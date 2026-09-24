@@ -1,0 +1,18 @@
+AIICO
+Next 5 Cedant
+output
+.venv/
+*.venv
+*__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.pyw
+*.pyz
+*.pywz
+*.pyzw
+*.pyzwz
+*.pyzwzw
+*.pyzwzwz
+*.pyzwzwzw
+~$TEMPLATE.xlsx
