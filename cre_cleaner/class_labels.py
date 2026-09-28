@@ -4,10 +4,16 @@ Bisola sheet naming: ``{ClassLabel} - PREMIUM|CLAIMS|OUTSTANDING``.
 Canonical labels she uses: Fire, General Accident, Marine Cargo, Marine Hull,
 Engineering, Bond. Source files often carry finer subclasses (Goods in Transit,
 All Risks, Burglary, …) that belong under General Accident.
+
+Facultative is **not** a Continental treaty class — ignored by default
+(``--include-fac`` to keep).
 """
 from __future__ import annotations
 
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+
+from cre_cleaner.config import FAC_CLASS_LABEL
+from cre_cleaner.normalize import normalize_header
 
 # Display order for class-split sheets (Bisola-like). Unknown labels append after.
 BISOLA_CLASS_ORDER: List[str] = [
@@ -17,8 +23,19 @@ BISOLA_CLASS_ORDER: List[str] = [
     "Marine Hull",
     "Engineering",
     "Bond",
-    "Facultative",  # present in AIICO ARK FAC OBLIG sheets; Bisola gold omits these
+    "Motor",
+    "Terrorism & PVT",
+    "Agriculture",
+    "Aviation",
+    "Oil & Gas",
+    "Travel",
+    FAC_CLASS_LABEL,  # opt-in only; default pipeline drops these sheets
 ]
+
+# Class text too broad to place in one Bisola class: bare MARINE could be Hull
+# or Cargo. Rows carrying only this go to the exceptions file, never a sheet.
+UNRESOLVED_CLASS_KEYS = {"MARINE"}
+_LAYER_NOISE = {"1ST", "2ND", "3RD", "SURP", "SURPLUS", "TREATY", "QUOTA", "SHARE", "QS"}
 
 # Bordereau type suffixes on sheet titles (exact Bisola wording for main types).
 TYPE_PREMIUM = "PREMIUM"
@@ -46,9 +63,21 @@ _CLASS_MAP: Dict[str, str] = {
     "MISC": "General Accident",
     "GENERAL ACCIDENT": "General Accident",
     "ACCIDENT": "General Accident",
-    "FACULTATIVE": "Facultative",
-    "FAC OBLIG": "Facultative",
-    "FAC": "Facultative",
+    # Obvious General Accident typos / abbreviations seen in raw tabs
+    # (e.g. Q3 2020 'GEN ACCIENT'). CASUALTY is deliberately NOT mapped
+    # (pending Bisola's approval) — it stays a title-cased 'Casualty' label.
+    "GEN ACCIENT": "General Accident",
+    "GENERAL ACCIENT": "General Accident",
+    "GEN ACCIDENT": "General Accident",
+    "GEN ACCDT": "General Accident",
+    "GEN ACDNT": "General Accident",
+    "GEN ACCIDNT": "General Accident",
+    "GEN ACC": "General Accident",
+    "GENERAL ACC": "General Accident",
+    "GENERAL ACCIDENTS": "General Accident",
+    "FACULTATIVE": FAC_CLASS_LABEL,
+    "FAC OBLIG": FAC_CLASS_LABEL,
+    "FAC": FAC_CLASS_LABEL,
     # AIICO ARK claims CLASS column subclasses → General Accident
     "GOODS IN TRANSIT": "General Accident",
     "GIT": "General Accident",
@@ -65,10 +94,22 @@ _CLASS_MAP: Dict[str, str] = {
     "PROFESSIONAL INDEMNITY": "General Accident",
     "DIRECTORS AND OFFICERS LIABILITY": "General Accident",
     "D&O": "General Accident",
-    "MOTOR": "General Accident",
     "PERSONAL ACCIDENT": "General Accident",
     "WORKMEN COMPENSATION": "General Accident",
     "WORKMEN'S COMPENSATION": "General Accident",
+    # Own classes (Continental books these separately from General Accident)
+    "MOTOR": "Motor",
+    "TERRORISM": "Terrorism & PVT",
+    "PVT": "Terrorism & PVT",
+    "POLITICAL VIOLENCE": "Terrorism & PVT",
+    "AGRIC": "Agriculture",
+    "AGRICULTURE": "Agriculture",
+    "AGRICULTURAL": "Agriculture",
+    "AVIATION": "Aviation",
+    "OIL & GAS": "Oil & Gas",
+    "OIL AND GAS": "Oil & Gas",
+    "OIL/GAS": "Oil & Gas",
+    "TRAVEL": "Travel",
 }
 
 
@@ -99,6 +140,102 @@ def normalize_class_label(raw: Optional[str]) -> str:
             return label
     # Title-case leftover for a visible sheet name
     return str(raw).strip().title() or "Other"
+
+
+def is_unresolved_class(raw: Optional[str]) -> bool:
+    """True when no class was found, or the only class text is too broad
+    (bare MARINE, incl. 'MARINE 2ND SURP') to pick a Bisola class."""
+    key = _norm_key(str(raw or ""))
+    if not key:
+        return True
+    toks = [t for t in key.replace("/", " ").split() if t not in _LAYER_NOISE]
+    return " ".join(toks) in UNRESOLVED_CLASS_KEYS
+
+
+# Filler words allowed around a class keyword in a section banner row
+# ("FIRE PAID CLAIM", "ENGINEERING 2ND SURPLUS OUTSTANDING CLAIMS AS AT MARCH 2020").
+_BANNER_MAX_LEN = 90
+
+
+def banner_class_label(text: Optional[str]) -> str:
+    """Class label from a lone section-banner cell, or ``""`` if none.
+
+    Used only when the tab itself carries no class (combined ``2nd surplus`` /
+    ``2ND SURPLUS TREATY`` tabs). Keyword based so typos and decorated banners
+    work: ENGIN*/ENG (incl. ENGINERRING, ENGINEERGING) → Engineering; FIRE →
+    Fire; MARINE HULL/HULL → Marine Hull; MARINE CARGO/CARGO → Marine Cargo;
+    BOND → Bond; GEN ACC*/GENERAL ACCIDENT/MISC → General Accident; MOTOR,
+    TERRORISM/PVT, AGRIC*, AVIATION, OIL & GAS, TRAVEL → their own classes.
+    Bare MARINE (e.g. "MARINE PAID CLAIM") → ``"MARINE"``: the banner still
+    starts a new section, but the rows are routed to exceptions as unresolved
+    (see ``is_unresolved_class``). Ambiguous (two classes) or keyword-free
+    banners (e.g. "2ND SURP PAID CLAIM") → ``""``.
+    """
+    if text is None:
+        return ""
+    raw = str(text).strip()
+    if not raw or len(raw) > _BANNER_MAX_LEN:
+        return ""
+    key = _norm_key(raw)
+    # Numbers / dates are never banners
+    if not any(ch.isalpha() for ch in key):
+        return ""
+    toks = key.replace("/", " ").replace("&", " ").split()
+    found = set()
+    joined = " " + " ".join(toks) + " "
+    if " MARINE HULL " in joined or "HULL" in toks or "MHULL" in toks:
+        found.add("Marine Hull")
+    if " MARINE CARGO " in joined or "CARGO" in toks or "MCARGO" in toks:
+        found.add("Marine Cargo")
+    if "MARINE" in toks and not ({"Marine Hull", "Marine Cargo"} & found):
+        found.add("MARINE")
+    if "MOTOR" in toks:
+        found.add("Motor")
+    if "TERRORISM" in toks or "PVT" in toks or " POLITICAL VIOLENCE " in joined:
+        found.add("Terrorism & PVT")
+    if any(t.startswith("AGRIC") for t in toks):
+        found.add("Agriculture")
+    if "AVIATION" in toks:
+        found.add("Aviation")
+    if " OIL GAS " in joined or " OIL AND GAS " in joined:
+        found.add("Oil & Gas")
+    if "TRAVEL" in toks:
+        found.add("Travel")
+    if any(t.startswith("ENGIN") for t in toks) or "ENG" in toks:
+        found.add("Engineering")
+    if "FIRE" in toks:
+        found.add("Fire")
+    if "BOND" in toks or "BONDS" in toks:
+        found.add("Bond")
+    if (
+        " GENERAL ACCIDENT " in joined
+        or " GEN ACC" in joined
+        or " MISC " in joined
+        or " MISCELLANEOUS " in joined
+        or "GA" == key
+    ):
+        found.add("General Accident")
+    if len(found) == 1:
+        return next(iter(found))
+    return ""
+
+
+def is_fac_class(raw: Optional[str]) -> bool:
+    return normalize_class_label(raw) == FAC_CLASS_LABEL
+
+
+def is_fac_sheet_name(sheet_name: str) -> bool:
+    """True for FAC OBLIG / Facultative source sheets Continental said to ignore."""
+    n = normalize_header(sheet_name)
+    if "FACULTATIVE" in n:
+        return True
+    if "FAC" in n and "OBLIG" in n:
+        return True
+    # Bare FAC sheets that aren't "FAC AMOUNT" style column noise in other names
+    tokens = n.split()
+    if tokens and tokens[0] == "FAC":
+        return True
+    return False
 
 
 def class_sheet_title(class_label: str, bordereau_type: str) -> str:
@@ -132,13 +269,16 @@ def premium_class_hint(row) -> str:
 
 def claims_class_hint(row) -> str:
     name = getattr(row, "class_name", "") or ""
-    if name:
+    sheet = getattr(getattr(row, "audit", None), "class_hint", "") or ""
+    # Prefer a resolved sheet/tab class over a bare MARINE row/banner value.
+    if name and not is_unresolved_class(name):
         return name
-    return getattr(getattr(row, "audit", None), "class_hint", "") or ""
+    if sheet and not is_unresolved_class(sheet):
+        return sheet
+    return name or sheet
 
 
 def mapping_documentation() -> List[Tuple[str, str]]:
     """Stable (source, Bisola label) pairs for README / SUMMARY."""
-    # Deduplicate by keeping first occurrence of each source key in sorted order
     items = sorted(_CLASS_MAP.items(), key=lambda kv: (kv[1], kv[0]))
     return items

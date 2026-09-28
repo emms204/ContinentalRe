@@ -1,6 +1,7 @@
 """Sheet type detection and header-row detection."""
 from __future__ import annotations
 
+import re
 from typing import Any, List, Optional, Sequence, Tuple
 
 from cre_cleaner.normalize import normalize_header, clean_text
@@ -103,7 +104,7 @@ def detect_sheet_type(sheet_name: str, sample_rows: List[List[Any]]) -> str:
     # Class premium sheets often named MARINE HULL 1ST / FIRE 2ND / BOND
     if any(x in name for x in (
         "HULL", "FIRE", "ENG", "CARGO", "MCARGO", "MISC", "BOND", "ACCIDENT",
-        "ACDNT", "SURP",
+        "ACDNT", "SURP", "MOTOR", "AGRIC", "PVT", "TERROR", "AVIATION", "TRAVEL",
     )) and "CLAIM" not in name:
         return "premium"
 
@@ -141,9 +142,22 @@ def class_from_sheet_name(sheet_name: str) -> str:
             return label
     if not name or name in {"2ND", "1ST", "."}:
         return ""
+    # Tab names that only describe the bordereau ("CLAIMS PAID", "PREMIUM",
+    # "Sheet1") carry no class; class then comes from row CLASS / banners.
+    toks = [t for t in re.split(r"[^A-Z0-9]+", name) if t]
+    if all(t in _NON_CLASS_TAB_WORDS or _NON_CLASS_TAB_PATTERN.fullmatch(t) for t in toks):
+        return ""
     return clean_text(sheet_name)
 
 
+_NON_CLASS_TAB_WORDS = {
+    "PREMIUM", "PREMIUMS", "PREM", "CLAIM", "CLAIMS", "PAID", "OUTSTANDING", "OUT",
+    "OST", "OS", "LOSS", "LOSSES", "BORDEREAU", "BORDEREAUX", "BORDERAUX", "BORD",
+    "BORDREAUX", "RETURNS", "RETURN", "CESSION", "TTY", "QUARTER", "QTR", "AND", "N",
+    "SHEET", "NIL", "SCHEDULE", "RESERVE", "RESERVES", "FOR", "THE", "OF",
+}
+_NON_CLASS_TAB_PATTERN = re.compile(r"\d+|Q[1-4]|\d+(ST|ND|RD|TH)|SHEET\d+")
+
+
 def re_sub_spaces(s: str) -> str:
-    import re
     return re.sub(r"\s+", " ", s).strip()

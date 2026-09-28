@@ -36,7 +36,6 @@ def cmd_inspect(args: argparse.Namespace) -> int:
                 if group:
                     print("  group_row:", ", ".join(group))
         else:
-            # show first few non-empty rows
             shown = 0
             for i, row in enumerate(rows[:12]):
                 vals = [str(c)[:40] for c in row if c is not None and str(c).strip()]
@@ -58,9 +57,24 @@ def cmd_run(args: argparse.Namespace) -> int:
         out_dir=Path(args.out_dir),
         base_dir=base,
         collapsed=bool(args.collapsed),
+        include_audit_sheets=bool(args.include_audit_sheets),
+        include_fac=bool(args.include_fac),
+        proportion_headers=args.proportion_headers,
+        out_name=args.out_name,
+        claims_leading_blank=bool(args.claims_leading_blank),
     )
     print("Output:", result.output_path)
+    if len(result.outputs) > 1:
+        print("Currency workbooks:")
+        for e in result.outputs:
+            print(f"  {e['currency']}: {e['output_path']} "
+                  f"(prem={e['premium_rows']} paid={e['claims_rows']} ost={e['outstanding_rows']})")
+    print("Exceptions sidecar:", result.exceptions_path)
+    print("Source audit sidecar:", result.source_audit_path)
     print("Layout:", result.summary.get("output_layout"))
+    print("Currency:", result.summary.get("currency"))
+    print("Adapter:", result.summary.get("adapter_status"))
+    print("Proportion headers:", result.summary.get("proportion_headers"))
     print("Premium rows:", len(result.premium_rows))
     print("Claims rows:", len(result.claims_rows))
     print("Outstanding rows:", len(result.outstanding_rows))
@@ -70,7 +84,11 @@ def cmd_run(args: argparse.Namespace) -> int:
         print("Sheets:")
         for sn, n in inv.items():
             print(f"  {sn}: {n} rows")
-    print("Summary:", json.dumps(result.summary, default=str, indent=2))
+    # Keep SUMMARY reconciliation out of the huge JSON dump
+    dump = {k: v for k, v in (result.summary or {}).items() if k != "reconciliation"}
+    if result.summary.get("reconciliation"):
+        dump["reconciliation_rows"] = len(result.summary["reconciliation"])
+    print("Summary:", json.dumps(dump, default=str, indent=2))
     return 0
 
 
@@ -91,6 +109,41 @@ def build_parser() -> argparse.ArgumentParser:
         "--collapsed",
         action="store_true",
         help="Write single PREMIUM/CLAIMS/OUTSTANDING sheets (legacy). Default is Bisola-style class-split.",
+    )
+    run_p.add_argument(
+        "--include-audit-sheets",
+        action="store_true",
+        help="Also embed EXCEPTIONS and SOURCE AUDIT sheets in the cleaned workbook "
+             "(default: sidecars only — upload workbook omits them).",
+    )
+    run_p.add_argument(
+        "--include-fac",
+        action="store_true",
+        help="Include Facultative source sheets / Facultative-* output "
+             "(default: ignore FAC — Continental guidance).",
+    )
+    run_p.add_argument(
+        "--proportion-headers",
+        choices=["gold", "distinct", "plain"],
+        default="gold",
+        help="Premium proportion column names. gold (default) = Bisola's most recent "
+             "distinct naming (RET/TREATY/FAC PROPORTION %%, as on her Q4 2025 Bond sheet); "
+             "distinct = RET PROPORTION %%, TREATY PROPORTION %%, FAC PROPORTION %%; "
+             "plain = PROPORTION %% x3 (literal Q2 2025 gold; duplicate names).",
+    )
+    run_p.add_argument(
+        "--out-name",
+        default=None,
+        help="Output workbook filename (default: {CEDANT}_{BROKER}_{YEAR}_Q{Q}_cleaned.xlsx). "
+             "Sidecars follow the same stem.",
+    )
+    run_p.add_argument(
+        "--claims-leading-blank",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="CLAIMS/OUTSTANDING sheets keep column A fully empty with headers in "
+             "B..S, title in B1 (TEMPLATE.xlsx / Bisola gold layout; default ON). "
+             "Use --no-claims-leading-blank to start claims headers at column A.",
     )
     run_p.set_defaults(func=cmd_run)
 

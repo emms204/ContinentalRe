@@ -12,6 +12,14 @@ class AuditMeta:
     source_sheet: str = ""
     source_row: int = 0
     class_hint: str = ""
+    # How the class was resolved: "sheet" (tab name), "banner" (section banner
+    # row above the rows, tab gave no class), "column" (row-level CLASS), or "".
+    class_source: str = ""
+    # Original class text as it appeared in the source (tab name / banner cell).
+    class_label_raw: str = ""
+    # ISO-ish code (NGN, USD, EUR, GBP) or FCY when the source only says
+    # "foreign". Rows of different currencies are never summed together.
+    currency: str = "NGN"
 
 
 @dataclass
@@ -29,20 +37,23 @@ class PremiumRow:
     ret_ppn: Any = None
     ret_si: Any = None
     ret_prem: Any = None
+    # sur_* = treaty/surplus allocation block (output headers say TREATY)
     sur_ppn: Any = None
     sur_si: Any = None
     sur_prem: Any = None
     fac_ppn: Any = None
     fac_si: Any = None
     fac_prem: Any = None
+    # Treaty layers beyond the one written to the TREATY band (the 18-column
+    # upload schema has a single band): [{"layer", "ppn", "si", "prem"}].
+    extra_layers: list = field(default_factory=list)
     audit: AuditMeta = field(default_factory=AuditMeta)
 
     def to_template_values(self) -> dict:
+        """Keys match PREMIUM_COL_MAP (upload / Bisola schema)."""
         return {
             "POLICY NO.": self.policy_no,
             "NAME OF INSURED": self.name_of_insured,
-            "CHANNEL": self.channel or None,
-            "SUB CHANNEL": self.sub_channel or None,
             "UNDERWRITING YEAR": self.underwriting_year,
             "FROM": self.period_from,
             "TO": self.period_to,
@@ -50,14 +61,14 @@ class PremiumRow:
             "MPL %": self.mpl_pct,
             "GROSS PREMIUM": self.gross_premium,
             "RETENTION PROPORTION %": self.ret_ppn,
-            "RETENTION SUM INSURED": self.ret_si,
-            "RETENTION PREMIUM": self.ret_prem,
-            "SURPLUS PROPORTION %": self.sur_ppn,
-            "SURPLUS SUM INSURED": self.sur_si,
-            "SURPLUS PREMIUM": self.sur_prem,
+            "RET SUM INSURED": self.ret_si,
+            "RET PREMIUM": self.ret_prem,
+            "TREATY PROPORTION %": self.sur_ppn,
+            "TREATY SUM INSURED": self.sur_si,
+            "TREATY PREMIUM": self.sur_prem,
             "FACULTATIVE PROPORTION %": self.fac_ppn,
-            "FACULTATIVE SUM INSURED": self.fac_si,
-            "FACULTATIVE PREMIUM": self.fac_prem,
+            "FAC SUM INSURED": self.fac_si,
+            "FAC PREMIUM": self.fac_prem,
         }
 
 
@@ -71,6 +82,7 @@ class ClaimsRow:
     uw_yr: Any = None
     period_from: Any = None
     period_to: Any = None
+    sum_insured: Any = None  # often blank; present in Bisola gold
     total_claims: Any = None
     ppn_ret: Any = None
     amount_ret: Any = None
@@ -79,9 +91,13 @@ class ClaimsRow:
     ppn_fac: Any = None
     amount_fac: Any = None
     details: str = ""
+    # Not in the upload schema; kept for date checks and reconciliation.
+    paid_date: Any = None
+    extra_layers: list = field(default_factory=list)  # [{"layer", "amount"}]
     audit: AuditMeta = field(default_factory=AuditMeta)
 
     def to_template_values(self) -> dict:
+        """Keys match CLAIMS_COL_MAP (upload / Bisola schema)."""
         return {
             "INSURED": self.insured,
             "CLASS": self.class_name,
@@ -91,13 +107,14 @@ class ClaimsRow:
             "UW YR": self.uw_yr,
             "FROM": self.period_from,
             "TO": self.period_to,
+            "SUM INSURED": self.sum_insured,
             "TOTAL CLAIMS": self.total_claims,
             "PPN RET %": self.ppn_ret,
-            "AMOUNT RET": self.amount_ret,
+            "RET AMOUNT": self.amount_ret,
             "PPN TREATY %": self.ppn_treaty,
-            "AMOUNT TREATY": self.amount_treaty,
+            "TREATY AMOUNT": self.amount_treaty,
             "PPN FAC %": self.ppn_fac,
-            "AMOUNT FAC": self.amount_fac,
+            "FAC AMOUNT": self.amount_fac,
             "DETAILS OF LOSS": self.details,
         }
 
@@ -133,8 +150,30 @@ class SourceAuditRecord:
     rows_skipped: int
     source_month: str = ""
     notes: str = ""
+    # Sheet-level currency, or "MIXED" when a CURRENCY column varies by row.
+    currency: str = "NGN"
+    hidden_rows: int = 0
+    # Row sums of kept rows: {currency: {metric: amount}} and {currency: rows}.
+    parsed_totals: dict = field(default_factory=dict)
+    parsed_rows: dict = field(default_factory=dict)
+    # Cedant's own total/footer rows: {metric: amount}. Empty = no total row.
+    footer_totals: dict = field(default_factory=dict)
+
+    AUDIT_HEADERS = [
+        "Source Filename", "Source Sheet", "Sheet Type", "Header Row",
+        "Rows Read", "Rows Kept", "Rows Skipped", "Source Month", "Currency",
+        "Hidden Rows Skipped", "Row Sum (main amount)", "Source Total Row (main amount)",
+        "Notes",
+    ]
+
+    def main_metric(self) -> str:
+        return "gross" if self.sheet_type == "premium" else "total"
 
     def as_row(self) -> list:
+        metric = self.main_metric()
+        row_sum = sum(
+            (t.get(metric) or 0.0) for t in self.parsed_totals.values()
+        ) if self.parsed_totals else None
         return [
             self.source_filename,
             self.source_sheet,
@@ -144,6 +183,10 @@ class SourceAuditRecord:
             self.rows_kept,
             self.rows_skipped,
             self.source_month,
+            self.currency,
+            self.hidden_rows,
+            row_sum,
+            self.footer_totals.get(metric),
             self.notes,
         ]
 
@@ -157,3 +200,9 @@ class PipelineResult:
     source_audit: list = field(default_factory=list)
     summary: dict = field(default_factory=dict)
     output_path: Optional[str] = None
+    exceptions_path: Optional[str] = None
+    source_audit_path: Optional[str] = None
+    # One entry per currency workbook: {"currency", "output_path",
+    # "exceptions_path", "source_audit_path", "summary"}. output_path above is
+    # the primary (NGN when present) workbook.
+    outputs: list = field(default_factory=list)

@@ -120,19 +120,70 @@ _PERIOD_SPLIT = re.compile(
 )
 
 
+_PERIOD_SEP = re.compile(r"\s*(?:-|–|—|\bto\b)\s*", re.IGNORECASE)
+
+
 def parse_period(val: Any) -> Tuple[Optional[datetime], Optional[datetime]]:
-    """Split 'dd/mm/yyyy - dd/mm/yyyy' (or 'to') into FROM/TO."""
+    """Split 'dd/mm/yyyy - dd/mm/yyyy' (or 'to') into FROM/TO.
+
+    A lone date (Excel serial or string) sets FROM only — TO stays blank.
+    Never copy the same date into both ends.
+    """
     if val is None or val == "":
         return None, None
     if isinstance(val, (datetime, date)):
         d = parse_date(val)
-        return d, d
+        return d, None
     s = clean_text(val)
+    # A lone date may itself contain dashes ('01-Jan-2025'); try it whole first.
+    d = parse_date(s)
+    if d is not None:
+        return d, None
+    # Then every separator position ('01-Jan-2025 - 31-Mar-2025' splits at the
+    # middle dash only when both halves are dates).
+    for m in _PERIOD_SEP.finditer(s):
+        a, b = parse_date(s[: m.start()]), parse_date(s[m.end():])
+        if a is not None and b is not None:
+            return a, b
     m = _PERIOD_SPLIT.match(s)
     if not m:
-        d = parse_date(s)
-        return d, None
+        return None, None
     return parse_date(m.group(1)), parse_date(m.group(2))
+
+
+_CURRENCY_TOKENS = {
+    "USD": "USD", "DOLLAR": "USD", "DOLLARS": "USD",
+    "NGN": "NGN", "NAIRA": "NGN",
+    "EUR": "EUR", "EURO": "EUR", "EUROS": "EUR",
+    "GBP": "GBP", "STERLING": "GBP",
+    "FCY": "FCY", "FOREIGN": "FCY",
+}
+_CURRENCY_SYMBOLS = (("US$", "USD"), ("$", "USD"), ("₦", "NGN"), ("€", "EUR"), ("£", "GBP"))
+
+
+def currency_codes(text: Any) -> set:
+    """Currency codes named in a filename / sheet name / header cell.
+
+    FCY ("foreign currency") is kept as its own code: the source does not say
+    which currency, so it must not be assumed to be USD.
+    """
+    s = clean_text(text).upper()
+    if not s:
+        return set()
+    found = {code for sym, code in _CURRENCY_SYMBOLS if sym in s}
+    for tok in re.split(r"[^A-Z]+", s):
+        if tok in _CURRENCY_TOKENS:
+            found.add(_CURRENCY_TOKENS[tok])
+    return found
+
+
+def currency_code(text: Any) -> str:
+    """Single code for a CURRENCY cell (e.g. 'USD', 'N', 'Naira'), '' if unknown."""
+    s = clean_text(text).upper()
+    if s in {"N", "NGN", "₦"}:
+        return "NGN"
+    codes = currency_codes(s)
+    return codes.pop() if len(codes) == 1 else ""
 
 
 def normalize_header(h: Any) -> str:

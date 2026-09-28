@@ -37,6 +37,7 @@ PREMIUM_ALIASES: Dict[str, List[str]] = {
         "GROSS PREMIUM", "PREMIUM", "GP", "GROSS PREM",
     ],
     "debit_note": ["DEBIT NOTE", "DEBITNOTE", "DN", "CREDIT NOTE"],
+    "currency": ["CURRENCY", "CCY"],
 }
 
 CLAIMS_ALIASES: Dict[str, List[str]] = {
@@ -77,7 +78,22 @@ CLAIMS_ALIASES: Dict[str, List[str]] = {
         "DESCRIPTION OF LOSS", "LOSS DESCRIPTION", "PARTICULARS",
     ],
     "month": ["MONTH"],
+    "paid_date": ["PAYMENT DATE", "DATE PAID", "PAID DATE", "DATE OF PAYMENT"],
+    "currency": ["CURRENCY", "CCY"],
 }
+
+
+def merged_aliases(
+    base: Dict[str, List[str]], extra: Optional[Dict[str, List[str]]],
+) -> Dict[str, List[str]]:
+    """Default aliases plus cedant-specific ones; field order stays the default
+    order (earlier fields claim a column first)."""
+    if not extra:
+        return base
+    out = {k: list(extra.get(k, [])) + list(v) for k, v in base.items()}
+    for k, v in extra.items():
+        out.setdefault(k, list(v))
+    return out
 
 
 @dataclass
@@ -94,6 +110,14 @@ class ColumnMap:
     fac_ppn: Optional[int] = None
     fac_si: Optional[int] = None
     fac_prem: Optional[int] = None
+    # Group label of the treaty block written to the TREATY band (e.g. "1SURP").
+    sur_label: str = ""
+    # Further treaty layers: (label, ppn, si, prem) column indices.
+    extra_treaty_blocks: List[Tuple[str, Optional[int], Optional[int], Optional[int]]] = field(
+        default_factory=list
+    )
+    # Second RET/FAC blocks that have no place in the upload schema.
+    ignored_blocks: List[str] = field(default_factory=list)
     unmapped_headers: List[str] = field(default_factory=list)
 
     def get(self, field: str) -> Optional[int]:
@@ -136,9 +160,31 @@ def map_simple_columns(
     return cm
 
 
+def extra_alias_columns(
+    headers: Sequence[Any],
+    aliases: List[str],
+    used: Sequence[Optional[int]],
+) -> List[Tuple[int, str]]:
+    """Further amount columns matching ``aliases`` that the first-match mapping
+    did not take (e.g. a 2ND SURPLUS column next to 1ST SURPLUS). Share / %
+    columns are not amounts and are excluded."""
+    taken = {i for i in used if i is not None}
+    out = []
+    for i, h in enumerate(headers):
+        n = normalize_header(h) if h is not None else ""
+        if not n or i in taken:
+            continue
+        if "%" in n or any(t in n.split() for t in ("PPN", "PROPORTION", "RATE", "SHARE")):
+            continue
+        if _alias_match(n, aliases):
+            out.append((i, n))
+    return out
+
+
 def detect_premium_allocation_blocks(
     header_row: Sequence[Any],
     group_row: Optional[Sequence[Any]] = None,
+    aliases: Optional[Dict[str, List[str]]] = None,
 ) -> ColumnMap:
     """
     AIICO ARK premium layout:
@@ -148,7 +194,7 @@ def detect_premium_allocation_blocks(
     Gross SI/Premium are the first SUM INSURED / PREMIUM after period/UW.
     Retention and Surplus triples follow.
     """
-    cm = map_simple_columns(header_row, PREMIUM_ALIASES)
+    cm = map_simple_columns(header_row, aliases or PREMIUM_ALIASES)
     norms = [normalize_header(h) if h is not None else "" for h in header_row]
     groups = []
     if group_row:
@@ -196,33 +242,66 @@ def detect_premium_allocation_blocks(
     ret_set = False
     sur_set = False
     fac_set = False
+    used: set = set()
     for idx, (pi, si, pr) in enumerate(blocks):
         g = group_for(pi)
         is_ret = any(x in g for x in ("OWN RETENTION", "RETENTION", "RETAINED"))
         is_fac = any(x in g for x in ("FAC", "FACULTATIVE"))
         is_sur = any(x in g for x in ("SURP", "SURPLUS", "TREATY", "QUOTA", "QS"))
+        # Only assign from an explicit group label here. Unlabelled blocks are
+        # handled below (first → retention, second → treaty). The old
+        # `(is_sur or not sur_set)` branch put the first unlabelled block into
+        # TREATY and the second into RETENTION — the opposite of the layout.
         if is_ret and not ret_set:
             cm.ret_ppn, cm.ret_si, cm.ret_prem = pi, si, pr
             ret_set = True
+            used.add(idx)
         elif is_fac and not fac_set:
             cm.fac_ppn, cm.fac_si, cm.fac_prem = pi, si, pr
             fac_set = True
-        elif (is_sur or not sur_set) and not sur_set:
-            # default second block to surplus
+            used.add(idx)
+        elif is_sur and not sur_set:
             cm.sur_ppn, cm.sur_si, cm.sur_prem = pi, si, pr
+            cm.sur_label = g or "TREATY"
             sur_set = True
-        elif not ret_set:
-            cm.ret_ppn, cm.ret_si, cm.ret_prem = pi, si, pr
-            ret_set = True
+            used.add(idx)
+        elif is_sur and sur_set:
+            cm.extra_treaty_blocks.append((g or f"TREATY BLOCK {idx + 1}", pi, si, pr))
+            used.add(idx)
+        elif is_ret or is_fac:
+            cm.ignored_blocks.append(f"{g} (cols {pi + 1}-{pr + 1})")
+            used.add(idx)
+        # else: unlabelled — fall through to positional assignment below
 
-    # If no group headers: first block = retention, second = surplus
-    if blocks and not ret_set:
-        pi, si, pr = blocks[0]
-        cm.ret_ppn, cm.ret_si, cm.ret_prem = pi, si, pr
-        ret_set = True
-        if len(blocks) > 1 and not sur_set:
-            pi, si, pr = blocks[1]
+    unlabelled = [blocks[i] for i in range(len(blocks)) if i not in used]
+    # No / remaining group labels: first block = retention, second = treaty.
+    # A single unlabelled block alone is treated as treaty (retention stays
+    # blank) so treaty-only sheets do not land in the RETENTION band.
+    if unlabelled and not ret_set and not sur_set:
+        if len(unlabelled) == 1:
+            pi, si, pr = unlabelled[0]
             cm.sur_ppn, cm.sur_si, cm.sur_prem = pi, si, pr
+            cm.sur_label = "TREATY"
+        else:
+            pi, si, pr = unlabelled[0]
+            cm.ret_ppn, cm.ret_si, cm.ret_prem = pi, si, pr
+            pi, si, pr = unlabelled[1]
+            cm.sur_ppn, cm.sur_si, cm.sur_prem = pi, si, pr
+            cm.sur_label = "TREATY"
+            for i, (pi, si, pr) in enumerate(unlabelled[2:], start=3):
+                cm.extra_treaty_blocks.append((f"TREATY BLOCK {i}", pi, si, pr))
+    elif unlabelled:
+        # Some blocks already labelled; assign leftovers in order.
+        for i, (pi, si, pr) in enumerate(unlabelled):
+            if not ret_set:
+                cm.ret_ppn, cm.ret_si, cm.ret_prem = pi, si, pr
+                ret_set = True
+            elif not sur_set:
+                cm.sur_ppn, cm.sur_si, cm.sur_prem = pi, si, pr
+                cm.sur_label = "TREATY"
+                sur_set = True
+            else:
+                cm.extra_treaty_blocks.append((f"TREATY BLOCK {i + 1}", pi, si, pr))
 
     return cm
 

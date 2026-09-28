@@ -16,3 +16,8 @@ output
 *.pyzwzwz
 *.pyzwzwzw
 ~$TEMPLATE.xlsx
+gold/*
+*.agents/
+*.DS_Store
+*.log
+*.log.*
