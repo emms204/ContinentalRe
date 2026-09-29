@@ -13,7 +13,7 @@ from __future__ import annotations
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 from cre_cleaner.config import FAC_CLASS_LABEL
-from cre_cleaner.normalize import normalize_header
+from cre_cleaner.core.normalize import normalize_header
 
 # Display order for class-split sheets (Bisola-like). Unknown labels append after.
 BISOLA_CLASS_ORDER: List[str] = [

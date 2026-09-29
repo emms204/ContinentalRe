@@ -6,9 +6,9 @@ import json
 import sys
 from pathlib import Path
 
-from cre_cleaner.detect import detect_sheet_type, find_header_row
-from cre_cleaner.io_excel import read_workbook_sheets, sheet_names
-from cre_cleaner.normalize import normalize_header
+from cre_cleaner.core.detect import detect_sheet_type, find_header_row
+from cre_cleaner.io.excel import read_workbook_sheets, sheet_names
+from cre_cleaner.core.normalize import normalize_header
 from cre_cleaner.pipeline import run_pipeline
 
 
@@ -102,7 +102,11 @@ def build_parser() -> argparse.ArgumentParser:
     run_p.add_argument("--year", type=int, required=True)
     run_p.add_argument("--quarter", type=int, required=True, choices=[1, 2, 3, 4])
     run_p.add_argument("--raw-dir", required=True)
-    run_p.add_argument("--template", default="TEMPLATE.xlsx")
+    run_p.add_argument(
+        "--template",
+        default="templates/TEMPLATE.xlsx",
+        help="Layout/style seed workbook (default: templates/TEMPLATE.xlsx)",
+    )
     run_p.add_argument("--out-dir", default="output")
     run_p.add_argument("--base-dir", default=None, help="Base directory for relative paths (default: cwd)")
     run_p.add_argument(

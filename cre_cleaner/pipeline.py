@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import List, Optional, Sequence, Tuple
 
 from cre_cleaner.adapters import get_adapter
-from cre_cleaner.class_labels import (
+from cre_cleaner.core.class_labels import (
     claims_class_hint,
     group_rows_by_class,
     is_fac_class,
@@ -16,15 +16,18 @@ from cre_cleaner.class_labels import (
     premium_class_hint,
 )
 from cre_cleaner.config import QUARTER_MONTHS
-from cre_cleaner.io_excel import write_output_workbook
+from cre_cleaner.io.excel import write_output_workbook
 from cre_cleaner.models import PipelineResult, ExceptionRecord
-from cre_cleaner.quarterly import merge_monthly_premiums, parse_claims_file
-from cre_cleaner.reconcile import (
+from cre_cleaner.io.pdf import convert_pdfs_in_dir, list_pdfs
+from cre_cleaner.core.period_infer import infer_period
+from cre_cleaner.core.quarterly import merge_monthly_premiums, parse_claims_file
+from cre_cleaner.core.reconcile import (
     build_summary,
     build_source_reconciliation,
     check_row_dates,
     check_row_splits,
     flag_duplicate_claims,
+    flag_duplicate_premium,
 )
 
 
@@ -154,12 +157,71 @@ def _discover_premium_inputs(adapter, raw_dir: Path, year: int, quarter: int):
     return [], "none", []
 
 
+_BORDEREAU_TYPES = {"all", "premium", "claims", "outstanding"}
+
+
+def normalize_bordereau_type(value: Optional[str]) -> str:
+    """Phase 1 mode: premium | claims | outstanding | all."""
+    v = (value or "all").strip().lower()
+    if v in {"paid", "claim"}:
+        return "claims"
+    if v in {"ost", "os", "out"}:
+        return "outstanding"
+    if v in {"prem", "premiums"}:
+        return "premium"
+    if v not in _BORDEREAU_TYPES:
+        raise ValueError(
+            f"bordereau_type must be one of {sorted(_BORDEREAU_TYPES)}, got {value!r}"
+        )
+    return v
+
+
+def field_completeness(
+    premium_rows: Sequence = (),
+    claims_rows: Sequence = (),
+    outstanding_rows: Sequence = (),
+) -> dict:
+    """Share of rows with key mapped fields populated (Phase 1 QA panel)."""
+    def _pct(rows, pred) -> Optional[float]:
+        if not rows:
+            return None
+        ok = sum(1 for r in rows if pred(r))
+        return round(100.0 * ok / len(rows), 1)
+
+    def _has_num(v) -> bool:
+        return v is not None and v != ""
+
+    return {
+        "premium_rows": len(premium_rows),
+        "premium_policy_no_pct": _pct(premium_rows, lambda r: bool(getattr(r, "policy_no", ""))),
+        "premium_gross_pct": _pct(premium_rows, lambda r: _has_num(getattr(r, "gross_premium", None))),
+        "premium_retention_pct": _pct(
+            premium_rows,
+            lambda r: _has_num(getattr(r, "ret_prem", None)) or _has_num(getattr(r, "ret_ppn", None)),
+        ),
+        "premium_treaty_pct": _pct(
+            premium_rows,
+            lambda r: _has_num(getattr(r, "sur_prem", None)) or _has_num(getattr(r, "sur_ppn", None)),
+        ),
+        "claims_rows": len(claims_rows),
+        "claims_policy_no_pct": _pct(claims_rows, lambda r: bool(getattr(r, "policy_no", ""))),
+        "claims_total_pct": _pct(claims_rows, lambda r: _has_num(getattr(r, "total_claims", None))),
+        "outstanding_rows": len(outstanding_rows),
+        "outstanding_policy_no_pct": _pct(
+            outstanding_rows, lambda r: bool(getattr(r, "policy_no", ""))
+        ),
+        "outstanding_total_pct": _pct(
+            outstanding_rows, lambda r: _has_num(getattr(r, "total_claims", None))
+        ),
+    }
+
+
 def run_pipeline(
     *,
     cedant: str,
     broker: str,
-    year: int,
-    quarter: int,
+    year: Optional[int] = None,
+    quarter: Optional[int] = None,
     raw_dir: Path,
     template: Path,
     out_dir: Path,
@@ -170,7 +232,15 @@ def run_pipeline(
     proportion_headers: str = "gold",
     out_name: Optional[str] = None,
     claims_leading_blank: bool = True,
+    convert_pdfs: bool = False,
+    bordereau_type: str = "all",
 ) -> PipelineResult:
+    """Clean one quarter from ``raw_dir``.
+
+    Phase 1 defaults: PDF conversion off; year/quarter inferred from sheet
+    date columns when omitted; ``bordereau_type`` selects Premium / Claims /
+    Outstanding / all.
+    """
     base_dir = Path(base_dir) if base_dir else Path.cwd()
     raw_dir = Path(raw_dir)
     if not raw_dir.is_absolute():
@@ -183,86 +253,174 @@ def run_pipeline(
         out_dir = (base_dir / out_dir).resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
 
+    try:
+        mode = normalize_bordereau_type(bordereau_type)
+    except ValueError as e:
+        result = PipelineResult()
+        result.exceptions.append(ExceptionRecord("ERROR", "bordereau_type_invalid", detail=str(e)))
+        return result
+
+    want_premium = mode in {"all", "premium"}
+    want_claims = mode in {"all", "claims"}
+    want_outstanding = mode in {"all", "outstanding"}
+
     adapter = get_adapter(cedant, broker)
     result = PipelineResult()
     result.exceptions.append(ExceptionRecord(
         "INFO", "adapter_status",
         detail=f"{cedant.upper()}/{broker.upper()}: {adapter.status_text()}",
     ))
+    result.exceptions.append(ExceptionRecord(
+        "INFO", "bordereau_type",
+        detail=f"Phase 1 mode={mode}",
+    ))
 
-    # --- Premium ---
-    month_files, prem_mode, prem_discovered = _discover_premium_inputs(
-        adapter, raw_dir, year, quarter,
-    )
-    if prem_mode == "none":
+    # --- PDF → Excel (paused for Phase 1 unless explicitly enabled) ---
+    if convert_pdfs and list_pdfs(raw_dir):
+        batch = convert_pdfs_in_dir(raw_dir)
+        for conv in batch.conversions:
+            sev = "INFO" if conv.ok or conv.skipped else "ERROR"
+            result.exceptions.append(ExceptionRecord(
+                sev, "pdf_convert",
+                source_filename=conv.source.name,
+                detail=conv.detail or ("ok" if conv.ok else "failed"),
+            ))
+            if sev == "ERROR":
+                print(f"ERROR pdf_convert {conv.source.name}: {conv.detail}", file=sys.stderr)
+    elif list_pdfs(raw_dir) and not convert_pdfs:
         result.exceptions.append(ExceptionRecord(
-            "ERROR", "no_premium_files",
-            detail=f"No monthly or quarterly premium files for Q{quarter} {year} in {raw_dir}",
-        ))
-    elif prem_mode == "monthly":
-        found_months = {m for m, _ in prem_discovered}
-        for month in QUARTER_MONTHS[quarter]:
-            if month not in found_months:
-                msg = (
-                    f"No premium file found for {adapter.month_label(month)} {year} "
-                    f"(Q{quarter}) in {raw_dir} — month missing from the quarter"
-                )
-                result.exceptions.append(ExceptionRecord(
-                    "ERROR", "premium_month_missing", detail=msg,
-                ))
-                print(f"ERROR premium_month_missing: {msg}", file=sys.stderr)
-    else:
-        result.exceptions.append(ExceptionRecord(
-            "INFO", "premium_input_quarterly",
+            "INFO", "pdf_skipped_phase1",
             detail=(
-                f"No monthly premium files for Q{quarter} {year}; using "
-                f"{len(month_files)} quarterly premium file(s): "
-                f"{[p.name for _, p, _ in month_files]}"
+                f"{len(list_pdfs(raw_dir))} PDF file(s) present but ignored "
+                "(Phase 1: Excel only; set convert_pdfs=True to enable LlamaParse)"
             ),
         ))
 
-    for sev, reason, fname, detail in getattr(adapter, "discovery_notes", []) or []:
-        result.exceptions.append(ExceptionRecord(sev, reason, fname, detail=detail))
-        print(f"{sev} {reason}: {detail}", file=sys.stderr)
-
-    premium_rows, exc_p, audit_p = merge_monthly_premiums(
-        month_files, include_fac=include_fac, adapter=adapter,
-    )
-    result.premium_rows = premium_rows
-    result.exceptions.extend(exc_p)
-    result.source_audit.extend(audit_p)
-
-    # --- Claims ---
-    claims_files = adapter.discover_claims_files(raw_dir, year, quarter)
-    if not claims_files:
-        msg = (
-            f"No claims / outstanding files found for Q{quarter} {year} in {raw_dir} "
-            "(looked for CLAIM/LOSS/OUTSTANDING + quarter or month in the filename)"
-        )
-        result.exceptions.append(ExceptionRecord(
-            "ERROR", "no_claims_files", detail=msg,
-        ))
-        print(f"ERROR no_claims_files: {msg}", file=sys.stderr)
-    paid_all = []
-    ost_all = []
-    for cpath in claims_files:
-        try:
-            paid, ost, exc_c, audit_c = parse_claims_file(
-                cpath, include_fac=include_fac, adapter=adapter,
-            )
-            paid_all.extend(paid)
-            ost_all.extend(ost)
-            result.exceptions.extend(exc_c)
-            result.source_audit.extend(audit_c)
-        except Exception as e:
+    # --- Year / quarter (explicit or inferred from date columns / filenames) ---
+    if year is None or quarter is None:
+        inferred = infer_period(raw_dir)
+        for w in inferred.warnings:
             result.exceptions.append(ExceptionRecord(
-                "ERROR", "claims_parse_failed",
-                source_filename=cpath.name,
-                detail=str(e),
+                "WARN", "period_infer", detail=w,
+            ))
+        if inferred.evidence:
+            result.exceptions.append(ExceptionRecord(
+                "INFO", "period_infer_evidence",
+                detail=f"confidence={inferred.confidence}; " + "; ".join(inferred.evidence[:8]),
+            ))
+        if year is None:
+            year = inferred.year
+        if quarter is None:
+            quarter = inferred.quarter
+        if year is None or quarter is None:
+            result.exceptions.append(ExceptionRecord(
+                "ERROR", "period_unresolved",
+                detail=(
+                    "Could not infer year and quarter from date columns in the "
+                    "workbooks (or filenames as fallback). Ensure sheets have "
+                    "Date of Loss / Cover From / Transaction Date values."
+                ),
+            ))
+            result.summary = {
+                "cedant": cedant, "broker": broker,
+                "year": year, "quarter": quarter,
+                "adapter_status": adapter.status_text(),
+                "bordereau_type": mode,
+                "error": "period_unresolved",
+            }
+            return result
+
+    year = int(year)
+    quarter = int(quarter)
+    if quarter not in (1, 2, 3, 4):
+        result.exceptions.append(ExceptionRecord(
+            "ERROR", "period_invalid", detail=f"quarter must be 1–4, got {quarter}",
+        ))
+        return result
+
+    # --- Premium ---
+    month_files: list = []
+    prem_mode = "none"
+    prem_discovered: list = []
+    if want_premium:
+        month_files, prem_mode, prem_discovered = _discover_premium_inputs(
+            adapter, raw_dir, year, quarter,
+        )
+        if prem_mode == "none":
+            result.exceptions.append(ExceptionRecord(
+                "ERROR", "no_premium_files",
+                detail=f"No monthly or quarterly premium files for Q{quarter} {year} in {raw_dir}",
+            ))
+        elif prem_mode == "monthly":
+            found_months = {m for m, _ in prem_discovered}
+            for month in QUARTER_MONTHS[quarter]:
+                if month not in found_months:
+                    # Phase 1: one monthly file still yields a Qn workbook; missing
+                    # months are WARN (multi-file merge remains available later).
+                    msg = (
+                        f"No premium file found for {adapter.month_label(month)} {year} "
+                        f"(Q{quarter}) in {raw_dir} — month missing from the quarter"
+                    )
+                    result.exceptions.append(ExceptionRecord(
+                        "WARN", "premium_month_missing", detail=msg,
+                    ))
+                    print(f"WARN premium_month_missing: {msg}", file=sys.stderr)
+        else:
+            result.exceptions.append(ExceptionRecord(
+                "INFO", "premium_input_quarterly",
+                detail=(
+                    f"No monthly premium files for Q{quarter} {year}; using "
+                    f"{len(month_files)} quarterly premium file(s): "
+                    f"{[p.name for _, p, _ in month_files]}"
+                ),
             ))
 
-    result.claims_rows = paid_all
-    result.outstanding_rows = ost_all
+        for sev, reason, fname, detail in getattr(adapter, "discovery_notes", []) or []:
+            result.exceptions.append(ExceptionRecord(sev, reason, fname, detail=detail))
+            print(f"{sev} {reason}: {detail}", file=sys.stderr)
+
+        premium_rows, exc_p, audit_p = merge_monthly_premiums(
+            month_files, include_fac=include_fac, adapter=adapter,
+        )
+        result.premium_rows = premium_rows
+        result.exceptions.extend(exc_p)
+        result.source_audit.extend(audit_p)
+
+    # --- Claims / outstanding ---
+    claims_files: list = []
+    if want_claims or want_outstanding:
+        claims_files = adapter.discover_claims_files(raw_dir, year, quarter)
+        if not claims_files:
+            msg = (
+                f"No claims / outstanding files found for Q{quarter} {year} in {raw_dir} "
+                "(looked for CLAIM/LOSS/OUTSTANDING + quarter or month in the filename)"
+            )
+            result.exceptions.append(ExceptionRecord(
+                "ERROR", "no_claims_files", detail=msg,
+            ))
+            print(f"ERROR no_claims_files: {msg}", file=sys.stderr)
+        paid_all = []
+        ost_all = []
+        for cpath in claims_files:
+            try:
+                paid, ost, exc_c, audit_c = parse_claims_file(
+                    cpath, include_fac=include_fac, adapter=adapter,
+                )
+                if want_claims:
+                    paid_all.extend(paid)
+                if want_outstanding:
+                    ost_all.extend(ost)
+                result.exceptions.extend(exc_c)
+                result.source_audit.extend(audit_c)
+            except Exception as e:
+                result.exceptions.append(ExceptionRecord(
+                    "ERROR", "claims_parse_failed",
+                    source_filename=cpath.name,
+                    detail=str(e),
+                ))
+
+        result.claims_rows = paid_all
+        result.outstanding_rows = ost_all
 
     if not include_fac:
         result.premium_rows, result.claims_rows, result.outstanding_rows = _drop_fac_rows(
@@ -278,6 +436,7 @@ def run_pipeline(
         setattr(result, attr, kept)
         result.exceptions.extend(excs)
 
+    result.exceptions.extend(flag_duplicate_premium(result.premium_rows))
     result.exceptions.extend(flag_duplicate_claims(result.claims_rows, "CLAIMS BORDEREAU"))
     result.exceptions.extend(
         flag_duplicate_claims(result.outstanding_rows, "OUTSTANDING LOSS BORDEREAU")
@@ -369,6 +528,8 @@ def run_pipeline(
         summary["date_checks"] = date_counts
         summary["reconciliation"] = recon
         summary["premium_input_mode"] = prem_mode
+        summary["bordereau_type"] = mode
+        summary["field_completeness"] = field_completeness(prem_c, paid_c, ost_c)
 
         if out_name and len(currency_groups) == 1:
             name = out_name if out_name.lower().endswith(".xlsx") else out_name + ".xlsx"
@@ -436,6 +597,8 @@ def run_pipeline(
         summary["date_checks"] = date_counts
         summary["reconciliation"] = []
         summary["premium_input_mode"] = prem_mode
+        summary["bordereau_type"] = mode
+        summary["field_completeness"] = field_completeness([], [], [])
         summary["by_class"] = {}
         name = out_name or f"{cedant.upper()}_{broker.upper()}_{year}_Q{quarter}_cleaned.xlsx"
         if not name.lower().endswith(".xlsx"):

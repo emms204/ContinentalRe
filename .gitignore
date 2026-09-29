@@ -1,6 +1,18 @@
-AIICO
+# Local data (large / private)
+data/raw/
+data/gold/*
+!data/gold/INDEX.md
+!data/gold/**/README.md
+
+# Legacy root locations (pre-restructure)
+NewData
 Next 5 Cedant
+gold
+AIICO
+
+# Run artifacts
 output
+
 .venv/
 *.venv
 *__pycache__/
@@ -14,9 +26,7 @@ output
 *.pyzwz
 *.pyzwzw
 *.pyzwzwz
-*.pyzwzwzw
 ~$TEMPLATE.xlsx
-gold/*
 *.agents/
 *.DS_Store
 *.log

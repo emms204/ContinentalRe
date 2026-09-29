@@ -21,9 +21,9 @@ from pathlib import Path
 from typing import Any, List, Optional, Sequence, Tuple
 
 from cre_cleaner.adapters.base import QuarterlyWorkbookAdapter
-from cre_cleaner.map_columns import ColumnMap, detect_premium_allocation_blocks, map_simple_columns
+from cre_cleaner.core.map_columns import ColumnMap, detect_premium_allocation_blocks, map_simple_columns
 from cre_cleaner.models import ExceptionRecord
-from cre_cleaner.normalize import clean_text, normalize_header, parse_number
+from cre_cleaner.core.normalize import clean_text, normalize_header, parse_number
 
 _PREMIUM_HEADER = [None, "Policy No", "Insured Name", "Insurance Period", None, "Sum Insured.",
                    "Gross Premium", "Sum Insured", "Rate", "Sum Insured", "Premium", "Rate",

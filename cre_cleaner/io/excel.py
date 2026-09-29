@@ -12,7 +12,7 @@ from openpyxl.styles import Alignment, Font
 from openpyxl.utils import get_column_letter
 from openpyxl.worksheet.worksheet import Worksheet
 
-from cre_cleaner.class_labels import (
+from cre_cleaner.core.class_labels import (
     TYPE_CLAIMS,
     TYPE_OUTSTANDING,
     TYPE_PREMIUM,
@@ -38,7 +38,7 @@ from cre_cleaner.models import (
     ExceptionRecord,
     SourceAuditRecord,
 )
-from cre_cleaner.normalize import clean_text
+from cre_cleaner.core.normalize import clean_text
 
 
 def read_workbook_sheets(path: Path) -> Dict[str, List[List[Any]]]:

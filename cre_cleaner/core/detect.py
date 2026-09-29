@@ -4,7 +4,7 @@ from __future__ import annotations
 import re
 from typing import Any, List, Optional, Sequence, Tuple
 
-from cre_cleaner.normalize import normalize_header, clean_text
+from cre_cleaner.core.normalize import normalize_header, clean_text
 
 
 PREMIUM_MARKERS = {
@@ -69,16 +69,31 @@ def find_header_row(
 def detect_sheet_type(sheet_name: str, sample_rows: List[List[Any]]) -> str:
     """Return 'premium' | 'paid' | 'outstanding' | 'skip'."""
     name = normalize_header(sheet_name)
-    if any(x in name for x in ("STATEMENT", "COVER", "INDEX", "SUMMARY")):
-        # still may be data; don't auto-skip solely on name unless clear
-        pass
+    toks = set(re.findall(r"[A-Z0-9]+", name))
+    # Standalone OS / OST / O/S tokens (AIICO SCIB: "marine os claims"). Do not
+    # use substring "OS" — it appears inside LOSS, CROSS, etc.
+    is_ost_name = (
+        "OUTSTANDING" in name
+        or "OST" in toks
+        or "OS" in toks
+        or bool(re.search(r"\bO\s*/\s*S\b", str(sheet_name).upper()))
+    )
+    if is_ost_name and (
+        "CLAIM" in name or "LOSS" in name or "RESERVE" in name or not ("PREMIUM" in name)
+    ):
+        # "os claims" / "outstanding" / bare "FIRE OS" → outstanding
+        if "PREMIUM" not in name:
+            return "outstanding"
     if "OUTSTANDING" in name or (("OUT" in name or "OST" in name) and "CLAIM" in name):
         return "outstanding"
+    # Production / listing dumps are not premium bordereaux (HEIRS JOMOLA).
+    if ("PROD" in toks or "PRODUCTION" in toks or "LISTING" in toks) and "PREM" not in name:
+        return "skip"
     # AIICO names like "MISC. ACC PAID JANUARY" omit the word CLAIM
-    if "PAID" in name:
+    if "PAID" in name and not is_ost_name:
         return "paid"
     if "CLAIM" in name and "PREMIUM" not in name and "CESSION" not in name:
-        if "OUT" in name or "OST" in name:
+        if is_ost_name or "OUT" in name or "OST" in name:
             return "outstanding"
         return "paid"
     if "PREMIUM" in name and "CLAIM" not in name:
@@ -153,8 +168,10 @@ def class_from_sheet_name(sheet_name: str) -> str:
 _NON_CLASS_TAB_WORDS = {
     "PREMIUM", "PREMIUMS", "PREM", "CLAIM", "CLAIMS", "PAID", "OUTSTANDING", "OUT",
     "OST", "OS", "LOSS", "LOSSES", "BORDEREAU", "BORDEREAUX", "BORDERAUX", "BORD",
-    "BORDREAUX", "RETURNS", "RETURN", "CESSION", "TTY", "QUARTER", "QTR", "AND", "N",
-    "SHEET", "NIL", "SCHEDULE", "RESERVE", "RESERVES", "FOR", "THE", "OF",
+    "BORDREAUX", "BOEREAUX", "BOARDEREUX", "BOADEREUX", "RETURNS", "RETURN",
+    "CESSION", "TTY", "QUARTER", "QTR", "AND", "N", "SHEET", "NIL", "SCHEDULE",
+    "RESERVE", "RESERVES", "FOR", "THE", "OF", "SUMMARY", "RECOVERY", "PROD",
+    "PRODUCTION", "LISTING", "CONFIRMATION",
 }
 _NON_CLASS_TAB_PATTERN = re.compile(r"\d+|Q[1-4]|\d+(ST|ND|RD|TH)|SHEET\d+")
 

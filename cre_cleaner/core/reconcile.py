@@ -12,7 +12,7 @@ from typing import Dict, List, Optional, Sequence, Tuple
 
 from cre_cleaner.config import MONTH_ALIASES, MONTH_NAMES, QUARTER_MONTHS
 from cre_cleaner.models import PremiumRow, ClaimsRow, ExceptionRecord, SourceAuditRecord
-from cre_cleaner.normalize import parse_number
+from cre_cleaner.core.normalize import parse_number
 
 _AMOUNT_TOL_ABS = 1.0
 _AMOUNT_TOL_REL = 0.001
@@ -455,5 +455,35 @@ def flag_duplicate_claims(rows: Sequence[ClaimsRow], source_label: str) -> List[
                 source_sheet="",
                 source_row=idxs[0],
                 detail=f"key={key} count={len(idxs)} indices={idxs[:10]}",
+            ))
+    return out
+
+
+def flag_duplicate_premium(rows: Sequence, source_label: str = "PREMIUM BORDEREAU") -> List[ExceptionRecord]:
+    """Flag exact-duplicate premium rows — never auto-delete."""
+    from collections import defaultdict
+    buckets = defaultdict(list)
+    for i, r in enumerate(rows):
+        if not getattr(r, "policy_no", None) and not getattr(r, "name_of_insured", None):
+            continue
+        key = (
+            getattr(r, "policy_no", ""),
+            getattr(r, "name_of_insured", ""),
+            str(getattr(r, "period_from", "")),
+            str(getattr(r, "period_to", "")),
+            getattr(r, "gross_premium", None),
+            getattr(r, "total_sum_insured", None),
+        )
+        buckets[key].append(i)
+    out = []
+    for key, idxs in buckets.items():
+        if len(idxs) > 1:
+            out.append(ExceptionRecord(
+                severity="WARN",
+                reason="apparent_duplicate",
+                source_filename=source_label,
+                source_sheet="",
+                source_row=idxs[0],
+                detail=f"premium key={key} count={len(idxs)} indices={idxs[:10]}",
             ))
     return out

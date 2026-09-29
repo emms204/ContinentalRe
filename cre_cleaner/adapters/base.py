@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 
 from cre_cleaner.config import MONTH_ALIASES, MONTH_NAMES
-from cre_cleaner.map_columns import (
+from cre_cleaner.core.map_columns import (
     CLAIMS_ALIASES,
     PREMIUM_ALIASES,
     ColumnMap,
@@ -46,11 +46,15 @@ def token_month(tok: str) -> Optional[int]:
 
 def quarters_in_text(text: str) -> Set[int]:
     """Quarters named in a file/folder name: Q1, 'Q 1', 'BordreauxQ4', '1ST QTR',
-    'FIRST QUARTER', 'QR 1', '2ND QUATER', 'QTR1', '1QTR'."""
+    'FIRST QUARTER', 'QR 1', '2ND QUATER', 'QTR1', '1QTR'.
+
+    Must not treat the leading digit of a year as a quarter: ``Qtr 2021`` is not Q2.
+    """
     u = str(text).upper()
+    # (?!\d) blocks "Qtr 2021" → false Q2 (the "2" of 2021).
     found = {int(m.group(1)) for m in re.finditer(r"Q\s*([1-4])(?!\d)", u)}
-    found |= {int(m.group(1)) for m in re.finditer(r"QTR\s*([1-4])", u)}
-    found |= {int(m.group(1)) for m in re.finditer(r"([1-4])\s*QTR", u)}
+    found |= {int(m.group(1)) for m in re.finditer(r"QTR\s*([1-4])(?!\d)", u)}
+    found |= {int(m.group(1)) for m in re.finditer(r"(?<!\d)([1-4])\s*QTR\b", u)}
     toks = name_tokens(u)
     for i, t in enumerate(toks):
         if t in _QUARTER_TOKENS:
@@ -58,7 +62,6 @@ def quarters_in_text(text: str) -> Set[int]:
                 found.add(_QUARTER_WORDS[toks[i - 1]])
             if i + 1 < len(toks) and toks[i + 1] in {"1", "2", "3", "4"}:
                 found.add(int(toks[i + 1]))
-        # Compound token QTR1 / 1QTR from filenames without a separator
         m = re.fullmatch(r"QTR([1-4])", t) or re.fullmatch(r"([1-4])QTR", t)
         if m:
             found.add(int(m.group(1)))

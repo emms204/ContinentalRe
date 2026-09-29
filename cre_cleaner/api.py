@@ -1,15 +1,15 @@
 """Provisional FastAPI wrapper for cre_cleaner.
 
-Upload a zip (or Excel files) → one cleaned zip per run, grouped as
-cedant/broker/year/quarter/currency. Marked provisional until output grouping
-is agreed with Tyrone.
+Phase 1: upload **one Excel** bordereau → cleaned workbook zip.
+Year/quarter are inferred from sheet date columns (optional override still
+accepted). PDF / multi-file / zip are not the primary path.
 
 Auth: set CRE_CLEANER_API_KEY and send it as header ``X-API-Key``.
 Size: CRE_CLEANER_MAX_UPLOAD_MB (default 50). Uploads are never persisted under
 ``output/api_runs`` — work stays in a TemporaryDirectory deleted after the response.
 
 Run:
-  export CRE_CLEANER_API_KEY=…   # required for /clean and /clean/json
+  export CRE_CLEANER_API_KEY=…
   cd ContinentalRe && uvicorn cre_cleaner.api:app --reload --port 8090
 """
 from __future__ import annotations
@@ -31,12 +31,13 @@ from fastapi.responses import JSONResponse, StreamingResponse
 
 from cre_cleaner.adapters import list_adapters
 from cre_cleaner.adapters.base import UnsupportedCedantError
-from cre_cleaner.pipeline import run_pipeline
+from cre_cleaner.paths import REPO_ROOT, TEMPLATE_PATH
+from cre_cleaner.pipeline import normalize_bordereau_type, run_pipeline
 
-REPO_ROOT = Path(__file__).resolve().parent.parent
-TEMPLATE = REPO_ROOT / "TEMPLATE.xlsx"
+TEMPLATE = TEMPLATE_PATH
 
-_ALLOWED_UPLOAD_SUFFIXES = {".zip", ".xlsx", ".xls", ".xlsm"}
+_ALLOWED_UPLOAD_SUFFIXES = {".xlsx", ".xls", ".xlsm", ".zip"}  # zip = legacy only
+_PHASE1_EXCEL = {".xlsx", ".xls", ".xlsm"}
 _LABEL_RE = re.compile(r"^[A-Z0-9][A-Z0-9 _.\-]{0,63}$")
 
 
@@ -86,7 +87,8 @@ def safe_upload_basename(filename: Optional[str], fallback_stem: str = "upload")
     if suffix not in _ALLOWED_UPLOAD_SUFFIXES:
         raise HTTPException(
             400,
-            f"Unsupported upload type {suffix!r}; use .zip, .xlsx or .xls",
+            f"Unsupported upload type {suffix!r}; Phase 1 accepts .xlsx / .xls "
+            f"(legacy .zip allowed). PDF is paused.",
         )
     stem = re.sub(r"[^A-Za-z0-9._-]+", "_", Path(name).stem).strip("._-")[:80]
     if not stem:
@@ -116,14 +118,13 @@ async def read_upload_limited(file: UploadFile, max_bytes: int) -> bytes:
 
 
 app = FastAPI(
-    title="cre_cleaner API (provisional)",
+    title="cre_cleaner API (Phase 1)",
     description=(
-        "Provisional Continental Re bordereau cleaner. "
-        "Requires X-API-Key (CRE_CLEANER_API_KEY). "
-        "Output grouping (cedant/broker/year/quarter/currency) is provisional "
-        "until agreed with Tyrone."
+        "Continental Re bordereau cleaner — Phase 1: one Excel file per clean, "
+        "year/quarter inferred from date columns, mode=premium|claims|outstanding|all. "
+        "Requires X-API-Key (CRE_CLEANER_API_KEY)."
     ),
-    version="0.1.0-provisional",
+    version="0.2.0-phase1",
 )
 
 
@@ -131,9 +132,11 @@ app = FastAPI(
 def health():
     return {
         "ok": True,
-        "provisional": True,
+        "phase": 1,
         "auth_configured": _configured_api_key() is not None,
         "max_upload_mb": _max_upload_bytes() // (1024 * 1024),
+        "primary_input": "single_excel",
+        "pdf_enabled": False,
     }
 
 
@@ -188,20 +191,41 @@ def _prepare_raw(data: bytes, basename: str, raw: Path) -> Path:
             raise HTTPException(400, "Upload is not a valid zip") from e
         return _collect_inputs(raw)
     dest = raw / basename
-    # Defend against any residual path components
     if dest.resolve().parent != raw.resolve():
         raise HTTPException(400, f"Unsafe filename: {basename!r}")
     dest.write_bytes(data)
     return raw
 
 
+async def _stage_uploads(files: List[UploadFile], raw: Path) -> Path:
+    """Phase 1: exactly one Excel file (legacy single .zip still accepted)."""
+    if not files:
+        raise HTTPException(400, "No files uploaded")
+    if len(files) > 1:
+        raise HTTPException(
+            400,
+            "Phase 1 accepts one Excel file per clean "
+            "(multi-file / bulk is deferred). Send a single .xlsx / .xls.",
+        )
+    max_bytes = _max_upload_bytes()
+    basename = safe_upload_basename(files[0].filename)
+    suffix = Path(basename).suffix.lower()
+    if suffix == ".pdf":
+        raise HTTPException(400, "PDF upload is paused for Phase 1 — send Excel")
+    if suffix not in _PHASE1_EXCEL and suffix != ".zip":
+        raise HTTPException(400, f"Unsupported type {suffix!r}")
+    data = await read_upload_limited(files[0], max_bytes)
+    return _prepare_raw(data, basename, raw)
+
+
 def _run_clean(
     *,
     cedant: str,
     broker: str,
-    year: int,
-    quarter: int,
+    year: Optional[int],
+    quarter: Optional[int],
     include_fac: bool,
+    bordereau_type: str,
     raw_dir: Path,
     out: Path,
 ):
@@ -216,6 +240,8 @@ def _run_clean(
             out_dir=out,
             base_dir=REPO_ROOT,
             include_fac=include_fac,
+            convert_pdfs=False,
+            bordereau_type=bordereau_type,
         )
     except UnsupportedCedantError as e:
         raise HTTPException(400, str(e)) from e
@@ -223,32 +249,60 @@ def _run_clean(
         raise HTTPException(500, f"Clean failed: {e}") from e
 
 
+def _resolved_period(result) -> tuple[int, int]:
+    summary = result.summary or {}
+    year = summary.get("year")
+    quarter = summary.get("quarter")
+    if year is None or quarter is None:
+        raise HTTPException(
+            400,
+            "Could not infer year/quarter from workbook date columns — "
+            "ensure Date of Loss / Cover From / Transaction Date are populated",
+        )
+    return int(year), int(quarter)
+
+
+def _parse_bordereau_type(value: str) -> str:
+    try:
+        return normalize_bordereau_type(value)
+    except ValueError as e:
+        raise HTTPException(400, str(e)) from e
+
+
 @app.post("/clean", dependencies=[Depends(require_api_key)])
 async def clean(
     cedant: str = Form(...),
     broker: str = Form(...),
-    year: int = Form(...),
-    quarter: int = Form(..., ge=1, le=4),
+    bordereau_type: str = Form(
+        "all",
+        description="premium | claims | outstanding | all",
+    ),
+    year: Optional[int] = Form(
+        None,
+        description="Optional override; default = infer from sheet date columns",
+    ),
+    quarter: Optional[int] = Form(
+        None,
+        ge=1,
+        le=4,
+        description="Optional override; default = infer from sheet date columns",
+    ),
     include_fac: bool = Form(False),
-    file: UploadFile = File(..., description="Zip of raw Excel, or a single .xlsx/.xls"),
+    file: UploadFile = File(
+        ...,
+        description="One .xlsx / .xls bordereau (legacy .zip accepted)",
+    ),
 ):
-    """Clean one quarter. Returns a zip of cleaned workbooks + sidecars.
+    """Clean one Excel bordereau. Returns a zip of cleaned workbooks + sidecars.
 
-    Grouping inside the zip (provisional):
-      {cedant}/{broker}/{year}/Q{quarter}/{currency}/
-        {cedant}_{broker}_{year}_Q{quarter}_{currency}_cleaned.xlsx
-        …_exceptions.xlsx
-        …_source_audit.xlsx
-
-    All work stays in a temporary directory deleted after the response.
+    Year/quarter default to inference from date columns inside the file.
     """
     if not TEMPLATE.exists():
         raise HTTPException(500, f"TEMPLATE.xlsx missing at {TEMPLATE}")
 
     cedant = sanitize_label(cedant, "cedant")
     broker = sanitize_label(broker, "broker")
-    basename = safe_upload_basename(file.filename)
-    data = await read_upload_limited(file, _max_upload_bytes())
+    mode = _parse_bordereau_type(bordereau_type)
 
     with tempfile.TemporaryDirectory(prefix="cre_api_") as tmp:
         tmp_path = Path(tmp)
@@ -257,35 +311,36 @@ async def clean(
         raw.mkdir()
         out.mkdir()
 
-        raw_dir = _prepare_raw(data, basename, raw)
+        raw_dir = await _stage_uploads([file], raw)
         result = _run_clean(
             cedant=cedant,
             broker=broker,
             year=year,
             quarter=quarter,
             include_fac=include_fac,
+            bordereau_type=mode,
             raw_dir=raw_dir,
             out=out,
         )
+        year_r, quarter_r = _resolved_period(result)
 
         buf = io.BytesIO()
         with zipfile.ZipFile(buf, "w", compression=zipfile.ZIP_DEFLATED) as zf:
             manifest = {
-                "provisional": True,
+                "phase": 1,
                 "grouping": "cedant/broker/year/quarter/currency",
                 "cedant": cedant,
                 "broker": broker,
-                "year": year,
-                "quarter": quarter,
+                "year": year_r,
+                "quarter": quarter_r,
+                "bordereau_type": mode,
+                "period_inferred": year is None or quarter is None,
+                "field_completeness": (result.summary or {}).get("field_completeness"),
                 "outputs": [],
-                "note": (
-                    "Output grouping is provisional until agreed with Tyrone. "
-                    "Adapters other than AIICO/ARK are first-pass / unverified."
-                ),
             }
             for entry in result.outputs:
                 ccy = entry["currency"]
-                prefix = f"{cedant}/{broker}/{year}/Q{quarter}/{ccy}"
+                prefix = f"{cedant}/{broker}/{year_r}/Q{quarter_r}/{ccy}"
                 for key in ("output_path", "exceptions_path", "source_audit_path"):
                     p = Path(entry[key])
                     if p.is_file():
@@ -298,13 +353,13 @@ async def clean(
                     "cleaned": f"{prefix}/{Path(entry['output_path']).name}",
                 })
             zf.writestr(
-                f"{cedant}/{broker}/{year}/Q{quarter}/manifest.json",
+                f"{cedant}/{broker}/{year_r}/Q{quarter_r}/manifest.json",
                 json.dumps(manifest, indent=2),
             )
 
         buf.seek(0)
         stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        fname = f"{cedant}_{broker}_{year}_Q{quarter}_cleaned_{stamp}.zip"
+        fname = f"{cedant}_{broker}_{year_r}_Q{quarter_r}_cleaned_{stamp}.zip"
         return StreamingResponse(
             buf,
             media_type="application/zip",
@@ -316,24 +371,19 @@ async def clean(
 async def clean_json(
     cedant: str = Form(...),
     broker: str = Form(...),
-    year: int = Form(...),
-    quarter: int = Form(..., ge=1, le=4),
+    bordereau_type: str = Form("all"),
+    year: Optional[int] = Form(None),
+    quarter: Optional[int] = Form(None, ge=1, le=4),
     include_fac: bool = Form(False),
     file: UploadFile = File(...),
 ):
-    """Same as /clean but returns JSON metrics.
-
-    Files are written only under a TemporaryDirectory that is deleted when this
-    handler returns — paths in the JSON are therefore not durable. Use /clean
-    when you need the cleaned workbooks.
-    """
+    """Same as /clean but returns JSON metrics (temp files deleted after response)."""
     if not TEMPLATE.exists():
         raise HTTPException(500, f"TEMPLATE.xlsx missing at {TEMPLATE}")
 
     cedant = sanitize_label(cedant, "cedant")
     broker = sanitize_label(broker, "broker")
-    basename = safe_upload_basename(file.filename)
-    data = await read_upload_limited(file, _max_upload_bytes())
+    mode = _parse_bordereau_type(bordereau_type)
 
     with tempfile.TemporaryDirectory(prefix="cre_api_json_") as tmp:
         tmp_path = Path(tmp)
@@ -342,18 +392,19 @@ async def clean_json(
         raw.mkdir()
         out.mkdir()
 
-        raw_dir = _prepare_raw(data, basename, raw)
+        raw_dir = await _stage_uploads([file], raw)
         result = _run_clean(
             cedant=cedant,
             broker=broker,
             year=year,
             quarter=quarter,
             include_fac=include_fac,
+            bordereau_type=mode,
             raw_dir=raw_dir,
             out=out,
         )
+        year_r, quarter_r = _resolved_period(result)
 
-        # Summarise without leaking absolute temp paths that vanish after return.
         outputs = []
         for entry in result.outputs:
             outputs.append({
@@ -367,14 +418,15 @@ async def clean_json(
             })
 
         return JSONResponse({
-            "provisional": True,
+            "phase": 1,
             "persisted": False,
             "cedant": cedant,
             "broker": broker,
-            "year": year,
-            "quarter": quarter,
+            "year": year_r,
+            "quarter": quarter_r,
+            "bordereau_type": mode,
+            "period_inferred": year is None or quarter is None,
+            "field_completeness": (result.summary or {}).get("field_completeness"),
             "outputs": outputs,
             "exception_count": len(result.exceptions),
-            "adapter_status": (result.summary or {}).get("adapter_status"),
-            "note": "Temp outputs deleted after response; download via /clean for files.",
         })

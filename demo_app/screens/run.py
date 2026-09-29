@@ -1,9 +1,8 @@
-"""Run screen — clean a bordereau."""
+"""Run screen — Phase 1: one Excel file per clean."""
 from __future__ import annotations
 
-import io
 import json
-import zipfile
+import shutil
 from datetime import datetime
 from pathlib import Path
 
@@ -20,10 +19,15 @@ BROKERS_BY_CEDANT = {
     c: sorted({b for cc, b, _v, _n in _ADAPTER_ROWS if cc == c})
     for c in CEDANTS
 }
-YEARS = list(range(2020, 2027))
-QUARTERS = [1, 2, 3, 4]
+_BORDEREAU_MODES = ("Premium", "Claims", "Outstanding", "All")
+_MODE_TO_TYPE = {
+    "Premium": "premium",
+    "Claims": "claims",
+    "Outstanding": "outstanding",
+    "All": "all",
+}
+_EXCEL_SUFFIXES = {".xlsx", ".xls", ".xlsm"}
 
-# Legacy keys from earlier attempts — purged so they cannot override the form.
 _LEGACY_WIDGET_KEYS = (
     "w_cedant",
     "w_broker",
@@ -31,30 +35,6 @@ _LEGACY_WIDGET_KEYS = (
     "w_quarter",
     "w_use_sample",
 )
-
-
-def _cached_upload_name() -> str | None:
-    if not paths.LAST_UPLOAD_ZIP.exists():
-        return None
-    if paths.LAST_UPLOAD_NAME.exists():
-        name = paths.LAST_UPLOAD_NAME.read_text(encoding="utf-8").strip()
-        if name:
-            return name
-    return paths.LAST_UPLOAD_ZIP.name
-
-
-def _save_upload_cache(data: bytes, original_name: str) -> None:
-    paths.DEMO_RUNS_DIR.mkdir(parents=True, exist_ok=True)
-    paths.LAST_UPLOAD_ZIP.write_bytes(data)
-    paths.LAST_UPLOAD_NAME.write_text(
-        original_name.strip() or "upload.zip", encoding="utf-8"
-    )
-
-
-def _clear_upload_cache() -> None:
-    for p in (paths.LAST_UPLOAD_ZIP, paths.LAST_UPLOAD_NAME):
-        if p.exists():
-            p.unlink()
 
 
 def _load_json(path: Path) -> dict:
@@ -67,6 +47,36 @@ def _load_json(path: Path) -> dict:
     return data if isinstance(data, dict) else {}
 
 
+def _cached_upload_path() -> Path | None:
+    if paths.LAST_UPLOAD_FILE.is_file():
+        return paths.LAST_UPLOAD_FILE
+    return None
+
+
+def _cached_upload_name() -> str | None:
+    if not _cached_upload_path():
+        return None
+    if paths.LAST_UPLOAD_NAME.exists():
+        name = paths.LAST_UPLOAD_NAME.read_text(encoding="utf-8").strip()
+        if name:
+            return name
+    return paths.LAST_UPLOAD_FILE.name
+
+
+def _save_upload_cache(data: bytes, original_name: str) -> None:
+    paths.DEMO_RUNS_DIR.mkdir(parents=True, exist_ok=True)
+    paths.LAST_UPLOAD_FILE.write_bytes(data)
+    paths.LAST_UPLOAD_NAME.write_text(
+        Path(original_name).name.strip() or "upload.xlsx", encoding="utf-8"
+    )
+
+
+def _clear_upload_cache() -> None:
+    for p in (paths.LAST_UPLOAD_FILE, paths.LAST_UPLOAD_NAME):
+        if p.exists():
+            p.unlink()
+
+
 def _save_last_run(
     *,
     cedant: str,
@@ -74,9 +84,9 @@ def _save_last_run(
     year: int,
     quarter: int,
     use_sample: bool,
+    bordereau_type: str,
     output_path: str | None = None,
 ) -> None:
-    """Authoritative record of the last successful clean — not overwritten by form defaults."""
     paths.DEMO_RUNS_DIR.mkdir(parents=True, exist_ok=True)
     payload = {
         "cedant": cedant,
@@ -84,6 +94,7 @@ def _save_last_run(
         "year": int(year),
         "quarter": int(quarter),
         "use_sample": bool(use_sample),
+        "bordereau_type": bordereau_type,
     }
     if output_path:
         payload["output_path"] = str(output_path)
@@ -94,9 +105,8 @@ def _save_form_disk(
     *,
     cedant: str,
     broker: str,
-    year: int,
-    quarter: int,
     use_sample: bool,
+    bordereau_mode: str,
 ) -> None:
     paths.DEMO_RUNS_DIR.mkdir(parents=True, exist_ok=True)
     paths.LAST_FORM_JSON.write_text(
@@ -104,9 +114,8 @@ def _save_form_disk(
             {
                 "cedant": cedant,
                 "broker": broker,
-                "year": int(year),
-                "quarter": int(quarter),
                 "use_sample": bool(use_sample),
+                "bordereau_mode": bordereau_mode,
             },
             indent=2,
         ),
@@ -114,66 +123,10 @@ def _save_form_disk(
     )
 
 
-def _latest_extract_root() -> Path | None:
-    """Most recent demo_runs/*/raw folder that still has Excel files."""
-    if not paths.DEMO_RUNS_DIR.is_dir():
-        return None
-    candidates: list[Path] = []
-    for child in paths.DEMO_RUNS_DIR.iterdir():
-        if not child.is_dir() or child.name.startswith("."):
-            continue
-        raw = child / "raw"
-        if raw.is_dir():
-            candidates.append(raw)
-    for raw in sorted(candidates, key=lambda p: p.parent.name, reverse=True):
-        if any(
-            p.is_file() and p.suffix.lower() in {".xlsx", ".xls"}
-            for p in raw.rglob("*")
-            if not p.name.startswith("~$")
-        ):
-            return raw
-    return None
-
-
-def _ensure_upload_cache_from_extract() -> bool:
-    """Rebuild last_upload.zip from the latest extract if the cache file is missing."""
-    if paths.LAST_UPLOAD_ZIP.exists():
-        return True
-    raw = _latest_extract_root()
-    if raw is None:
-        return False
-
-    # Prefer zipping a single top-level broker folder (e.g. raw/ARK → ARK.zip).
-    children = [p for p in raw.iterdir() if not p.name.startswith(".")]
-    if len(children) == 1 and children[0].is_dir():
-        root = children[0]
-        arc_base = root.name
-        name = f"{root.name}.zip"
-    else:
-        root = raw
-        arc_base = "raw"
-        name = "last_upload.zip"
-
-    buf = io.BytesIO()
-    with zipfile.ZipFile(buf, "w", compression=zipfile.ZIP_DEFLATED) as zf:
-        for path in root.rglob("*"):
-            if path.is_file() and not path.name.startswith("~$"):
-                zf.write(path, arcname=str(Path(arc_base) / path.relative_to(root)))
-    _save_upload_cache(buf.getvalue(), name)
-    return True
-
-
 def _authoritative_selection() -> dict:
-    """Resolve cedant/broker/year/quarter/use_sample for the form.
-
-    Priority matches what Compare shows: cleaned filename + last successful run,
-    never the demo defaults when a clean already exists.
-    """
     disk_run = _load_json(paths.LAST_RUN_JSON)
     disk_form = _load_json(paths.LAST_FORM_JSON)
     cached = _cached_upload_name() is not None
-    if not cached:
-        cached = _ensure_upload_cache_from_extract()
 
     out = st.session_state.get("last_output_path") or disk_run.get("output_path")
     meta = paths.parse_cleaned_meta(Path(out) if out else None)
@@ -190,18 +143,12 @@ def _authoritative_selection() -> dict:
         broker = disk_run.get("broker") or paths.DEFAULT_BROKER
         year = int(disk_run["year"])
         quarter = int(disk_run["quarter"])
-    elif disk_form.get("year") and disk_form.get("quarter"):
-        cedant = disk_form.get("cedant") or paths.DEFAULT_CEDANT
-        broker = disk_form.get("broker") or paths.DEFAULT_BROKER
-        year = int(disk_form["year"])
-        quarter = int(disk_form["quarter"])
     else:
         cedant = paths.DEFAULT_CEDANT
         broker = paths.DEFAULT_BROKER
         year = paths.DEFAULT_YEAR
         quarter = paths.DEFAULT_QUARTER
 
-    # Sample vs upload: prefer last successful clean, then cache presence.
     if "use_sample" in disk_run:
         use_sample = bool(disk_run["use_sample"])
     elif st.session_state.get("last_run_ok") and cached:
@@ -211,9 +158,20 @@ def _authoritative_selection() -> dict:
     else:
         use_sample = not cached
 
-    # Cleaned non-sample quarters always mean upload mode (sample is 2025 Q2 only).
     if (int(year), int(quarter)) != (paths.DEFAULT_YEAR, paths.DEFAULT_QUARTER):
         use_sample = False
+
+    mode = (
+        st.session_state.get("form_bordereau_mode")
+        or disk_form.get("bordereau_mode")
+        or disk_run.get("bordereau_type")
+        or "All"
+    )
+    if isinstance(mode, str) and mode.lower() in _MODE_TO_TYPE.values():
+        inv = {v: k for k, v in _MODE_TO_TYPE.items()}
+        mode = inv.get(mode.lower(), "All")
+    if mode not in _BORDEREAU_MODES:
+        mode = "All"
 
     return {
         "cedant": str(cedant).upper(),
@@ -221,6 +179,7 @@ def _authoritative_selection() -> dict:
         "year": int(year),
         "quarter": int(quarter),
         "use_sample": bool(use_sample),
+        "bordereau_mode": mode,
     }
 
 
@@ -241,12 +200,10 @@ def _ensure_session_defaults() -> None:
         "last_quarter": None,
         "form_cedant": paths.DEFAULT_CEDANT,
         "form_broker": paths.DEFAULT_BROKER,
-        "form_year": paths.DEFAULT_YEAR,
-        "form_quarter": paths.DEFAULT_QUARTER,
         "form_use_sample": _cached_upload_name() is None,
+        "form_bordereau_mode": "All",
         "run_hydrate": True,
     }
-    # Restore last clean into session if this browser session is fresh but disk has it.
     disk_run = _load_json(paths.LAST_RUN_JSON)
     if disk_run.get("output_path") and defaults["last_output_path"] is None:
         out = Path(str(disk_run["output_path"]))
@@ -262,8 +219,6 @@ def _ensure_session_defaults() -> None:
         if k not in st.session_state:
             st.session_state[k] = v
 
-    # Backfill year/quarter from the cleaned filename when session has output but
-    # no last_year (e.g. hot-reload after that field was added).
     out = st.session_state.get("last_output_path")
     if out and not st.session_state.get("last_year"):
         meta = paths.parse_cleaned_meta(Path(out))
@@ -275,7 +230,6 @@ def _ensure_session_defaults() -> None:
             st.session_state.last_quarter = q
             st.session_state.last_run_ok = True
 
-    # Sidecar paths are not stored in last_run.json — derive them from the cleaned file.
     if out:
         cleaned = Path(out)
         if cleaned.is_file():
@@ -287,105 +241,36 @@ def _ensure_session_defaults() -> None:
                 st.session_state.last_audit_path = str(audit)
 
 
-def _stuck_on_demo_defaults() -> bool:
-    """True when the form still shows the virgin demo prefill."""
-    return (
-        int(st.session_state.get("form_year") or 0) == paths.DEFAULT_YEAR
-        and int(st.session_state.get("form_quarter") or 0) == paths.DEFAULT_QUARTER
-        and bool(st.session_state.get("form_use_sample", True))
-    )
-
-
-def _should_hydrate() -> bool:
-    if st.session_state.get("run_hydrate", True):
-        return True
-    sel = _authoritative_selection()
-    # Poisoned session: defaults on screen, but a real clean exists.
-    if _stuck_on_demo_defaults() and (
-        sel["year"] != paths.DEFAULT_YEAR
-        or sel["quarter"] != paths.DEFAULT_QUARTER
-        or not sel["use_sample"]
-    ):
-        return True
-    return False
-
-
 def hydrate_form() -> None:
-    """Bind form_* to the last clean and bump widget epoch so Streamlit redraws."""
     sel = _authoritative_selection()
-
     st.session_state.form_cedant = sel["cedant"]
     st.session_state.form_broker = sel["broker"]
-    st.session_state.form_year = sel["year"]
-    st.session_state.form_quarter = sel["quarter"]
     st.session_state.form_use_sample = sel["use_sample"]
+    st.session_state.form_bordereau_mode = sel["bordereau_mode"]
 
-    # Drop legacy keys that older builds kept alive across Compare.
     for wk in _LEGACY_WIDGET_KEYS:
         st.session_state.pop(wk, None)
 
-    # New selectbox/checkbox identities → Streamlit must take our seeded values.
     st.session_state.form_epoch = int(st.session_state.get("form_epoch") or 0) + 1
     epoch = st.session_state.form_epoch
     st.session_state[f"cedant_{epoch}"] = sel["cedant"]
     st.session_state[f"broker_{epoch}"] = sel["broker"]
-    st.session_state[f"year_{epoch}"] = sel["year"]
-    st.session_state[f"quarter_{epoch}"] = sel["quarter"]
     st.session_state[f"use_sample_{epoch}"] = sel["use_sample"]
+    st.session_state[f"mode_{epoch}"] = sel["bordereau_mode"]
 
     _save_form_disk(
         cedant=sel["cedant"],
         broker=sel["broker"],
-        year=sel["year"],
-        quarter=sel["quarter"],
         use_sample=sel["use_sample"],
+        bordereau_mode=sel["bordereau_mode"],
     )
 
 
-def _has_excel(folder: Path) -> bool:
-    return any(
-        p.is_file() and p.suffix.lower() in {".xlsx", ".xls"}
-        for p in folder.iterdir()
-        if not p.name.startswith("~$") and not p.name.startswith(".")
-    )
-
-
-def _resolve_raw_dir(root: Path, year: int) -> Path:
-    root = Path(root)
-    year_token = str(year)
-
-    if _has_excel(root):
-        return root
-
-    year_dir = root / year_token
-    if year_dir.is_dir() and _has_excel(year_dir):
-        return year_dir
-
-    for candidate in sorted(root.rglob(year_token)):
-        if candidate.is_dir() and _has_excel(candidate):
-            return candidate
-
-    children = [p for p in root.iterdir() if p.is_dir() and not p.name.startswith(".")]
-    if len(children) == 1 and _has_excel(children[0]):
-        return children[0]
-
-    return root
-
-
-def _extract_zip_bytes(data: bytes, dest: Path, year: int) -> Path:
-    dest.mkdir(parents=True, exist_ok=True)
-    raw = dest / "raw"
-    raw.mkdir(parents=True, exist_ok=True)
-    with zipfile.ZipFile(io.BytesIO(data)) as zf:
-        zf.extractall(raw)
-
-    children = [p for p in raw.iterdir() if not p.name.startswith(".")]
-    start = children[0] if len(children) == 1 and children[0].is_dir() else raw
-    return _resolve_raw_dir(start, year)
+def _should_hydrate() -> bool:
+    return bool(st.session_state.get("run_hydrate", True))
 
 
 def _download_button(label: str, path: Path | str | None, key: str) -> None:
-    # Path("") / Path(None) → "." which exists as a directory — reject that.
     if path is None or str(path).strip() in {"", "."}:
         st.caption(f"{label}: not available")
         return
@@ -402,10 +287,35 @@ def _download_button(label: str, path: Path | str | None, key: str) -> None:
     )
 
 
+def _show_field_completeness(summary: dict | None) -> None:
+    fc = (summary or {}).get("field_completeness") or {}
+    if not fc:
+        return
+    with st.expander("Mapped field completeness", expanded=True):
+        if fc.get("premium_rows"):
+            st.write(
+                f"**Premium** ({fc['premium_rows']} rows): "
+                f"policy no {fc.get('premium_policy_no_pct')}% · "
+                f"gross {fc.get('premium_gross_pct')}% · "
+                f"retention {fc.get('premium_retention_pct')}% · "
+                f"treaty {fc.get('premium_treaty_pct')}%"
+            )
+        if fc.get("claims_rows"):
+            st.write(
+                f"**Claims** ({fc['claims_rows']} rows): "
+                f"policy no {fc.get('claims_policy_no_pct')}% · "
+                f"total {fc.get('claims_total_pct')}%"
+            )
+        if fc.get("outstanding_rows"):
+            st.write(
+                f"**Outstanding** ({fc['outstanding_rows']} rows): "
+                f"policy no {fc.get('outstanding_policy_no_pct')}% · "
+                f"total {fc.get('outstanding_total_pct')}%"
+            )
+
+
 def render() -> None:
     _ensure_session_defaults()
-
-    # Purge legacy widget keys every Run render (old interrupt-cleanup poison).
     for wk in _LEGACY_WIDGET_KEYS:
         st.session_state.pop(wk, None)
 
@@ -415,22 +325,21 @@ def render() -> None:
 
     if "form_epoch" not in st.session_state:
         st.session_state.form_epoch = 0
-        # First paint with no hydrate path — seed epoch-0 keys from form_*.
         epoch0 = 0
         st.session_state[f"cedant_{epoch0}"] = st.session_state.form_cedant
         st.session_state[f"broker_{epoch0}"] = st.session_state.form_broker
-        st.session_state[f"year_{epoch0}"] = st.session_state.form_year
-        st.session_state[f"quarter_{epoch0}"] = st.session_state.form_quarter
         st.session_state[f"use_sample_{epoch0}"] = st.session_state.form_use_sample
+        st.session_state[f"mode_{epoch0}"] = st.session_state.form_bordereau_mode
 
     epoch = int(st.session_state.form_epoch)
 
     st.subheader("Clean a bordereau")
     st.caption(
-        "Turn messy cedant Excel into a Continental-ready class-split workbook."
+        "Phase 1: one Excel file → quarterly cleaned workbook. "
+        "Year and quarter come from date columns in the file."
     )
 
-    c1, c2, c3, c4 = st.columns(4)
+    c1, c2 = st.columns(2)
     with c1:
         cedant = st.selectbox("Cedant", options=CEDANTS, key=f"cedant_{epoch}")
     with c2:
@@ -439,10 +348,15 @@ def render() -> None:
         if st.session_state.get(broker_key) not in brokers:
             st.session_state[broker_key] = brokers[0]
         broker = st.selectbox("Broker", options=brokers, key=broker_key)
-    with c3:
-        year = st.selectbox("Year", options=YEARS, key=f"year_{epoch}")
-    with c4:
-        quarter = st.selectbox("Quarter", options=QUARTERS, key=f"quarter_{epoch}")
+
+    mode_label = st.radio(
+        "Bordereau type",
+        options=_BORDEREAU_MODES,
+        horizontal=True,
+        key=f"mode_{epoch}",
+        help="Extract only this side from the workbook (Outstanding is its own type).",
+    )
+    bordereau_type = _MODE_TO_TYPE[mode_label]
 
     unverified = next(
         (note for c, b, verified, note in _ADAPTER_ROWS
@@ -455,41 +369,26 @@ def render() -> None:
     use_sample = st.checkbox(
         "Use local sample (AIICO / ARK / 2025)",
         key=f"use_sample_{epoch}",
-        help="Wifi-proof demo path. Uncheck to use a cached or newly uploaded zip.",
+        help="Wifi-proof demo path. Uncheck to upload one Excel bordereau.",
     )
 
-    # Durable form_* mirrors the live widgets while the user edits.
     st.session_state.form_cedant = cedant
     st.session_state.form_broker = broker
-    st.session_state.form_year = int(year)
-    st.session_state.form_quarter = int(quarter)
     st.session_state.form_use_sample = bool(use_sample)
+    st.session_state.form_bordereau_mode = mode_label
 
     cached_name = _cached_upload_name()
-    if not use_sample and not cached_name:
-        if _ensure_upload_cache_from_extract():
-            cached_name = _cached_upload_name()
 
     if not use_sample:
-        st.markdown(
-            "**What to upload** — a zip of raw broker Excel for one year "
-            "(monthly premium workbooks + the quarterly claims bordereau), "
-            "or a single quarterly `.xlsx` / `.xls`. "
-            f"Example: `AIICO/ARK.zip`; the cleaner uses the **{year}** folder inside it."
-        )
-        st.caption(
-            "Expected inside the zip (or under `{broker}/{year}/`): files like "
-            "`April Premium …xls`, `JANUARY PREM …xlsx`, "
-            "`2nd Qtr … Claims Paid Bord.xlsx`, or one combined quarterly workbook."
-        )
+        st.caption("Accepted: one `.xlsx` / `.xls` / `.xlsm` file (PDF paused for Phase 1)")
 
-        if cached_name:
-            size_mb = paths.LAST_UPLOAD_ZIP.stat().st_size / (1024 * 1024)
+        if cached_name and _cached_upload_path():
+            size_mb = _cached_upload_path().stat().st_size / (1024 * 1024)
             left, right = st.columns([4, 1])
             with left:
                 st.success(f"Using cached upload: **{cached_name}** ({size_mb:.1f} MB)")
             with right:
-                if st.button("Clear", key="clear_upload_cache", help="Remove cached zip"):
+                if st.button("Clear", key="clear_upload_cache", help="Remove cached upload"):
                     _clear_upload_cache()
                     st.session_state.form_use_sample = True
                     st.session_state.form_epoch = int(
@@ -498,43 +397,22 @@ def render() -> None:
                     e = st.session_state.form_epoch
                     st.session_state[f"cedant_{e}"] = st.session_state.form_cedant
                     st.session_state[f"broker_{e}"] = st.session_state.form_broker
-                    st.session_state[f"year_{e}"] = st.session_state.form_year
-                    st.session_state[f"quarter_{e}"] = st.session_state.form_quarter
                     st.session_state[f"use_sample_{e}"] = True
+                    st.session_state[f"mode_{e}"] = st.session_state.form_bordereau_mode
                     st.rerun()
 
         uploaded = st.file_uploader(
-            "Upload raw files (zip or Excel)" if not cached_name else "Replace cached upload",
-            type=["zip", "xlsx", "xls"],
-            help=(
-                "Zip of raw monthly premium + quarterly claims Excel, or a single "
-                "quarterly .xlsx/.xls. ARK.zip from AIICO/ is fine — pick Year to match."
-            ),
-            key=f"raw_zip_{epoch}",
+            "Upload Excel bordereau" if not cached_name else "Replace cached upload",
+            type=["xlsx", "xls", "xlsm"],
+            accept_multiple_files=False,
+            key=f"raw_file_{epoch}",
         )
         if uploaded is not None:
             data = uploaded.getvalue()
-            name = uploaded.name or "upload.zip"
-            lower = name.lower()
-            if lower.endswith((".xlsx", ".xls")):
-                # Wrap a single workbook in a zip so the rest of the demo can
-                # keep using last_upload.zip.
-                buf = io.BytesIO()
-                with zipfile.ZipFile(buf, "w", compression=zipfile.ZIP_DEFLATED) as zf:
-                    zf.writestr(Path(name).name, data)
-                _save_upload_cache(buf.getvalue(), name)
-                st.caption(f"Cached **{name}** (wrapped as zip) for later runs.")
-                cached_name = name
-            else:
-                try:
-                    with zipfile.ZipFile(io.BytesIO(data)) as zf:
-                        zf.namelist()
-                except zipfile.BadZipFile:
-                    st.error("That file is not a valid zip.")
-                else:
-                    _save_upload_cache(data, name)
-                    st.caption(f"Cached **{name}** for later runs.")
-                    cached_name = name
+            name = Path(uploaded.name or "upload.xlsx").name
+            _save_upload_cache(data, name)
+            st.caption(f"Cached **{name}** for later runs.")
+            cached_name = name
 
     with st.expander("Advanced", expanded=False):
         st.caption(
@@ -556,26 +434,17 @@ def render() -> None:
                 st.error(f"Sample raw folder not found: {raw_dir}")
                 return
         else:
-            if not paths.LAST_UPLOAD_ZIP.exists():
-                if not _ensure_upload_cache_from_extract():
-                    st.warning("Upload a zip of raw files, or enable the local sample.")
-                    return
+            cached = _cached_upload_path()
+            if cached is None:
+                st.warning("Upload one Excel file, or enable the local sample.")
+                return
             stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            run_dir = paths.DEMO_RUNS_DIR / stamp
-            try:
-                raw_dir = _extract_zip_bytes(
-                    paths.LAST_UPLOAD_ZIP.read_bytes(), run_dir, int(year)
-                )
-            except zipfile.BadZipFile:
-                st.error("Cached file is not a valid zip. Clear it and upload again.")
-                return
-            if not _has_excel(raw_dir):
-                st.error(
-                    f"No Excel files found for {year} in that zip "
-                    f"(looked under `{raw_dir}`). "
-                    "Zip the year folder, or use ARK.zip and set Year correctly."
-                )
-                return
+            run_dir = paths.DEMO_RUNS_DIR / stamp / "raw"
+            run_dir.mkdir(parents=True, exist_ok=True)
+            dest_name = _cached_upload_name() or cached.name
+            dest = run_dir / Path(dest_name).name
+            shutil.copy2(cached, dest)
+            raw_dir = run_dir
 
         if not paths.TEMPLATE_PATH.exists():
             st.error(f"Template not found: {paths.TEMPLATE_PATH}")
@@ -585,14 +454,14 @@ def render() -> None:
 
         try:
             with st.status("Cleaning bordereau…", expanded=True) as status:
-                status.write("Reading premiums…")
-                status.write("Merging quarter…")
+                status.write(f"Mode: {mode_label}")
+                status.write("Inferring year/quarter from date columns…")
                 status.write("Writing class sheets…")
                 result = run_pipeline(
                     cedant=str(cedant).strip(),
                     broker=str(broker).strip(),
-                    year=int(year),
-                    quarter=int(quarter),
+                    year=None,
+                    quarter=None,
                     raw_dir=raw_dir,
                     template=paths.TEMPLATE_PATH,
                     out_dir=paths.OUTPUT_DIR,
@@ -600,6 +469,8 @@ def render() -> None:
                     collapsed=collapsed,
                     include_audit_sheets=include_audit,
                     include_fac=include_fac,
+                    convert_pdfs=False,
+                    bordereau_type=bordereau_type,
                 )
                 status.update(label="Clean finished", state="complete")
         except UnsupportedCedantError as exc:
@@ -608,6 +479,23 @@ def render() -> None:
             return
         except Exception as exc:
             st.error(f"Clean failed: {exc}")
+            st.session_state.last_run_ok = False
+            return
+
+        summary = result.summary or {}
+        resolved_year = summary.get("year")
+        resolved_quarter = summary.get("quarter")
+        try:
+            resolved_year = int(resolved_year) if resolved_year is not None else None
+            resolved_quarter = int(resolved_quarter) if resolved_quarter is not None else None
+        except (TypeError, ValueError):
+            resolved_year, resolved_quarter = None, None
+        if resolved_year is None or resolved_quarter is None:
+            st.error(
+                "Could not resolve year/quarter from the upload. "
+                "Ensure date columns (Date of Loss, Cover From, Transaction Date, …) "
+                "are populated in the workbook."
+            )
             st.session_state.last_run_ok = False
             return
 
@@ -621,29 +509,28 @@ def render() -> None:
         st.session_state.last_summary = result.summary
         st.session_state.last_cedant = str(cedant).strip()
         st.session_state.last_broker = str(broker).strip()
-        st.session_state.last_year = int(year)
-        st.session_state.last_quarter = int(quarter)
+        st.session_state.last_year = int(resolved_year)
+        st.session_state.last_quarter = int(resolved_quarter)
         st.session_state.last_run_ok = True
 
         st.session_state.form_cedant = str(cedant).strip()
         st.session_state.form_broker = str(broker).strip()
-        st.session_state.form_year = int(year)
-        st.session_state.form_quarter = int(quarter)
         st.session_state.form_use_sample = bool(use_sample)
+        st.session_state.form_bordereau_mode = mode_label
 
         _save_form_disk(
             cedant=str(cedant).strip(),
             broker=str(broker).strip(),
-            year=int(year),
-            quarter=int(quarter),
             use_sample=bool(use_sample),
+            bordereau_mode=mode_label,
         )
         _save_last_run(
             cedant=str(cedant).strip(),
             broker=str(broker).strip(),
-            year=int(year),
-            quarter=int(quarter),
+            year=int(resolved_year),
+            quarter=int(resolved_quarter),
             use_sample=bool(use_sample),
+            bordereau_type=bordereau_type,
             output_path=str(result.output_path),
         )
 
@@ -656,6 +543,8 @@ def render() -> None:
                 "premium_file_unreadable",
                 "claims_parse_failed",
                 "no_premium_files",
+                "no_claims_files",
+                "period_unresolved",
             }
         ]
         if hard:
@@ -671,8 +560,15 @@ def render() -> None:
         prem = st.session_state.last_premium_rows
         paid = st.session_state.last_claims_rows
         ost = st.session_state.last_outstanding_rows
+        shown_year = st.session_state.get("last_year")
+        shown_quarter = st.session_state.get("last_quarter")
 
-        st.success("Cleaned workbook ready")
+        st.success(
+            f"Cleaned workbook ready — **{shown_year} Q{shown_quarter}** "
+            f"(from date columns)"
+            if shown_year and shown_quarter
+            else "Cleaned workbook ready"
+        )
         m1, m2, m3 = st.columns(3)
         m1.metric("Premium rows", f"{prem:,}" if prem is not None else "—")
         m2.metric("Paid claims", f"{paid:,}" if paid is not None else "—")
@@ -682,6 +578,8 @@ def render() -> None:
         ccy = (st.session_state.last_summary or {}).get("currency")
         if ccy:
             st.caption(f"Primary currency workbook: **{ccy}**")
+
+        _show_field_completeness(st.session_state.last_summary)
 
         d1, d2, d3 = st.columns(3)
         with d1:
@@ -728,11 +626,10 @@ def render() -> None:
     elif not clean:
         if use_sample:
             st.info(
-                "Prefill is AIICO · ARK · 2025 · Q2 — hit **Clean** to produce the demo workbook."
+                "Sample is AIICO · ARK · 2025 — hit **Clean**. "
+                "Year/quarter are read from the file."
             )
         elif cached_name:
-            st.info(
-                f"Cached **{cached_name}** is ready — pick year/quarter and hit **Clean**."
-            )
+            st.info(f"Cached **{cached_name}** is ready — hit **Clean**.")
         else:
-            st.info("Upload a raw zip, or enable the local sample.")
+            st.info("Upload one Excel bordereau, or enable the local sample.")

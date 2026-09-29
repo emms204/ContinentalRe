@@ -44,7 +44,27 @@ When a tab carries no class (combined `2nd surplus` premium tabs, `2ND SURPLUS T
 | GOODS IN TRANSIT, ALL RISKS, BURGLARY, MONEY, … | General Accident |
 | FACULTATIVE / FAC OBLIG | Facultative *(ignored by default; `--include-fac` to keep)* |
 
-See `cre_cleaner/class_labels.py` for the full map.
+See `cre_cleaner/core/class_labels.py` for the full map.
+
+## Layout
+
+```
+ContinentalRe/
+  cre_cleaner/          # cleaning package + API
+    adapters/           # cedant/broker discovery
+    core/               # parse, map, merge, reconcile
+    io/                 # Excel + PDF helpers
+    api.py  cli.py  pipeline.py  config.py  models.py  paths.py
+  demo_app/             # Streamlit UI
+  tests/
+  templates/            # TEMPLATE.xlsx (style seed)
+  docs/                 # REPORT.md and notes
+  data/
+    raw/newdata/        # source bordereaux
+    raw/next5/          # Next 5 Cedant pack
+    gold/               # Bisola cleaned reference
+  output/               # run artifacts (gitignored)
+```
 
 ## Setup
 
@@ -63,7 +83,8 @@ uv pip install -r ContinentalRe/requirements.txt
 cd /Users/osabobo/Downloads/MasteryHiveAI/ContinentalRe
 source ../.venv/bin/activate
 python -m cre_cleaner run --cedant AIICO --broker ARK --year 2025 --quarter 2 \
-  --raw-dir AIICO/ARK/2025 --template TEMPLATE.xlsx --out-dir output
+  --raw-dir data/raw/newdata/AIICO/ARK/2025 \
+  --template templates/TEMPLATE.xlsx --out-dir output
 ```
 
 Outputs:
@@ -74,7 +95,7 @@ Outputs:
 ## Inspect a raw file
 
 ```bash
-python -m cre_cleaner inspect --file "AIICO/ARK/2025/JANUARY PREM 2025 LOCAL (1).xlsx"
+python -m cre_cleaner inspect --file "data/raw/newdata/AIICO/ARK/2025/JANUARY PREM 2025 LOCAL (1).xlsx"
 ```
 
 ## Output workbook sheets (default upload)
@@ -109,7 +130,8 @@ source ../.venv/bin/activate
 streamlit run demo_app/app.py
 ```
 
-Prefills AIICO · ARK · 2025 · Q2 against the local sample under `AIICO/ARK/2025`. Compare proves sheet-derived totals against `gold/AIICO_ARK/{year}/Q{n}_{year}_BORDEREAU_NEW.xlsx`. Upload accepts zip or a single `.xlsx`/`.xls`.
+Phase 1: upload **one** Excel file; year/quarter come from date columns; mode is
+Premium / Claims / Outstanding / All. Sample data: `data/raw/newdata/AIICO/ARK/2025`.
 
 ## Provisional API (FastAPI)
 
@@ -117,14 +139,17 @@ Grouping `cedant/broker/year/quarter/currency` is provisional until agreed with 
 
 Requires `CRE_CLEANER_API_KEY` (send as `X-API-Key`). Uploads are capped by
 `CRE_CLEANER_MAX_UPLOAD_MB` (default 50) and never written under `output/api_runs`.
+PDFs need `LLAMA_CLOUD_API_KEY`. Year/quarter form fields are optional
+(default: read from date columns in the sheets).
 
 ```bash
 cd /Users/osabobo/Downloads/MasteryHiveAI/ContinentalRe
 source ../.venv/bin/activate
 export CRE_CLEANER_API_KEY=dev-secret
+export LLAMA_CLOUD_API_KEY=…   # when sending PDFs
 uvicorn cre_cleaner.api:app --reload --port 8090
-# POST /clean       (multipart + X-API-Key; returns cleaned zip)
-# POST /clean/json  (same; metrics only — temp files deleted after response)
+# POST /clean       multipart: cedant, broker, files=… (year/quarter optional)
+# POST /clean/json  same; metrics only
 # GET  /adapters
 # GET  /health
 ```

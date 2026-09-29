@@ -5,3 +5,4 @@ streamlit>=1.32
 fastapi>=0.110
 uvicorn>=0.27
 python-multipart>=0.0.9
+llama-cloud>=2.8

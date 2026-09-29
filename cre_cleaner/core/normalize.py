@@ -61,7 +61,19 @@ def parse_number(val: Any) -> Optional[float]:
     if s.startswith("(") and s.endswith(")"):
         neg = True
         s = s[1:-1]
-    s = s.replace(",", "").replace(" ", "")
+    # Trailing minus used in some bordereaux: "1,234-" / "1234.50-"
+    if re.search(r"[\d.]-\s*$", s) and not s.startswith("-"):
+        neg = True
+        s = s.rstrip().rstrip("-").rstrip()
+    # Currency codes / symbols (₦1,234.56 / NGN 1,000.00 / US$500)
+    s = re.sub(
+        r"^(?:NGN|USD|EUR|GBP|FCY|NAIRA|DOLLAR|DOLLARS|US\$)\s*",
+        "",
+        s,
+        flags=re.IGNORECASE,
+    )
+    s = s.lstrip("₦$€£")
+    s = s.replace(",", "").replace(" ", "").replace("\u00a0", "")
     if s.endswith("%"):
         s = s[:-1]
     try:

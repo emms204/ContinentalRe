@@ -93,7 +93,7 @@ st.markdown(CSS, unsafe_allow_html=True)
 
 st.markdown(
     '<h1 class="cre-heading">Continental Re · Bordereau Cleaner</h1>'
-    '<p class="cre-sub">Deterministic Excel cleaning for quarterly bordereaux</p>',
+    '<p class="cre-sub">Phase 1 — one Excel file → quarterly cleaned workbook</p>',
     unsafe_allow_html=True,
 )
 

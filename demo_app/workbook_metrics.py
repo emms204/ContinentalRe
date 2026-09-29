@@ -6,10 +6,10 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-from cre_cleaner.filters import looks_like_total_row
-from cre_cleaner.io_excel import read_workbook_sheets as _read_workbook_sheets
-from cre_cleaner.io_excel import sheet_names as _sheet_names
-from cre_cleaner.normalize import clean_text, normalize_header, parse_number
+from cre_cleaner.core.filters import looks_like_total_row
+from cre_cleaner.io.excel import read_workbook_sheets as _read_workbook_sheets
+from cre_cleaner.io.excel import sheet_names as _sheet_names
+from cre_cleaner.core.normalize import clean_text, normalize_header, parse_number
 
 
 SKIP_SHEETS = {"SUMMARY", "SOURCE AUDIT", "EXCEPTIONS"}

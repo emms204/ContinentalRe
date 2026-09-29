@@ -1,31 +1,39 @@
 """Parse premium / claims sheets and merge monthly premiums for a quarter."""
 from __future__ import annotations
 
+import re
 from collections import defaultdict
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-from cre_cleaner.class_labels import banner_class_label, is_fac_sheet_name, is_unresolved_class
-from cre_cleaner.detect import (
+from cre_cleaner.core.class_labels import (
+    banner_class_label,
+    is_fac_sheet_name,
+    is_unresolved_class,
+    normalize_class_label,
+)
+from cre_cleaner.core.detect import (
     detect_sheet_type,
     find_header_row,
     class_from_sheet_name,
 )
-from cre_cleaner.filters import (
+from cre_cleaner.core.filters import (
     is_blank_row,
     is_nil_row,
     looks_like_total_row,
     looks_like_section_header,
     has_min_transaction_evidence,
 )
-from cre_cleaner.io_excel import read_source_workbook
-from cre_cleaner.map_columns import (
+from cre_cleaner.io.excel import read_source_workbook
+from cre_cleaner.core.map_columns import (
     CLAIMS_ALIASES,
     ColumnMap,
     cell,
     detect_premium_allocation_blocks,
     extra_alias_columns,
     map_simple_columns,
+    merge_group_subheaders,
+    _looks_like_allocation_subrow,
 )
 from cre_cleaner.models import (
     PremiumRow,
@@ -34,7 +42,7 @@ from cre_cleaner.models import (
     ExceptionRecord,
     SourceAuditRecord,
 )
-from cre_cleaner.normalize import (
+from cre_cleaner.core.normalize import (
     as_text_id,
     clean_text,
     currency_code,
@@ -44,9 +52,62 @@ from cre_cleaner.normalize import (
     parse_period,
     normalize_header,
 )
-from cre_cleaner.reconcile import row_amounts
+from cre_cleaner.core.reconcile import row_amounts
 
 _NOT_A_DATE = {"NIL", "N/A", "NA", "-", "—", "TBA", "TBC"}
+_COPY_SHEET_RE = re.compile(r"^(?P<base>.*?)\s*\((?P<n>\d+)\)\s*$")
+
+
+def _sheet_base_name(sn: str) -> str:
+    m = _COPY_SHEET_RE.match(str(sn).strip())
+    return (m.group("base") if m else str(sn)).strip()
+
+
+def _is_duplicate_copy_sheet(sn: str, all_names: Sequence[str]) -> bool:
+    """True for ``CLAIMS RECOVERY (2)`` when ``CLAIMS RECOVERY`` (or another copy) exists."""
+    m = _COPY_SHEET_RE.match(str(sn).strip())
+    if not m:
+        return False
+    base = m.group("base").strip().casefold()
+    for other in all_names:
+        if other == sn:
+            continue
+        if _sheet_base_name(other).casefold() == base:
+            return True
+    return False
+
+
+def _claims_header_with_subrow(
+    raw_rows: List[List[Any]], header_at: int,
+) -> Tuple[List[Any], int]:
+    """Merge RETENTION|TREATY band + %/AMOUNT subheader into one virtual header.
+
+    Returns ``(header_cells, data_start_index)``.
+    """
+    header = raw_rows[header_at]
+    data_start = header_at + 1
+    if header_at + 1 >= len(raw_rows):
+        return list(header), data_start
+    sub = raw_rows[header_at + 1]
+    if not _looks_like_allocation_subrow(sub):
+        return list(header), data_start
+    return merge_group_subheaders(header, sub), header_at + 2
+
+
+def _premium_header_with_subrow(
+    raw_rows: List[List[Any]], header_at: int,
+) -> Tuple[List[Any], Optional[List[Any]], int]:
+    """Merge premium band + SI/Premium/% subrow. Returns (header, group_row, data_start)."""
+    header = raw_rows[header_at]
+    group_row = raw_rows[header_at - 1] if header_at > 0 else None
+    data_start = header_at + 1
+    if header_at + 1 >= len(raw_rows):
+        return list(header), group_row, data_start
+    sub = raw_rows[header_at + 1]
+    if not _looks_like_allocation_subrow(sub):
+        return list(header), group_row, data_start
+    # The found "header" is the band row; merge with subrow and keep prior row as group.
+    return merge_group_subheaders(header, sub), group_row, header_at + 2
 
 
 def _ppn_share(amount: Any, total: Any) -> Any:
@@ -320,6 +381,7 @@ def parse_premium_file(
     rows_out: List[PremiumRow] = []
     audit: List[SourceAuditRecord] = []
 
+    sheet_names = list(sheets.keys())
     for sn, raw_rows in sheets.items():
         if is_fac_sheet_name(sn) and not include_fac:
             audit.append(SourceAuditRecord(
@@ -332,6 +394,23 @@ def parse_premium_file(
                 rows_skipped=0,
                 source_month=source_month,
                 notes="Facultative sheet ignored (not a treaty class; use --include-fac)",
+            ))
+            continue
+        if _is_duplicate_copy_sheet(sn, sheet_names):
+            exceptions.append(ExceptionRecord(
+                "INFO", "duplicate_sheet_skipped", path.name, sn, 0,
+                f"Copy sheet skipped; using base tab {_sheet_base_name(sn)!r}",
+            ))
+            audit.append(SourceAuditRecord(
+                source_filename=path.name,
+                source_sheet=sn,
+                sheet_type="skip",
+                header_row=0,
+                rows_read=0,
+                rows_kept=0,
+                rows_skipped=0,
+                source_month=source_month,
+                notes="duplicate copy sheet skipped",
             ))
             continue
         st = detect_sheet_type(sn, raw_rows[:15])
@@ -382,9 +461,9 @@ def parse_premium_file(
         for hi, header_at in enumerate(header_indices):
             if header_at in header_override:
                 header, group_row = header_override[header_at]
+                data_start = header_at + 1
             else:
-                group_row = raw_rows[header_at - 1] if header_at > 0 else None
-                header = raw_rows[header_at]
+                header, group_row, data_start = _premium_header_with_subrow(raw_rows, header_at)
             if adapter is not None:
                 cmap = adapter.map_premium_columns(header, group_row, path=path, sheet=sn,
                                                    exceptions=exceptions)
@@ -433,7 +512,7 @@ def parse_premium_file(
             insured_i = cmap.get("insured")
             policy_i = cmap.get("policy_no")
 
-            for ridx in range(header_at + 1, end):
+            for ridx in range(data_start, end):
                 row = raw_rows[ridx]
                 excel_row = ridx + 1  # 1-based
                 if is_blank_row(row):
@@ -507,6 +586,32 @@ def parse_premium_file(
                 if cmap.get("channel") is not None:
                     channel = clean_text(cell(row, cmap.get("channel")))
 
+                row_class = ""
+                row_class_raw = ""
+                if cmap.get("class") is not None:
+                    row_class_raw = clean_text(cell(row, cmap.get("class")))
+                    if row_class_raw:
+                        # Prefer a resolved Bisola label; keep raw if unknown so
+                        # divert/group still has something placeable.
+                        mapped = normalize_class_label(row_class_raw)
+                        row_class = mapped if mapped and mapped != "Other" else row_class_raw
+
+                effective_class = ""
+                class_source = ""
+                class_raw = ""
+                if class_hint and not is_unresolved_class(class_hint):
+                    effective_class, class_source, class_raw = class_hint, "sheet", sn
+                elif row_class and not is_unresolved_class(row_class):
+                    effective_class, class_source, class_raw = row_class, "column", row_class_raw
+                elif banner_class and not is_unresolved_class(banner_class):
+                    effective_class, class_source, class_raw = banner_class, "banner", banner_raw
+                else:
+                    effective_class = class_hint or row_class or banner_class
+                    class_source = (
+                        "sheet" if class_hint else ("column" if row_class else ("banner" if banner_class else ""))
+                    )
+                    class_raw = sn if class_hint else (row_class_raw or banner_raw)
+
                 extra_layers = []
                 for label, ppn_i, si_i, prem_i in cmap.extra_treaty_blocks:
                     layer = {
@@ -544,9 +649,9 @@ def parse_premium_file(
                         source_filename=path.name,
                         source_sheet=sn,
                         source_row=excel_row,
-                        class_hint=class_hint or banner_class,
-                        class_source="sheet" if class_hint else ("banner" if banner_class else ""),
-                        class_label_raw=sn if class_hint else banner_raw,
+                        class_hint=effective_class,
+                        class_source=class_source,
+                        class_label_raw=class_raw,
                         currency=ccy.for_row(cell(row, cmap.get("currency"))),
                     ),
                 )
@@ -569,6 +674,12 @@ def parse_premium_file(
             notes += f"; section banners: {', '.join(banners_seen)}"
         if layer_labels:
             notes += f"; treaty layers: {primary_label or 'TREATY'} + {', '.join(layer_labels)}"
+        if kept == 0 and read_n == 0:
+            exceptions.append(ExceptionRecord(
+                "WARN", "empty_premium_sheet", path.name, sn, (hdr_i + 1) if hdr_i is not None else 0,
+                "Premium header found but no data rows — file may be an empty month workbook",
+            ))
+            notes = (notes + "; empty sheet").strip("; ")
         audit.append(totals.fill(SourceAuditRecord(
             source_filename=path.name,
             source_sheet=sn,
@@ -706,7 +817,11 @@ def _parse_claims_sheet(
         return ""
 
     for hi, header_at in enumerate(header_indices):
-        header = header_override.get(header_at) or raw_rows[header_at]
+        if header_at in header_override:
+            header = header_override[header_at]
+            data_start = header_at + 1
+        else:
+            header, data_start = _claims_header_with_subrow(raw_rows, header_at)
         cmap = map_simple_columns(header, aliases)
         end = header_indices[hi + 1] if hi + 1 < len(header_indices) else len(raw_rows)
         insured_i = cmap.get("insured")
@@ -742,7 +857,7 @@ def _parse_claims_sheet(
             if bi in header_indices and bi != header_at:
                 break
 
-        for ridx in range(header_at + 1, end):
+        for ridx in range(data_start, end):
             row = raw_rows[ridx]
             excel_row = ridx + 1
             if is_blank_row(row):
@@ -928,11 +1043,21 @@ def parse_claims_file(
     ost: List[ClaimsRow] = []
     audit: List[SourceAuditRecord] = []
 
+    sheet_names = list(sheets.keys())
     for sn, raw_rows in sheets.items():
         if is_fac_sheet_name(sn) and not include_fac:
             audit.append(SourceAuditRecord(
                 path.name, sn, "fac_skip", 0, 0, 0, 0, "",
                 "Facultative sheet ignored (not a treaty class; use --include-fac)",
+            ))
+            continue
+        if _is_duplicate_copy_sheet(sn, sheet_names):
+            exceptions.append(ExceptionRecord(
+                "INFO", "duplicate_sheet_skipped", path.name, sn, 0,
+                f"Copy sheet skipped; using base tab {_sheet_base_name(sn)!r}",
+            ))
+            audit.append(SourceAuditRecord(
+                path.name, sn, "skip", 0, 0, 0, 0, "", "duplicate copy sheet skipped",
             ))
             continue
         st = detect_sheet_type(sn, raw_rows[:20])

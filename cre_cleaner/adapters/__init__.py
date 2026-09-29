@@ -13,24 +13,65 @@ from cre_cleaner.adapters.chi_scib import ChiScibAdapter
 from cre_cleaner.adapters.custodian_scib import CustodianScibAdapter
 from cre_cleaner.adapters.mutual_benefits_ark import MutualBenefitsArkAdapter
 from cre_cleaner.adapters.nem_scib import NemScibAdapter
+from cre_cleaner.adapters.new_cedants import (
+    AiicoAgricDirectAdapter,
+    AiicoScibAdapter,
+    AxaDirectAdapter,
+    CustodianUaibAdapter,
+    HeirsDirectAdapter,
+    HeirsHibAdapter,
+    HeirsJomolaAdapter,
+    LasacoFeybilAdapter,
+    LasacoJomolaAdapter,
+    LasacoJordansAdapter,
+    MutualBenefitsJomolaAgricAdapter,
+    NemAonAdapter,
+    RoyalExchangeAgricAdapter,
+    UnitrustAgricAdapter,
+    UnitrustArkAdapter,
+)
 from cre_cleaner.adapters.royal_exchange import RoyalExchangeAdapter
 
 ADAPTERS: Dict[Tuple[str, str], Type[BaseAdapter]] = {
     ("AIICO", "ARK"): AiicoArkAdapter,
+    ("AIICO", "SCIB"): AiicoScibAdapter,
+    ("AIICO", "AGRIC DIRECT"): AiicoAgricDirectAdapter,
+    ("AXA", "DIRECT"): AxaDirectAdapter,
     ("CHI", "SCIB"): ChiScibAdapter,
     ("CUSTODIAN", "SCIB"): CustodianScibAdapter,
+    ("CUSTODIAN", "UAIB"): CustodianUaibAdapter,
+    ("HEIRS", "DIRECT"): HeirsDirectAdapter,
+    ("HEIRS", "HIB"): HeirsHibAdapter,
+    ("HEIRS", "JOMOLA"): HeirsJomolaAdapter,
+    ("LASACO", "FEYBIL"): LasacoFeybilAdapter,
+    ("LASACO", "JOMOLA"): LasacoJomolaAdapter,
+    ("LASACO", "JORDANS"): LasacoJordansAdapter,
     ("MUTUAL BENEFITS", "ARK"): MutualBenefitsArkAdapter,
+    ("MUTUAL BENEFITS", "JOMOLA AGRIC"): MutualBenefitsJomolaAgricAdapter,
+    ("NEM", "AON"): NemAonAdapter,
     ("NEM", "SCIB"): NemScibAdapter,
     ("ROYAL EXCHANGE", "DIRECT"): RoyalExchangeAdapter,
+    ("ROYAL EXCHANGE", "AGRIC"): RoyalExchangeAgricAdapter,
+    ("UNITRUST", "ARK"): UnitrustArkAdapter,
+    ("UNITRUST", "AGRIC"): UnitrustAgricAdapter,
 }
 
-# Common aliases so the demo / API can accept shortened names.
+# Common aliases so the demo / API can accept folder / shortened names.
 _ALIASES: Dict[Tuple[str, str], Tuple[str, str]] = {
     ("MUTUAL", "ARK"): ("MUTUAL BENEFITS", "ARK"),
     ("MUTUALBENEFITS", "ARK"): ("MUTUAL BENEFITS", "ARK"),
+    ("MUTUAL BENEFITS", "MUTUAL BENEFITS & ARK"): ("MUTUAL BENEFITS", "ARK"),
+    ("MUTUAL BENEFITS", "MUTUAL BENEFIT JOMOLA AGRIC"): ("MUTUAL BENEFITS", "JOMOLA AGRIC"),
     ("REX", "DIRECT"): ("ROYAL EXCHANGE", "DIRECT"),
     ("ROYALEXCHANGE", "DIRECT"): ("ROYAL EXCHANGE", "DIRECT"),
     ("CUSTODIAN AND ALLIED", "SCIB"): ("CUSTODIAN", "SCIB"),
+    ("CUSTODIAN AND ALLIED INS", "SCIB"): ("CUSTODIAN", "SCIB"),
+    ("CUSTODIAN AND ALLIED INS", "UAIB"): ("CUSTODIAN", "UAIB"),
+    ("CHI 2", "SCIB"): ("CHI", "SCIB"),
+    ("AXA MANSARD", "DIRECT"): ("AXA", "DIRECT"),
+    ("AXA", "AXA"): ("AXA", "DIRECT"),
+    ("UNITRUST", "UNITRUST & ARK"): ("UNITRUST", "ARK"),
+    ("AIICO", "AGRIC"): ("AIICO", "AGRIC DIRECT"),
 }
 
 

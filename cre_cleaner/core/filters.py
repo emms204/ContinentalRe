@@ -4,7 +4,7 @@ from __future__ import annotations
 from typing import Any, Optional, Sequence
 
 from cre_cleaner.config import SKIP_TOKENS
-from cre_cleaner.normalize import clean_text, parse_number, as_text_id
+from cre_cleaner.core.normalize import clean_text, parse_number, as_text_id
 
 
 def is_blank_row(row: Sequence[Any]) -> bool:

@@ -2,7 +2,8 @@
 
 CHI returns are mostly PDFs plus a few xlsx (PVT, AGRIC, claims, dollar
 bordereaux). Discovery matches quarter folders / filenames; parsers reuse
-default AIICO-style aliases. PDF files are logged, not read.
+default AIICO-style aliases. PDFs are converted to Excel via LlamaParse
+before discovery (see ``cre_cleaner.io.pdf``).
 """
 from __future__ import annotations
 
@@ -14,5 +15,6 @@ class ChiScibAdapter(QuarterlyWorkbookAdapter):
     broker = "SCIB"
     verified = False
     status_note = (
-        "CHI SCIB: Excel files only (many returns are PDF); not checked against Bisola gold"
+        "CHI SCIB: PDF→xlsx via LlamaParse then quarterly discovery; "
+        "not checked against Bisola gold"
     )
