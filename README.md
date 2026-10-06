@@ -12,7 +12,7 @@ Built for Emmanuel Osanebi / MasteryHiveAI. v1 focuses on **AIICO ARK**.
 - **Default output = upload-ready workbook**:
   - Bisola-style class-split sheets: `{ClassLabel} - PREMIUM|CLAIMS|OUTSTANDING`
   - Premium band **TREATY** (not SURPLUS); unique `RET/TREATY/FAC SUM INSURED` + `RET/TREATY/FAC PREMIUM`
-  - Claims/OST unique `RET AMOUNT` / `TREATY AMOUNT` / `FAC AMOUNT` (+ `SUM INSURED` column)
+  - Claims/OST unique `RET AMOUNT` / `TREATY AMOUNT` / `FAC AMOUNT` (TEMPLATE layout; no `SUM INSURED` column)
   - **No** `EXCEPTIONS` / `SOURCE AUDIT` sheets in the upload file (validator treats them as invalid classes)
   - **No** `Facultative - *` sheets (Continental: FAC is not a treaty class)
 - Audit logs are written as **sidecar files** next to the cleaned xlsx:
@@ -23,14 +23,14 @@ Built for Emmanuel Osanebi / MasteryHiveAI. v1 focuses on **AIICO ARK**.
 - Optional `--collapsed` writes legacy single PREMIUM/CLAIMS/OUTSTANDING sheets.
 - `--proportion-headers gold|distinct|plain` (default `gold`): premium proportion column names. `gold` = Bisola's most recent distinct naming (RET/TREATY/FAC PROPORTION %, her Q4 2025 Bond sheet) — same text as `distinct`; `plain` = `PROPORTION %` ×3 (literal Q2 2025 gold; duplicate names).
 - `--out-name FILE.xlsx` overrides the output filename (sidecars follow the stem).
-- CLAIMS/OUTSTANDING sheets keep **column A fully empty** with the title in B1 and headers in B–S (TEMPLATE.xlsx / Bisola gold layout) — default ON (`--claims-leading-blank`). `--no-claims-leading-blank` starts claims headers at column A instead.
-- Upload sheets are built fresh (TEMPLATE = header style seed only): premium exactly 18 cols A–R, claims/outstanding 18 header cols B–S with column A empty (19 cols A–S), nothing hidden, no stray/whitespace cells, no Excel error literals, explicit number formats. Validate with `python tests/validate_upload.py OUTPUT.xlsx [GOLD.xlsx]`.
-- TEMPLATE.xlsx is used only as a layout/style seed; **upload headers come from Bisola/validator schema** in `config.py`.
+- CLAIMS/OUTSTANDING sheets keep **column A fully empty** with the title in B1 and headers in B–R (TEMPLATE.xlsx layout) — default ON (`--claims-leading-blank`). `--no-claims-leading-blank` starts claims headers at column A instead.
+- Upload sheets are built fresh (TEMPLATE = header style seed only): premium exactly 18 cols A–R, claims/outstanding 17 header cols B–R with column A empty (18 cols A–R), nothing hidden, no stray/whitespace cells, no Excel error literals, explicit number formats. Validate with `python tests/validate_upload.py OUTPUT.xlsx [GOLD.xlsx]`.
+- TEMPLATE.xlsx seeds layout/styles; **claims/outstanding upload headers match TEMPLATE** (`config.CLAIMS_COL_MAP`). Premium band names follow the Bisola/validator unique-label schema in `config.py`.
 
 ## Class label mapping (AIICO ARK → Bisola)
 
 Class resolution order (Bisola's Cleaning Manual): clear source grouping (tab name) > row-level CLASS column > section/sheet heading > mapping guide > exception.
-When a tab carries no class (combined `2nd surplus` premium tabs, `2ND SURPLUS TREATY` paid tab) the class comes from the lone **section-banner row** above the rows (`FIRE`, `ENGINERRING`, `FIRE PAID CLAIM`, `ENGINEERING PAID CLAIM`, `MARINE PAID CLAIM` → Marine Cargo, …). Banner rows are never output; the banner text is recorded in the source-audit notes. Rows still without a class go to the exceptions sidecar (`class_unresolved`) — there is no `Other` sheet. These rows land on the plain class sheets (no `2ND SURPLUS …` sheets). `CASUALTY` / `CAS` are **not** mapped yet (pending Bisola) and keep a title-cased sheet (`Casualty - PREMIUM`, `Cas - PREMIUM`).
+When a tab carries no class (combined `2nd surplus` premium tabs, `2ND SURPLUS TREATY` paid tab) the class comes from the lone **section-banner row** above the rows (`FIRE`, `ENGINERRING`, `FIRE PAID CLAIM`, `ENGINEERING PAID CLAIM`, `MARINE PAID CLAIM` → Marine Cargo, …). Banner rows are never output; the banner text is recorded in the source-audit notes. Rows still without a class go to the exceptions sidecar (`class_unresolved`) — there is no `Other` sheet. These rows land on the plain class sheets (no `2ND SURPLUS …` sheets). `CASUALTY`, `CAS` (exact match only) and `HOUSEHOLDERS` map to **General Accident** (Bisola-approved, IMPL-20260925-01). `MARINE 2ND SURPLUS` / `MARINE 2ND SURP` stay unresolved (exceptions sidecar, pending Bisola).
 
 | Source CLASS / sheet hint | Bisola sheet label |
 |---------------------------|--------------------|
@@ -107,7 +107,7 @@ python -m cre_cleaner inspect --file "data/raw/newdata/AIICO/ARK/2025/JANUARY PR
 | `{Class} - CLAIMS` | Paid claims (unique RET/TREATY/FAC AMOUNT) |
 | `{Class} - OUTSTANDING` | Outstanding claims |
 
-Class labels typically seen for AIICO ARK: Fire, General Accident, Marine Cargo, Marine Hull, Engineering, Bond, Motor. Additional own classes when present in source: Terrorism & PVT, Agriculture, Aviation, Oil & Gas, Travel. Bare **MARINE** (Hull vs Cargo unclear) goes to the exceptions sidecar, not a sheet. CASUALTY stays unmapped pending Bisola.
+Class labels typically seen for AIICO ARK: Fire, General Accident, Marine Cargo, Marine Hull, Engineering, Bond, Motor. Additional own classes when present in source: Terrorism & PVT, Agriculture, Aviation, Oil & Gas, Travel. Bare **MARINE** (Hull vs Cargo unclear) goes to the exceptions sidecar, not a sheet. CASUALTY / CAS / HOUSEHOLDERS → General Accident.
 
 ## Known gaps / behaviour notes
 

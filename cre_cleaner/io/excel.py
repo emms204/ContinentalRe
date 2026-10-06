@@ -288,16 +288,21 @@ _PREMIUM_PCT_KEYS = {
     "MPL %", "RETENTION PROPORTION %", "TREATY PROPORTION %", "FACULTATIVE PROPORTION %",
 }
 _CLAIMS_AMOUNT_KEYS = {
-    "SUM INSURED", "TOTAL CLAIMS", "RET AMOUNT", "TREATY AMOUNT", "FAC AMOUNT",
+    "TOTAL CLAIMS", "RET AMOUNT", "TREATY AMOUNT", "FAC AMOUNT",
 }
 _CLAIMS_PCT_KEYS = {"PPN RET %", "PPN TREATY %", "PPN FAC %"}
 
 _AMOUNT_FMT = "#,##0.00"
+# Premium proportions are stored as percent points (8.2 → "8.20"); claims PPN
+# shares are fractions (amount/total → 0.062) and must use Excel % format so
+# they display like Bisola gold (6.21%), not 0.06.
 _PCT_FMT = "0.00"
+_CLAIMS_PCT_FMT = "0.00%"
 _DATE_FMT = "DD/MM/YYYY"
 
 _PREMIUM_WIDTHS = [7, 22, 45, 12, 12, 12, 20, 9, 18, 12, 20, 18, 12, 20, 18, 12, 18, 16]
-_CLAIMS_WIDTHS = [7, 40, 18, 22, 26, 14, 8, 12, 12, 20, 18, 10, 18, 10, 18, 10, 16, 50]
+# TEMPLATE claims headers B..R (no SUM INSURED): S/NO … TO, TOTAL CLAIMS, … DETAILS
+_CLAIMS_WIDTHS = [7, 40, 18, 22, 26, 14, 8, 12, 12, 18, 10, 18, 10, 18, 10, 16, 50]
 
 
 class _Sink:
@@ -488,10 +493,10 @@ def write_premium_rows(
 
 
 def claims_col_map(leading_blank: bool = True) -> Dict[str, int]:
-    """CLAIMS_COL_MAP holds Bisola-gold positions (S/NO. in col B).
+    """CLAIMS_COL_MAP holds TEMPLATE positions (S/NO. in col B).
 
-    Default upload layout (TEMPLATE.xlsx / Bisola gold): column A fully empty,
-    headers B..S. ``leading_blank=False`` shifts everything to start at col A."""
+    Default upload layout (TEMPLATE.xlsx): column A fully empty, headers B..R.
+    ``leading_blank=False`` shifts everything to start at col A."""
     shift = 0 if leading_blank else -(min(CLAIMS_COL_MAP.values()) - 1)
     return {k: v + shift for k, v in CLAIMS_COL_MAP.items()}
 
@@ -507,10 +512,10 @@ def write_claims_rows(
     styles: Optional[Dict[str, Dict[str, Any]]] = None,
     sink: Optional[_Sink] = None,
 ) -> int:
-    """Write an 18-column claims/outstanding sheet.
+    """Write a claims/outstanding sheet matching TEMPLATE.xlsx.
 
     Default (``leading_blank=True``): column A fully empty, title in B1, headers
-    B..S (as TEMPLATE.xlsx and Bisola gold). ``leading_blank=False``: A..R."""
+    B..R. ``leading_blank=False``: headers start at column A."""
     styles = styles or {}
     cmap = claims_col_map(leading_blank)
     first_col = min(cmap.values())
@@ -551,7 +556,7 @@ def write_claims_rows(
             elif key in _CLAIMS_AMOUNT_KEYS:
                 cell.number_format = _AMOUNT_FMT
             elif key in _CLAIMS_PCT_KEYS:
-                cell.number_format = _PCT_FMT
+                cell.number_format = _CLAIMS_PCT_FMT
             elif key == "UW YR":
                 cell.number_format = "0"
             else:
@@ -772,14 +777,15 @@ def _write_class_split_sheets(
     claims_leading_blank: bool = True,
     styles: Optional[Dict[str, Dict[str, Any]]] = None,
     sink: Optional[_Sink] = None,
+    class_map: Any = None,
 ) -> Dict[str, int]:
     """Create Bisola-style per-class sheets; omit empty class×type combos.
 
     Returns {sheet_title: row_count}.
     """
-    prem_by = group_rows_by_class(premium_rows, premium_class_hint)
-    paid_by = group_rows_by_class(claims_rows, claims_class_hint)
-    ost_by = group_rows_by_class(outstanding_rows, claims_class_hint)
+    prem_by = group_rows_by_class(premium_rows, premium_class_hint, class_map)
+    paid_by = group_rows_by_class(claims_rows, claims_class_hint, class_map)
+    ost_by = group_rows_by_class(outstanding_rows, claims_class_hint, class_map)
 
     all_labels = _filter_fac_labels(
         ordered_class_labels(set(prem_by) | set(paid_by) | set(ost_by)),
@@ -891,6 +897,7 @@ def write_output_workbook(
     include_fac: bool = False,
     proportion_mode: str = DEFAULT_PROPORTION_MODE,
     claims_leading_blank: bool = True,
+    class_map: Any = None,
 ) -> Tuple[Path, Path, Path]:
     """Write upload-ready workbook + sidecar exception/audit files.
 
@@ -929,6 +936,7 @@ def write_output_workbook(
             claims_leading_blank=claims_leading_blank,
             styles=styles,
             sink=sink,
+            class_map=class_map,
         )
         layout = "class-split"
 

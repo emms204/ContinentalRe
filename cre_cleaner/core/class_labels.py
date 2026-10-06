@@ -1,16 +1,19 @@
-"""Map AIICO ARK source class / sheet hints onto Bisola-style class labels.
+"""Map source class / sheet hints onto Bisola-style class labels.
 
 Bisola sheet naming: ``{ClassLabel} - PREMIUM|CLAIMS|OUTSTANDING``.
 Canonical labels she uses: Fire, General Accident, Marine Cargo, Marine Hull,
-Engineering, Bond. Source files often carry finer subclasses (Goods in Transit,
-All Risks, Burglary, …) that belong under General Accident.
+Engineering, Bond. This module holds only the generic class vocabulary; a
+cedant's own subclasses, typos and approved mappings are supplied by its
+adapter (``BaseAdapter.class_label_map``) and passed in as ``class_map``.
 
 Facultative is **not** a Continental treaty class — ignored by default
 (``--include-fac`` to keep).
 """
 from __future__ import annotations
 
-from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+import re
+
+from typing import Dict, FrozenSet, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 from cre_cleaner.config import FAC_CLASS_LABEL
 from cre_cleaner.core.normalize import normalize_header
@@ -63,40 +66,13 @@ _CLASS_MAP: Dict[str, str] = {
     "MISC": "General Accident",
     "GENERAL ACCIDENT": "General Accident",
     "ACCIDENT": "General Accident",
-    # Obvious General Accident typos / abbreviations seen in raw tabs
-    # (e.g. Q3 2020 'GEN ACCIENT'). CASUALTY is deliberately NOT mapped
-    # (pending Bisola's approval) — it stays a title-cased 'Casualty' label.
-    "GEN ACCIENT": "General Accident",
-    "GENERAL ACCIENT": "General Accident",
     "GEN ACCIDENT": "General Accident",
-    "GEN ACCDT": "General Accident",
-    "GEN ACDNT": "General Accident",
-    "GEN ACCIDNT": "General Accident",
     "GEN ACC": "General Accident",
     "GENERAL ACC": "General Accident",
     "GENERAL ACCIDENTS": "General Accident",
     "FACULTATIVE": FAC_CLASS_LABEL,
     "FAC OBLIG": FAC_CLASS_LABEL,
     "FAC": FAC_CLASS_LABEL,
-    # AIICO ARK claims CLASS column subclasses → General Accident
-    "GOODS IN TRANSIT": "General Accident",
-    "GIT": "General Accident",
-    "ALL RISKS": "General Accident",
-    "ALL RISK": "General Accident",
-    "BURGLARY": "General Accident",
-    "MONEY": "General Accident",
-    "FIDELITY GUARANTEE": "General Accident",
-    "FIDELITY": "General Accident",
-    "PUBLIC LIABILITY": "General Accident",
-    "PUBLIC / PRODUCT LIABILITY": "General Accident",
-    "PUBLIC/PRODUCT LIABILITY": "General Accident",
-    "PRODUCT LIABILITY": "General Accident",
-    "PROFESSIONAL INDEMNITY": "General Accident",
-    "DIRECTORS AND OFFICERS LIABILITY": "General Accident",
-    "D&O": "General Accident",
-    "PERSONAL ACCIDENT": "General Accident",
-    "WORKMEN COMPENSATION": "General Accident",
-    "WORKMEN'S COMPENSATION": "General Accident",
     # Own classes (Continental books these separately from General Accident)
     "MOTOR": "Motor",
     "TERRORISM": "Terrorism & PVT",
@@ -113,6 +89,26 @@ _CLASS_MAP: Dict[str, str] = {
 }
 
 
+# Keys matched only as the WHOLE normalized value, never as a substring in the
+# fallback of normalize_class_label (short keys that occur inside other words).
+# Adapters add their own via ``ClassMap.exact_only``.
+_EXACT_ONLY_KEYS: FrozenSet[str] = frozenset()
+
+
+class ClassMap:
+    """Generic class map plus one adapter's extra keys (never another's)."""
+
+    def __init__(self, extra: Optional[Mapping[str, str]] = None,
+                 exact_only: Iterable[str] = ()) -> None:
+        self.map: Dict[str, str] = dict(_CLASS_MAP)
+        self.map.update(extra or {})
+        self.exact_only: FrozenSet[str] = frozenset(_EXACT_ONLY_KEYS) | frozenset(exact_only)
+        self._by_len = sorted(self.map.items(), key=lambda kv: -len(kv[0]))
+
+
+GENERIC_CLASS_MAP = ClassMap()
+
+
 def _norm_key(raw: str) -> str:
     s = (raw or "").strip().upper()
     s = s.replace(".", " ").replace("_", " ").replace("-", " ")
@@ -121,21 +117,25 @@ def _norm_key(raw: str) -> str:
     return s.strip()
 
 
-def normalize_class_label(raw: Optional[str]) -> str:
+def normalize_class_label(raw: Optional[str], class_map: Optional[ClassMap] = None) -> str:
     """Map a source CLASS / sheet hint to a Bisola class label.
 
-    Unknown non-empty values are returned in title case so they still get a
-    sheet (never silently dropped). Empty → ``\"Other\"``.
+    ``class_map`` is the adapter's map (generic + that cedant's extras);
+    default: generic only. Unknown non-empty values are returned in title
+    case so they still get a sheet (never silently dropped). Empty → ``\"Other\"``.
     """
+    cmap = class_map or GENERIC_CLASS_MAP
     if raw is None:
         return "Other"
     key = _norm_key(str(raw))
     if not key:
         return "Other"
-    if key in _CLASS_MAP:
-        return _CLASS_MAP[key]
+    if key in cmap.map:
+        return cmap.map[key]
     # Substring / prefix fallbacks (longest keys first)
-    for token, label in sorted(_CLASS_MAP.items(), key=lambda kv: -len(kv[0])):
+    for token, label in cmap._by_len:
+        if token in cmap.exact_only:
+            continue
         if token and token in key:
             return label
     # Title-case leftover for a visible sheet name
@@ -220,8 +220,8 @@ def banner_class_label(text: Optional[str]) -> str:
     return ""
 
 
-def is_fac_class(raw: Optional[str]) -> bool:
-    return normalize_class_label(raw) == FAC_CLASS_LABEL
+def is_fac_class(raw: Optional[str], class_map: Optional[ClassMap] = None) -> bool:
+    return normalize_class_label(raw, class_map) == FAC_CLASS_LABEL
 
 
 def is_fac_sheet_name(sheet_name: str) -> bool:
@@ -238,9 +238,14 @@ def is_fac_sheet_name(sheet_name: str) -> bool:
     return False
 
 
+_SHEET_TITLE_FORBIDDEN = re.compile(r"[\[\]:*?/\\]")
+
+
 def class_sheet_title(class_label: str, bordereau_type: str) -> str:
-    """e.g. ``Fire - PREMIUM``."""
-    return f"{class_label} - {bordereau_type}"
+    """e.g. ``Fire - PREMIUM``. Characters Excel forbids in a sheet title
+    (``[ ] : * ? / \\``) are replaced by ``-`` so an unmapped source class such
+    as ``PUBLIC/PRODUCT LIABILITY`` cannot crash the writer."""
+    return f"{_SHEET_TITLE_FORBIDDEN.sub('-', class_label)} - {bordereau_type}"
 
 
 def ordered_class_labels(labels: Iterable[str]) -> List[str]:
@@ -254,11 +259,12 @@ def ordered_class_labels(labels: Iterable[str]) -> List[str]:
     return seen
 
 
-def group_rows_by_class(rows: Sequence, class_getter) -> Dict[str, list]:
+def group_rows_by_class(rows: Sequence, class_getter,
+                        class_map: Optional[ClassMap] = None) -> Dict[str, list]:
     """Group row objects by normalized Bisola class label."""
     out: Dict[str, list] = {}
     for r in rows:
-        lab = normalize_class_label(class_getter(r))
+        lab = normalize_class_label(class_getter(r), class_map)
         out.setdefault(lab, []).append(r)
     return out
 
@@ -278,7 +284,7 @@ def claims_class_hint(row) -> str:
     return name or sheet
 
 
-def mapping_documentation() -> List[Tuple[str, str]]:
+def mapping_documentation(class_map: Optional[ClassMap] = None) -> List[Tuple[str, str]]:
     """Stable (source, Bisola label) pairs for README / SUMMARY."""
-    items = sorted(_CLASS_MAP.items(), key=lambda kv: (kv[1], kv[0]))
+    items = sorted((class_map or GENERIC_CLASS_MAP).map.items(), key=lambda kv: (kv[1], kv[0]))
     return items

@@ -24,7 +24,8 @@ from cre_cleaner.core.filters import (
     looks_like_section_header,
     has_min_transaction_evidence,
 )
-from cre_cleaner.io.excel import read_source_workbook
+from cre_cleaner.io.excel import read_source_workbook, read_workbook_sheets
+from cre_cleaner.core.table_type import OTHER, UNKNOWN, TabType, classify_tab
 from cre_cleaner.core.map_columns import (
     CLAIMS_ALIASES,
     ColumnMap,
@@ -47,6 +48,8 @@ from cre_cleaner.core.normalize import (
     clean_text,
     currency_code,
     currency_codes,
+    currency_filter_code,
+    prefer_named_over_fcy,
     parse_number,
     parse_date,
     parse_period,
@@ -56,6 +59,28 @@ from cre_cleaner.core.reconcile import row_amounts
 
 _NOT_A_DATE = {"NIL", "N/A", "NA", "-", "—", "TBA", "TBC"}
 _COPY_SHEET_RE = re.compile(r"^(?P<base>.*?)\s*\((?P<n>\d+)\)\s*$")
+
+
+def _workbook_currency_filter_hint(
+    sheets: Dict[str, List[List[Any]]],
+) -> Optional[str]:
+    """Single Currency Filter code shared across tabs in one workbook, if any.
+
+    Some exports put ``Currency Filter ( NAIRA at 1 )`` on the premium tab
+    while the claims tab title only says FOREIGN CURRENCY — without this hint
+    the two tabs split into NGN vs FCY workbooks.
+    """
+    found: set = set()
+    for rows in sheets.values():
+        for row in rows[:30]:
+            for cell_v in row:
+                if isinstance(cell_v, str):
+                    code = currency_filter_code(cell_v)
+                    if code:
+                        found.add(code)
+    if len(found) == 1:
+        return next(iter(found))
+    return None
 
 
 def _sheet_base_name(sn: str) -> str:
@@ -77,16 +102,76 @@ def _is_duplicate_copy_sheet(sn: str, all_names: Sequence[str]) -> bool:
     return False
 
 
+def _adapter_rules(adapter: Any):
+    """(sheet-type rules, table vocab, class map) of the adapter; generic when
+    no adapter is given. Cedant rules only ever come from the adapter."""
+    if adapter is None:
+        return None, None, None
+    cmap = adapter.class_map() if hasattr(adapter, "class_map") else None
+    return getattr(adapter, "sheet_type_rules", None), getattr(adapter, "table_vocab", None), cmap
+
+
+def _uw_year_fallback(adapter: Any, uw_col: Optional[int], uw: Any, period_from: Any,
+                      exceptions: List[ExceptionRecord], path: Path, sheet: str,
+                      excel_row: int, kind: str) -> Any:
+    """UW-year start-date fallback — adapter setting, OFF by default.
+
+    The source UW column is always copied when the tab has one (all
+    cedants). Only when the tab has *no* UW column AND the adapter setting
+    ``uw_year_from_start_date`` is on for the run period is the UW year taken
+    from the year of the policy start date (FROM); every derived value is
+    flagged ``uw_year_from_start_date`` in the exceptions sidecar.
+    """
+    if uw_col is not None or adapter is None or not hasattr(adapter, "setting"):
+        return uw
+    if not adapter.setting("uw_year_from_start_date"):
+        return uw
+    year = getattr(period_from, "year", None)
+    if not isinstance(year, int):
+        return uw
+    exceptions.append(ExceptionRecord(
+        "INFO", "uw_year_from_start_date", path.name, sheet, excel_row,
+        f"{kind}: no UW YEAR column — UW year {year} taken from policy start date "
+        f"{period_from:%Y-%m-%d} (derived, approved fallback)",
+    ))
+    return year
+
+
+def _row_list(rows: List[int]) -> str:
+    """Compact 'r5-r9, r12' list of source rows."""
+    out, start, prev = [], None, None
+    for r in rows:
+        if start is None:
+            start = prev = r
+        elif r == prev + 1:
+            prev = r
+        else:
+            out.append(f"r{start}" if start == prev else f"r{start}-r{prev}")
+            start = prev = r
+    if start is not None:
+        out.append(f"r{start}" if start == prev else f"r{start}-r{prev}")
+    return ", ".join(out)
+
+
+def _tie_note(ties: List[str]) -> str:
+    """Source-audit note recording every column tie decision (alias-list
+    order, then leftmost column)."""
+    if not ties:
+        return ""
+    return "; column ties (alias order, then position): " + " | ".join(ties)
+
+
 def _claims_header_with_subrow(
-    raw_rows: List[List[Any]], header_at: int,
+    raw_rows: List[List[Any]], header_at: int, merge: bool = False,
 ) -> Tuple[List[Any], int]:
-    """Merge RETENTION|TREATY band + %/AMOUNT subheader into one virtual header.
+    """Merge RETENTION|TREATY band + %/AMOUNT subheader into one virtual header
+    (unless the adapter opts out with ``band_subrow_layout = False``).
 
     Returns ``(header_cells, data_start_index)``.
     """
     header = raw_rows[header_at]
     data_start = header_at + 1
-    if header_at + 1 >= len(raw_rows):
+    if not merge or header_at + 1 >= len(raw_rows):
         return list(header), data_start
     sub = raw_rows[header_at + 1]
     if not _looks_like_allocation_subrow(sub):
@@ -95,43 +180,20 @@ def _claims_header_with_subrow(
 
 
 def _premium_header_with_subrow(
-    raw_rows: List[List[Any]], header_at: int,
+    raw_rows: List[List[Any]], header_at: int, merge: bool = False,
 ) -> Tuple[List[Any], Optional[List[Any]], int]:
-    """Merge premium band + SI/Premium/% subrow. Returns (header, group_row, data_start)."""
+    """Merge premium band + SI/Premium/% subrow (unless the adapter opts out
+    with ``band_subrow_layout = False``). Returns (header, group_row, data_start)."""
     header = raw_rows[header_at]
     group_row = raw_rows[header_at - 1] if header_at > 0 else None
     data_start = header_at + 1
-    if header_at + 1 >= len(raw_rows):
+    if not merge or header_at + 1 >= len(raw_rows):
         return list(header), group_row, data_start
     sub = raw_rows[header_at + 1]
     if not _looks_like_allocation_subrow(sub):
         return list(header), group_row, data_start
     # The found "header" is the band row; merge with subrow and keep prior row as group.
     return merge_group_subheaders(header, sub), group_row, header_at + 2
-
-
-def _ppn_share(amount: Any, total: Any) -> Any:
-    """Bisola-style share of total: amount / total_claims (fraction, not %).
-
-    AIICO ARK source claims rarely ship PPN columns; gold fills
-    PPN RET/TREATY/FAC % from the amount bands. Missing amount → 0 when
-    total is usable (matches gold's blank FAC band). Zero/missing total →
-    leave blank (cannot divide).
-    """
-    if total is None:
-        return None
-    try:
-        denom = float(total)
-    except (TypeError, ValueError):
-        return None
-    if denom == 0:
-        return None
-    if amount is None:
-        return 0.0
-    try:
-        return float(amount) / denom
-    except (TypeError, ValueError):
-        return None
 
 
 def _load_source(path: Path) -> Tuple[Dict[str, List[List[Any]]], List[ExceptionRecord], Dict[str, int]]:
@@ -148,35 +210,84 @@ def _load_source(path: Path) -> Tuple[Dict[str, List[List[Any]]], List[Exception
 
 
 class _SheetCurrency:
-    """Currency for one source sheet: a CURRENCY column wins per row, then
-    header/title text, sheet name, file name, folder name; default NGN."""
+    """Currency for one source sheet.
 
-    def __init__(self, path: Path, sheet: str, top_rows: Sequence[Sequence[Any]],
-                 exceptions: List[ExceptionRecord]):
+    Priority (Cleaning Manual: copy source figures; never invent currency):
+      1. ``Currency Filter ( NAIRA … )`` / similar in sheet headers
+      2. Named currencies in header/title text (FCY dropped when a named code
+         is also present — some titles say FOREIGN CURRENCY even for Naira)
+      3. Sheet name → file name → folder name
+      4. Workbook-level Currency Filter hint from a sibling sheet
+      5. Default NGN
+
+    A CURRENCY column on the row still wins per ``for_row``.
+    """
+
+    def __init__(
+        self,
+        path: Path,
+        sheet: str,
+        top_rows: Sequence[Sequence[Any]],
+        exceptions: List[ExceptionRecord],
+        *,
+        file_currency_hint: Optional[str] = None,
+    ):
         self.path, self.sheet, self.exceptions = path, sheet, exceptions
         self.code, self.source = "NGN", "default"
-        levels = (
-            ("header text", [c for r in top_rows for c in r if isinstance(c, str)]),
-            ("sheet name", [sheet]),
-            ("file name", [path.name]),
-            ("folder name", [path.parent.name]),
-        )
-        for source, texts in levels:
-            codes = set()
-            for t in texts:
-                codes |= currency_codes(t)
-            if len(codes) == 1:
-                self.code, self.source = codes.pop(), source
-                break
-            if len(codes) > 1:
-                exceptions.append(ExceptionRecord(
-                    "WARN", "currency_ambiguous", path.name, sheet, 0,
-                    f"{source} names several currencies {sorted(codes)}; checking the next level",
-                ))
+        header_cells = [c for r in top_rows for c in r if isinstance(c, str)]
+
+        filter_codes = {currency_filter_code(t) for t in header_cells}
+        filter_codes.discard("")
+        if len(filter_codes) == 1:
+            self.code, self.source = filter_codes.pop(), "currency filter"
+        elif len(filter_codes) > 1:
+            exceptions.append(ExceptionRecord(
+                "WARN", "currency_ambiguous", path.name, sheet, 0,
+                f"currency filter names several currencies {sorted(filter_codes)}; "
+                "checking header text / file name",
+            ))
+
+        if self.source == "default":
+            levels = (
+                ("header text", header_cells),
+                ("sheet name", [sheet]),
+                ("file name", [path.name]),
+                ("folder name", [path.parent.name]),
+            )
+            for source, texts in levels:
+                codes: set = set()
+                for t in texts:
+                    codes |= currency_codes(t)
+                codes = prefer_named_over_fcy(codes)
+                if len(codes) == 1:
+                    self.code, self.source = codes.pop(), source
+                    break
+                if len(codes) > 1:
+                    exceptions.append(ExceptionRecord(
+                        "WARN", "currency_ambiguous", path.name, sheet, 0,
+                        f"{source} names several currencies {sorted(codes)}; "
+                        "checking the next level",
+                    ))
+
+        # Sibling sheet had an authoritative Currency Filter (e.g. premium tab
+        # says NAIRA; claims tab only has the FOREIGN CURRENCY report title).
+        if (
+            self.code == "FCY"
+            and file_currency_hint
+            and file_currency_hint != "FCY"
+        ):
+            exceptions.append(ExceptionRecord(
+                "INFO", "currency_workbook_filter", path.name, sheet, 0,
+                f"{self.source} looked like FCY; using workbook Currency Filter "
+                f"{file_currency_hint} from a sibling sheet",
+            ))
+            self.code, self.source = file_currency_hint, "workbook currency filter"
+
         if self.code == "FCY":
             exceptions.append(ExceptionRecord(
                 "WARN", "currency_unspecified_foreign", path.name, sheet, 0,
-                f"{self.source} says foreign currency without naming it; written to the FCY workbook",
+                f"{self.source} says foreign currency without naming it; "
+                "written to the FCY workbook",
             ))
         self.seen: set = set()
         self._bad_logged = False
@@ -369,6 +480,87 @@ def _premium_metric_cols(cmap: ColumnMap) -> Dict[str, Optional[int]]:
     return cols
 
 
+def _type_fields(tt: Optional[TabType]) -> Dict[str, Any]:
+    if tt is None:
+        return {}
+    return dict(detected_type=tt.label, type_confidence=round(tt.confidence, 2),
+                type_evidence=tt.audit_text()[:2000])
+
+
+def _typed_sheet(path: Path, sn: str, raw_rows: List[List[Any]], legacy_st: str,
+                 adapter: Any, exceptions: List[ExceptionRecord]) -> Tuple[str, TabType]:
+    """Sheet type for one tab (IMPL-20260929-02, Manual C.5 / D.1).
+
+    Content-typing adapters: the type comes from the tab's own tables
+    (core.table_type); UNKNOWN goes to the exceptions sidecar with its
+    evidence and is not loaded; OTHER (empty / summary / statement) is only
+    logged. Other adapters keep the name rules; the content type is advisory
+    and a disagreement is logged.
+    """
+    tt = classify_tab(path.name, sn, raw_rows, vocab=_adapter_rules(adapter)[1])
+    content = tt.sheet_type
+    loadable = {"premium", "paid", "outstanding"}
+    first = next((t.header_row for t in tt.tables if t.header_row >= 0), -1) + 1
+    if not getattr(adapter, "content_sheet_typing", False):
+        if content in loadable and content != legacy_st:
+            exceptions.append(ExceptionRecord(
+                "INFO", "table_type_disagrees", path.name, sn, first,
+                f"name rules say {legacy_st}; content says {tt.label}: {tt.audit_text()[:600]}",
+            ))
+        return legacy_st, tt
+    if tt.label == UNKNOWN:
+        exceptions.append(ExceptionRecord(
+            "WARN", "table_type_unknown", path.name, sn, first,
+            f"UNKNOWN table type — not loaded; conflicts: {'; '.join(tt.conflicts) or '-'}; "
+            f"evidence: {tt.audit_text()[:600]} (name rules said {legacy_st})",
+        ))
+    elif tt.label == OTHER:
+        if legacy_st in loadable:
+            exceptions.append(ExceptionRecord(
+                "INFO", "table_type_other", path.name, sn, first,
+                f"OTHER (not loaded): {tt.audit_text()[:300]} (name rules said {legacy_st})",
+            ))
+    elif content != legacy_st:
+        exceptions.append(ExceptionRecord(
+            "INFO", "table_type_from_content", path.name, sn, first,
+            f"{tt.label} from content (name rules said {legacy_st}): {tt.audit_text()[:600]}",
+        ))
+    return content, tt
+
+
+def _audit_hidden_tabs(path: Path, exceptions: List[ExceptionRecord], adapter: Any,
+                       source_month: str = "") -> List[SourceAuditRecord]:
+    """Hidden sheets are never loaded; content-typing adapters still type
+    them so the audit shows what each hidden tab holds."""
+    if not getattr(adapter, "content_sheet_typing", False):
+        return []
+    names = [e.source_sheet for e in exceptions
+             if e.reason == "hidden_sheet_skipped" and e.source_filename == path.name]
+    if not names:
+        return []
+    try:
+        allsh = read_workbook_sheets(path)
+    except Exception:  # pragma: no cover - reader already succeeded once
+        return []
+    out = []
+    for sn in names:
+        rows = allsh.get(sn)
+        if rows is None:
+            continue
+        tt = classify_tab(path.name, sn, rows, vocab=_adapter_rules(adapter)[1])
+        n = sum(t.n_rows for t in tt.tables)
+        if tt.label not in (OTHER,) and n:
+            exceptions.append(ExceptionRecord(
+                "WARN", "hidden_table_not_loaded", path.name, sn, 0,
+                f"hidden sheet holds a {tt.label} table ({n} rows) — not loaded; {tt.audit_text()[:300]}",
+            ))
+        out.append(SourceAuditRecord(
+            path.name, sn, "hidden_skip", 0, 0, 0, 0, source_month,
+            "hidden sheet — typed for audit, not loaded", **_type_fields(tt),
+        ))
+    return out
+
+
 def parse_premium_file(
     path: Path,
     source_month: str,
@@ -380,8 +572,10 @@ def parse_premium_file(
     sheets, exceptions, hidden_count = _load_source(path)
     rows_out: List[PremiumRow] = []
     audit: List[SourceAuditRecord] = []
+    file_ccy_hint = _workbook_currency_filter_hint(sheets)
 
     sheet_names = list(sheets.keys())
+    sheet_rules, _vocab, class_map = _adapter_rules(adapter)
     for sn, raw_rows in sheets.items():
         if is_fac_sheet_name(sn) and not include_fac:
             audit.append(SourceAuditRecord(
@@ -413,8 +607,13 @@ def parse_premium_file(
                 notes="duplicate copy sheet skipped",
             ))
             continue
-        st = detect_sheet_type(sn, raw_rows[:15])
+        st, tt = _typed_sheet(path, sn, raw_rows, detect_sheet_type(sn, raw_rows[:15], sheet_rules),
+                              adapter, exceptions)
         if st != "premium":
+            note = "skipped non-premium sheet in premium file"
+            if st in ("paid", "outstanding") and getattr(adapter, "content_sheet_typing", False):
+                note = (f"{st} table in premium file — not loaded here (claims come from the "
+                        "claims files; see secondary-source check)")
             audit.append(SourceAuditRecord(
                 source_filename=path.name,
                 source_sheet=sn,
@@ -424,7 +623,8 @@ def parse_premium_file(
                 rows_kept=0,
                 rows_skipped=0,
                 source_month=source_month,
-                notes="skipped non-premium sheet in premium file",
+                notes=note,
+                **_type_fields(tt),
             ))
             continue
 
@@ -447,7 +647,10 @@ def parse_premium_file(
 
         class_hint = class_from_sheet_name(sn)
         ccy_top = max(hdr_i + 1, 1)
-        ccy = _SheetCurrency(path, sn, raw_rows[: ccy_top], exceptions)
+        ccy = _SheetCurrency(
+            path, sn, raw_rows[: ccy_top], exceptions,
+            file_currency_hint=file_ccy_hint,
+        )
         totals = _SheetTotals("gross")
         # Positional layouts have no real header rows to re-detect.
         header_indices = [hdr_i] if header_override else _repeated_headers(raw_rows, hdr_i)
@@ -457,18 +660,24 @@ def parse_premium_file(
         layer_labels: List[str] = []
         primary_label = ""
         kept = skipped = read_n = 0
+        tie_notes: List[str] = []
 
         for hi, header_at in enumerate(header_indices):
             if header_at in header_override:
                 header, group_row = header_override[header_at]
                 data_start = header_at + 1
             else:
-                header, group_row, data_start = _premium_header_with_subrow(raw_rows, header_at)
+                header, group_row, data_start = _premium_header_with_subrow(
+                    raw_rows, header_at, merge=bool(getattr(adapter, "band_subrow_layout", True)))
             if adapter is not None:
                 cmap = adapter.map_premium_columns(header, group_row, path=path, sheet=sn,
                                                    exceptions=exceptions)
             else:
                 cmap = detect_premium_allocation_blocks(header, group_row)
+            for t in getattr(cmap, "tie_log", []):
+                note = f"r{header_at + 1} {t}"
+                if note not in tie_notes:
+                    tie_notes.append(note)
             for label, *_cols in cmap.extra_treaty_blocks:
                 if label not in layer_labels:
                     layer_labels.append(label)
@@ -477,6 +686,12 @@ def parse_premium_file(
                 exceptions.append(ExceptionRecord(
                     "WARN", "allocation_block_ignored", path.name, sn, max(header_at + 1, 1),
                     "Second RET/FAC block has no upload column: " + "; ".join(cmap.ignored_blocks),
+                ))
+            if cmap.borrowed_blocks:
+                exceptions.append(ExceptionRecord(
+                    "WARN", "treaty_columns_not_own", path.name, sn, max(header_at + 1, 1),
+                    "Band SI/premium left blank rather than copied from another band's "
+                    "columns: " + "; ".join(cmap.borrowed_blocks),
                 ))
             end = header_indices[hi + 1] if hi + 1 < len(header_indices) else len(raw_rows)
             next_group_row = end - 1 if hi + 1 < len(header_indices) else None
@@ -581,6 +796,8 @@ def parse_premium_file(
                     uw = int(uw)
                 elif isinstance(uw, str) and uw.strip().isdigit():
                     uw = int(uw.strip())
+                uw = _uw_year_fallback(adapter, cmap.get("uw_year"), uw, period_from,
+                                       exceptions, path, sn, excel_row, "PREMIUM")
 
                 channel = ""
                 if cmap.get("channel") is not None:
@@ -593,7 +810,7 @@ def parse_premium_file(
                     if row_class_raw:
                         # Prefer a resolved Bisola label; keep raw if unknown so
                         # divert/group still has something placeable.
-                        mapped = normalize_class_label(row_class_raw)
+                        mapped = normalize_class_label(row_class_raw, class_map)
                         row_class = mapped if mapped and mapped != "Other" else row_class_raw
 
                 effective_class = ""
@@ -655,6 +872,9 @@ def parse_premium_file(
                         currency=ccy.for_row(cell(row, cmap.get("currency"))),
                     ),
                 )
+                if adapter is not None:
+                    adapter.check_premium_row(prow, exceptions=exceptions, path=path,
+                                              sheet=sn, excel_row=excel_row)
                 # If required field missing — leave blank, log, still include
                 if not policy:
                     exceptions.append(ExceptionRecord(
@@ -668,6 +888,9 @@ def parse_premium_file(
         if layer_labels:
             exceptions.append(_treaty_layer_note(path, sn, primary_label, layer_labels))
         notes = f"class_hint={class_hint}; currency={ccy.audit_code()} ({ccy.source})"
+        if adapter is not None and hasattr(adapter, "settings_note"):
+            notes += "; " + adapter.settings_note()
+        notes += _tie_note(tie_notes)
         if len(header_indices) > 1:
             notes += f"; {len(header_indices)} header blocks"
         if banners_seen:
@@ -692,8 +915,10 @@ def parse_premium_file(
             notes=notes,
             currency=ccy.audit_code(),
             hidden_rows=hidden_count.get(sn, 0),
+            **_type_fields(tt),
         )))
 
+    audit.extend(_audit_hidden_tabs(path, exceptions, adapter, source_month))
     return rows_out, exceptions, audit
 
 
@@ -735,6 +960,30 @@ def merge_monthly_premiums(
     return all_rows, all_exc, all_audit
 
 
+# Exact header labels (normalized). A repeated header row carries these as whole
+# cells; narrative text such as 'CLAIM NOTIFICATION - ... POLICY' does not.
+_CLAIM_NO_LABELS = {"CLAIM NO", "CLAIM NUMBER", "CLAIMNUMBER"}
+_POLICY_LABELS = {"POLICY NO", "POLICY NUMBER", "POLICY"}
+
+
+def _has_claims_header_labels(row: Sequence[Any]) -> bool:
+    """True when the row has a whole-cell CLAIM NO label and a POLICY label."""
+    cells = {normalize_header(c) for c in row if c is not None and clean_text(c)}
+    return bool(cells & _CLAIM_NO_LABELS) and bool(cells & _POLICY_LABELS)
+
+
+def _is_claims_header_block_start(row: Sequence[Any]) -> bool:
+    """Column-header row that starts a block of claims rows (any position in the tab)."""
+    if not _has_claims_header_labels(row):
+        return False
+    norms = [normalize_header(c) for c in row if c is not None]
+    joined = " ".join(norms)
+    if not ("DATE" in joined or "LOSS" in joined or "S NO" in joined
+            or "S/N" in joined.replace(" ", "")):
+        return False
+    return sum(1 for n in norms if n) >= 5
+
+
 def _parse_claims_sheet(
     path: Path,
     sn: str,
@@ -743,6 +992,7 @@ def _parse_claims_sheet(
     aliases: Optional[Dict[str, List[str]]] = None,
     hidden_rows: int = 0,
     adapter: Any = None,
+    file_currency_hint: Optional[str] = None,
 ) -> Tuple[List[ClaimsRow], List[ExceptionRecord], SourceAuditRecord]:
     aliases = aliases or CLAIMS_ALIASES
     exceptions: List[ExceptionRecord] = []
@@ -769,15 +1019,20 @@ def _parse_claims_sheet(
     if header_override:
         header_indices = [hdr_i]
     else:
-        header_indices = [hdr_i]
-        for i in range(hdr_i + 1, len(raw_rows)):
-            norms = [normalize_header(c) for c in raw_rows[i] if c is not None]
-            joined = " ".join(norms)
-            if "CLAIM" in joined and "POLICY" in joined and ("DATE" in joined or "LOSS" in joined or "S NO" in joined or "S/N" in joined.replace(" ", "")):
-                if sum(1 for n in norms if n) >= 5:
-                    header_indices.append(i)
+        # ALL header blocks in the tab, including blocks ABOVE the best-scoring
+        # header find_header_row picked (2021 Q2 '2ND SURPLUS TREATY': the Fire
+        # block at r3 was never parsed because the Engineering header at r13
+        # scored higher).
+        header_indices = sorted({hdr_i} | {
+            i for i in range(len(raw_rows))
+            if i != hdr_i and _is_claims_header_block_start(raw_rows[i])
+        })
+    earlier_blocks = [i + 1 for i in header_indices if i < hdr_i]
 
-    ccy = _SheetCurrency(path, sn, raw_rows[: max(hdr_i + 1, 1)], exceptions)
+    ccy = _SheetCurrency(
+        path, sn, raw_rows[: max(hdr_i + 1, 1)], exceptions,
+        file_currency_hint=file_currency_hint,
+    )
     totals = _SheetTotals("total")
     layer_labels: List[str] = []
     primary_label = ""
@@ -800,6 +1055,8 @@ def _parse_claims_sheet(
 
     banners_seen: List[str] = []
     section_raw = ""
+    tie_notes: List[str] = []
+    ppn_calc_rows: List[int] = []
 
     def _banner_class(cell_text: str) -> str:
         if not class_hint:
@@ -821,14 +1078,23 @@ def _parse_claims_sheet(
             header = header_override[header_at]
             data_start = header_at + 1
         else:
-            header, data_start = _claims_header_with_subrow(raw_rows, header_at)
-        cmap = map_simple_columns(header, aliases)
+            header, data_start = _claims_header_with_subrow(
+                raw_rows, header_at,
+                merge=bool(getattr(adapter, "band_subrow_layout", True)))
+        if adapter is not None and hasattr(adapter, "map_claims_columns"):
+            cmap = adapter.map_claims_columns(header, aliases)
+        else:
+            cmap = map_simple_columns(header, aliases)
+        for t in getattr(cmap, "tie_log", []):
+            note = f"r{header_at + 1} {t}"
+            if note not in tie_notes:
+                tie_notes.append(note)
         end = header_indices[hi + 1] if hi + 1 < len(header_indices) else len(raw_rows)
         insured_i = cmap.get("insured")
         policy_i = cmap.get("policy_no")
         extra_cols = extra_alias_columns(
             header, aliases["amount_treaty"], list(cmap.mapping.values()),
-        )
+        ) + list(getattr(cmap, "extra_amount_columns", []))
         for _i, label in extra_cols:
             if label not in layer_labels:
                 layer_labels.append(label)
@@ -871,15 +1137,11 @@ def _parse_claims_sheet(
                     section_raw = ne[0]
                     skipped += 1
                     continue
-            # skip repeated header
-            norms = [normalize_header(c) for c in row if c is not None]
-            if norms and normalize_header(norms[0] if False else (row[0] if row else "")) in {"S NO", "S/N", "S/NO"} or (
-                "CLAIM NO" in " ".join(norms) and "POLICY" in " ".join(norms)
-            ):
-                # another header — skip
-                if "CLAIM" in " ".join(norms) and "POLICY" in " ".join(norms):
-                    skipped += 1
-                    continue
+            # skip repeated header: whole-cell CLAIM NO + POLICY labels only
+            # (a details cell like 'CLAIM NOTIFICATION - ...' is not a header)
+            if _has_claims_header_labels(row):
+                skipped += 1
+                continue
             read_n += 1
             if is_nil_row(row):
                 skipped += 1
@@ -891,7 +1153,7 @@ def _parse_claims_sheet(
                 totals.add_footer(fvals)
                 skipped += 1
                 continue
-            if looks_like_total_row(row, [insured_i, policy_i]):
+            if looks_like_total_row(row, [insured_i, policy_i, cmap.get("claim_no")]):
                 if insured or policy:
                     exceptions.append(ExceptionRecord(
                         "WARN", "total_like_row_skipped", path.name, sn, excel_row,
@@ -948,24 +1210,38 @@ def _parse_claims_sheet(
             uw = cell(row, cmap.get("uw_yr"))
             if isinstance(uw, float) and uw == int(uw):
                 uw = int(uw)
+            uw = _uw_year_fallback(adapter, cmap.get("uw_yr"), uw, period_from,
+                                   exceptions, path, sn, excel_row, sheet_type.upper())
 
             details = ""
             if cmap.get("details") is not None:
                 details = clean_text(cell(row, cmap.get("details")))
 
-            # Some raw sheets (e.g. AIICO 2025 Q2 '2ND SURPLUS TREATY' Eng paid)
-            # have UW YEAR / DESCRIPTION columns swapped: UW YR holds loss text
-            # and DETAILS holds a year. Swap back only in that unambiguous case.
-            if (
-                isinstance(uw, str) and len(uw.strip()) > 6 and not uw.strip().isdigit()
-                and isinstance(details, str) and details.strip().isdigit()
-                and 1950 <= int(details.strip()) <= 2100
-            ):
-                exceptions.append(ExceptionRecord(
-                    "INFO", "uw_year_details_swapped", path.name, sn, excel_row,
-                    f"UW YR held loss text; DETAILS held year {details.strip()} — swapped",
-                ))
-                uw, details = int(details.strip()), clean_text(uw)
+            # Cedant-specific column-swap repair lives in the adapter.
+            if adapter is not None and hasattr(adapter, "fix_claims_uw_details"):
+                fixed = adapter.fix_claims_uw_details(uw, details)
+                if fixed is not None:
+                    exceptions.append(ExceptionRecord(
+                        "INFO", "uw_year_details_swapped", path.name, sn, excel_row,
+                        f"UW YR held loss text; DETAILS held year {details.strip()} — swapped",
+                    ))
+                    uw, details = fixed
+
+            # Source proportions are copied as-is (blank when the source has
+            # none). Only an adapter may derive them (derive_claims_ppn),
+            # and every derived value is flagged 'Calculated' (Manual Claims 8).
+            # Source PPN columns (when the adapter mapped them) are copied as-is.
+            ppns = {k: (parse_number(cell(row, cmap.get(f"ppn_{k}")))
+                        if cmap.get(f"ppn_{k}") is not None else None)
+                    for k in ("ret", "treaty", "fac")}
+            derive = (adapter.derive_claims_ppn
+                      if adapter is not None and hasattr(adapter, "setting")
+                      and adapter.setting("claims_ppn_calculated") else None)
+            if derive is not None and all(cmap.get(f"ppn_{k}") is None for k in ppns):
+                ppns = {k: derive(a, total) for k, a in
+                        (("ret", amt_ret), ("treaty", amt_tr), ("fac", amt_fac))}
+                if any(v is not None for v in ppns.values()):
+                    ppn_calc_rows.append(excel_row)
 
             extra_layers = []
             for i, label in extra_cols:
@@ -983,11 +1259,11 @@ def _parse_claims_sheet(
                 period_from=period_from,
                 period_to=period_to,
                 total_claims=total,
-                ppn_ret=_ppn_share(amt_ret, total),
+                ppn_ret=ppns["ret"],
                 amount_ret=amt_ret,
-                ppn_treaty=_ppn_share(amt_tr, total),
+                ppn_treaty=ppns["treaty"],
                 amount_treaty=amt_tr,
-                ppn_fac=_ppn_share(amt_fac, total),
+                ppn_fac=ppns["fac"],
                 amount_fac=amt_fac,
                 details=details,
                 paid_date=_date_or_flag(cell(row, cmap.get("paid_date")), "PAYMENT DATE", flag_date),
@@ -1010,10 +1286,22 @@ def _parse_claims_sheet(
     if layer_labels:
         exceptions.append(_treaty_layer_note(path, sn, primary_label, layer_labels))
     notes = f"class_hint={class_hint}; currency={ccy.audit_code()} ({ccy.source})"
+    if adapter is not None and hasattr(adapter, "settings_note"):
+        notes += "; " + adapter.settings_note()
+    if ppn_calc_rows:
+        # Manual Claims step 8: derived proportions are flagged 'Calculated'
+        # in the source-audit sidecar (rows listed).
+        notes += (f"; PPN RET/TREATY/FAC Calculated (layer amount / total claims; source has "
+                  f"no proportion columns) on {len(ppn_calc_rows)} rows: "
+                  + _row_list(ppn_calc_rows))
+    notes += _tie_note(tie_notes)
     if banners_seen:
         notes += f"; section banners: {', '.join(banners_seen)}"
     if layer_labels:
         notes += f"; extra treaty layers: {', '.join(layer_labels)}"
+    if earlier_blocks:
+        notes += (f"; header blocks above r{hdr_i + 1} also parsed: "
+                  f"{', '.join(f'r{r}' for r in earlier_blocks)}")
     return rows_out, exceptions, totals.fill(SourceAuditRecord(
         source_filename=path.name,
         source_sheet=sn,
@@ -1042,8 +1330,10 @@ def parse_claims_file(
     paid: List[ClaimsRow] = []
     ost: List[ClaimsRow] = []
     audit: List[SourceAuditRecord] = []
+    file_ccy_hint = _workbook_currency_filter_hint(sheets)
 
     sheet_names = list(sheets.keys())
+    sheet_rules = _adapter_rules(adapter)[0]
     for sn, raw_rows in sheets.items():
         if is_fac_sheet_name(sn) and not include_fac:
             audit.append(SourceAuditRecord(
@@ -1060,35 +1350,42 @@ def parse_claims_file(
                 path.name, sn, "skip", 0, 0, 0, 0, "", "duplicate copy sheet skipped",
             ))
             continue
-        st = detect_sheet_type(sn, raw_rows[:20])
+        st = detect_sheet_type(sn, raw_rows[:20], sheet_rules)
         if st == "skip":
             # statement sheet etc.
             name_u = normalize_header(sn)
-            if "STATEMENT" in name_u:
+            if "STATEMENT" in name_u and not getattr(adapter, "content_sheet_typing", False):
                 audit.append(SourceAuditRecord(
                     path.name, sn, "skip", 0, 0, 0, 0, "", "statement/cover skipped",
                 ))
                 continue
             # try content
-            st2 = detect_sheet_type(sn, raw_rows[:30])
+            st2 = detect_sheet_type(sn, raw_rows[:30], sheet_rules)
             st = st2
+        st, tt = _typed_sheet(path, sn, raw_rows, st, adapter, exceptions)
         if st == "premium":
             # FAC OBLIG UY premium cession inside claims workbook — skip for claims pipeline
             audit.append(SourceAuditRecord(
                 path.name, sn, "premium", 0, 0, 0, 0, "",
                 "premium cession sheet inside claims file — not merged into claims",
+                **_type_fields(tt),
             ))
             continue
         if st not in {"paid", "outstanding"}:
             audit.append(SourceAuditRecord(
-                path.name, sn, st, 0, 0, 0, 0, "", "unclassified skip",
+                path.name, sn, st, 0, 0, 0, 0, "",
+                {"unknown": "UNKNOWN table type — not loaded (see exceptions)",
+                 "other": "OTHER (empty / summary / statement) — not loaded"}.get(st, "unclassified skip"),
+                **_type_fields(tt),
             ))
             continue
 
         rows, exc, aud = _parse_claims_sheet(
             path, sn, raw_rows, st, aliases=aliases, hidden_rows=hidden_count.get(sn, 0),
-            adapter=adapter,
+            adapter=adapter, file_currency_hint=file_ccy_hint,
         )
+        for k, v in _type_fields(tt).items():
+            setattr(aud, k, v)
         exceptions.extend(exc)
         audit.append(aud)
         if st == "paid":
@@ -1096,4 +1393,5 @@ def parse_claims_file(
         else:
             ost.extend(rows)
 
+    audit.extend(_audit_hidden_tabs(path, exceptions, adapter))
     return paid, ost, exceptions, audit

@@ -21,7 +21,7 @@ from pathlib import Path
 from typing import Any, List, Optional, Sequence, Tuple
 
 from cre_cleaner.adapters.base import QuarterlyWorkbookAdapter
-from cre_cleaner.core.map_columns import ColumnMap, detect_premium_allocation_blocks, map_simple_columns
+from cre_cleaner.core.map_columns import ColumnMap, map_simple_columns
 from cre_cleaner.models import ExceptionRecord
 from cre_cleaner.core.normalize import clean_text, normalize_header, parse_number
 
@@ -69,13 +69,13 @@ class CustodianScibAdapter(QuarterlyWorkbookAdapter):
         norms = [normalize_header(h) if h is not None else "" for h in header]
         bands = [normalize_header(g) if g is not None else "" for g in (group_row or [])]
         if "GROSS PREMIUM" not in norms:
-            return detect_premium_allocation_blocks(header, group_row, self.premium_aliases())
+            return self.detect_premium_allocation_blocks(header, group_row)
         gp = norms.index("GROSS PREMIUM")
         if not any("RETEN" in b for b in bands):
             # Some returns (e.g. 2025 Q4) drop the band row; accept only the
             # exact Custodian column sequence.
             if norms[gp + 1: gp + 7] != ["SUM INSURED", "RATE", "SUM INSURED", "PREMIUM", "RATE", "SUM INSURED"]:
-                return detect_premium_allocation_blocks(header, group_row, self.premium_aliases())
+                return self.detect_premium_allocation_blocks(header, group_row)
             offset = gp - _PREMIUM_HEADER.index("Gross Premium")
             bands = [""] * max(offset, 0) + [normalize_header(b) if b else "" for b in _PREMIUM_BAND]
             if exceptions is not None and path is not None:
@@ -83,7 +83,7 @@ class CustodianScibAdapter(QuarterlyWorkbookAdapter):
                     "INFO", "band_row_missing_positional_layout", path.name, sheet, 0,
                     "No RET/TREATY/FAC band row above the header; standard Custodian band order assumed",
                 ))
-        cm = map_simple_columns(header, self.premium_aliases())
+        cm = map_simple_columns(header, self.premium_aliases(), exclude=self.premium_exclude)
         cm.mapping["gross_premium"] = gp
         si = next((i for i in range(gp - 1, -1, -1) if norms[i].startswith("SUM INSURED")), None)
         if si is not None:

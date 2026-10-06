@@ -4,15 +4,18 @@ from __future__ import annotations
 import warnings
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 from cre_cleaner.core.filters import looks_like_total_row
 from cre_cleaner.io.excel import read_workbook_sheets as _read_workbook_sheets
 from cre_cleaner.io.excel import sheet_names as _sheet_names
-from cre_cleaner.core.normalize import clean_text, normalize_header, parse_number
+from cre_cleaner.core.normalize import as_text_id, clean_text, normalize_header, parse_date, parse_number
 
 
 SKIP_SHEETS = {"SUMMARY", "SOURCE AUDIT", "EXCEPTIONS"}
+
+# kind → frozenset of row fingerprints (for month-scoped gold subsetting)
+FingerprintScope = Dict[str, Set[Tuple[str, ...]]]
 
 
 def read_workbook_sheets(path: Path) -> Dict[str, List[List[Any]]]:
@@ -65,6 +68,7 @@ class WorkbookMetrics:
     outstanding: BucketTotals
     # Sheets not counted in any bucket, as "name — reason" (shown on Compare).
     skipped_sheets: List[str] = field(default_factory=list)
+    scope_note: str = ""  # e.g. month-scoped subset of quarterly gold
 
 
 def _is_fac_sheet(name: str) -> bool:
@@ -77,16 +81,13 @@ def _classify_sheet(name: str) -> Optional[str]:
     n = clean_text(name).upper()
     if not n or n in SKIP_SHEETS:
         return None
-    # Bisola quirks: "2ND SURPLUS … PREM", "… OS", leading-space OUTSTANDING,
-    # and titles truncated at Excel's 31-char limit ("2ND SURPLUS Engineering -
-    # Outst", "2ND SURPLUS Marine Cargo - Clai") — match on word stems.
     is_ost = (
-        "OUTS" in n            # OUTSTANDING / OUTST / OUTS (truncated)
-        or "OUTSAND" in n      # source typo
+        "OUTS" in n
+        or "OUTSAND" in n
         or n.rstrip().endswith(" OS")
         or " - OS" in n
     )
-    is_claim = "CLAI" in n     # CLAIM / CLAIMS / CLAI (truncated)
+    is_claim = "CLAI" in n
     if "PREM" in n and not is_claim and not is_ost:
         return "premium"
     if is_ost:
@@ -144,6 +145,64 @@ def _id_cols(headers: List[Any], kind: str) -> Tuple[Optional[int], Optional[int
     )
 
 
+def _fp_atom(val: Any) -> str:
+    d = parse_date(val)
+    if d is not None:
+        return d.strftime("%Y-%m-%d")
+    n = parse_number(val)
+    if n is not None:
+        return f"{n:.2f}"
+    return as_text_id(val).upper()
+
+
+def _row_fingerprint(
+    kind: str, headers: List[Any], row: List[Any],
+) -> Optional[Tuple[str, ...]]:
+    """Stable identity for matching a cleaned row to the same row inside quarterly gold.
+
+    Policy + party + amount + period (or loss date) — not inception-month alone,
+    because a monthly bordereau is a *submission*, not \"FROM ∈ that month\".
+    """
+    if kind == "premium":
+        policy_i = _col_index(headers, "POLICY NO")
+        insured_i = _col_index(headers, "NAME OF INSURED")
+        amount_i = _col_index(headers, "GROSS PREMIUM")
+        from_i = _col_index(headers, "FROM")
+        to_i = _col_index(headers, "TO")
+        claim_i = None
+        loss_i = None
+    else:
+        policy_i = _col_index(headers, "POLICY NO")
+        insured_i = _col_index(headers, "INSURED")
+        amount_i = _col_index(headers, "TOTAL CLAIMS")
+        from_i = _col_index(headers, "FROM")
+        to_i = _col_index(headers, "TO")
+        claim_i = _col_index(headers, "CLAIM NO")
+        loss_i = _col_index(headers, "DATE OF LOSS")
+
+    def cell(i: Optional[int]) -> Any:
+        if i is None or i >= len(row):
+            return None
+        return row[i]
+
+    policy = _fp_atom(cell(policy_i))
+    if not policy:
+        return None
+    parts = [
+        kind,
+        policy,
+        _fp_atom(cell(insured_i)),
+        _fp_atom(cell(amount_i)),
+        _fp_atom(cell(from_i)),
+        _fp_atom(cell(to_i)),
+    ]
+    if claim_i is not None:
+        parts.append(_fp_atom(cell(claim_i)))
+    if loss_i is not None:
+        parts.append(_fp_atom(cell(loss_i)))
+    return tuple(parts)
+
+
 def _is_skip_row(
     row: List[Any],
     *,
@@ -157,7 +216,6 @@ def _is_skip_row(
     insured_i, policy_i = _id_cols(headers, kind)
     if looks_like_total_row(row, [insured_i, policy_i]):
         return True
-    # Bisola footers: blank policy + blank insured, but many numeric totals
     insured = clean_text(row[insured_i]) if insured_i is not None and insured_i < len(row) else ""
     policy = clean_text(row[policy_i]) if policy_i is not None and policy_i < len(row) else ""
     if not insured and not policy:
@@ -165,25 +223,55 @@ def _is_skip_row(
     non_empty = sum(1 for c in row if c is not None and clean_text(c))
     if non_empty < 2:
         return True
-    if amount_i is not None and amount_i < len(row):
-        # lone amount with no identity already handled above
-        pass
     return False
 
 
-def _sheet_row_amount(
-    rows: List[List[Any]], kind: str
-) -> Tuple[int, float]:
+def _iter_data_rows(rows: List[List[Any]], kind: str):
+    """Yield (headers, row, amount_i) for real transaction rows on a sheet."""
     hdr_i = _find_header_row(rows, kind)
     if hdr_i is None:
-        return 0, 0.0
+        return
     headers = rows[hdr_i]
     amount_i = _amount_col_index(headers, kind)
-    n = 0
-    total = 0.0
     for row in rows[hdr_i + 1 :]:
         if _is_skip_row(row, kind=kind, headers=headers, amount_i=amount_i):
             continue
+        yield headers, row, amount_i
+
+
+def collect_fingerprints(path: Path, *, exclude_fac: bool = True) -> FingerprintScope:
+    """Fingerprints of every counted row in a cleaned workbook, by bordereau kind."""
+    path = Path(path)
+    sheets = read_workbook_sheets(path)
+    out: FingerprintScope = {"premium": set(), "paid": set(), "outstanding": set()}
+    for sn in sheet_names(path):
+        kind = _classify_sheet(sn)
+        if kind is None:
+            continue
+        if exclude_fac and _is_fac_sheet(sn):
+            continue
+        for headers, row, _amount_i in _iter_data_rows(sheets.get(sn) or [], kind):
+            fp = _row_fingerprint(kind, headers, row)
+            if fp is not None:
+                out[kind].add(fp)
+    return out
+
+
+def _sheet_row_amount(
+    rows: List[List[Any]],
+    kind: str,
+    *,
+    allow_fingerprints: Optional[Set[Tuple[str, ...]]] = None,
+) -> Tuple[int, float]:
+    """Count rows/amount. If ``allow_fingerprints`` is a set (including empty),
+    only rows whose fingerprint is in that set are counted — empty set ⇒ 0."""
+    n = 0
+    total = 0.0
+    for headers, row, amount_i in _iter_data_rows(rows, kind):
+        if allow_fingerprints is not None:
+            fp = _row_fingerprint(kind, headers, row)
+            if fp is None or fp not in allow_fingerprints:
+                continue
         n += 1
         if amount_i is not None and amount_i < len(row):
             v = parse_number(row[amount_i])
@@ -196,7 +284,11 @@ def compute_workbook_metrics(
     path: Path,
     *,
     exclude_fac: bool = True,
+    fingerprint_scope: Optional[FingerprintScope] = None,
+    scope_note: str = "",
 ) -> WorkbookMetrics:
+    """Sheet totals. Pass ``fingerprint_scope`` to count only matching gold rows
+    (month-scoped compare against a quarterly Bisola workbook)."""
     path = Path(path)
     names = sheet_names(path)
     sheets = read_workbook_sheets(path)
@@ -216,9 +308,16 @@ def compute_workbook_metrics(
         if exclude_fac and _is_fac_sheet(sn):
             skipped.append(f"{sn} — Facultative (excluded)")
             continue
-        data_sheets.append(sn)
         rows = sheets.get(sn) or []
-        count, amount = _sheet_row_amount(rows, kind)
+        allow = None if fingerprint_scope is None else fingerprint_scope.get(kind, set())
+        # Scoped compare: empty fingerprint set for a kind means that bordereau
+        # was not in the clean (e.g. premium-only upload) — skip those gold sheets.
+        if allow is not None and len(allow) == 0:
+            continue
+        count, amount = _sheet_row_amount(rows, kind, allow_fingerprints=allow)
+        if allow is not None and count == 0:
+            continue
+        data_sheets.append(sn)
         bucket = {"premium": premium, "paid": paid, "outstanding": outstanding}[kind]
         bucket.rows += count
         bucket.amount += amount
@@ -232,7 +331,40 @@ def compute_workbook_metrics(
         paid=paid,
         outstanding=outstanding,
         skipped_sheets=skipped,
+        scope_note=scope_note,
     )
+
+
+def metrics_for_compare(
+    ours_path: Path,
+    gold_path: Path,
+    *,
+    coverage: Optional[dict] = None,
+    exclude_fac: bool = True,
+) -> Tuple[WorkbookMetrics, WorkbookMetrics]:
+    """Ours always full-file. Gold is subset-matched when coverage is a single month."""
+    ours_path = Path(ours_path)
+    gold_path = Path(gold_path)
+    coverage = coverage or {}
+    ours = compute_workbook_metrics(ours_path, exclude_fac=exclude_fac)
+
+    if coverage.get("kind") == "single_month":
+        fps = collect_fingerprints(ours_path, exclude_fac=exclude_fac)
+        label = coverage.get("month_label") or "month"
+        note = (
+            f"Gold scoped to {label} — rows matching this single-file clean "
+            f"inside the quarterly Bisola workbook"
+        )
+        gold = compute_workbook_metrics(
+            gold_path,
+            exclude_fac=exclude_fac,
+            fingerprint_scope=fps,
+            scope_note=note,
+        )
+        return ours, gold
+
+    gold = compute_workbook_metrics(gold_path, exclude_fac=exclude_fac)
+    return ours, gold
 
 
 def amounts_match(a: float, b: float, tol: float = 0.01) -> bool:
@@ -273,7 +405,6 @@ def preview_sheet(
     kind = _classify_sheet(sheet_name) or "paid"
     hdr_i = _find_header_row(rows, kind if kind != "outstanding" else "outstanding")
     if hdr_i is None:
-        # fallback: first non-empty row
         for i, row in enumerate(rows[:8]):
             if any(c is not None and clean_text(c) for c in row):
                 hdr_i = i
@@ -281,7 +412,6 @@ def preview_sheet(
     if hdr_i is None:
         return [], []
     headers_raw = [clean_text(c) for c in rows[hdr_i]]
-    # Keep only through the last real header — skip empty TEMPLATE padding cols
     last = -1
     for i, h in enumerate(headers_raw):
         if h:
@@ -297,7 +427,6 @@ def preview_sheet(
         clipped = list(row[: len(headers)])
         while len(clipped) < len(headers):
             clipped.append(None)
-        # Surface Excel errors clearly without inventing numbers
         clipped = [
             None if (isinstance(c, str) and c.strip().startswith("#")) else c
             for c in clipped

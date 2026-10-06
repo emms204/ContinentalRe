@@ -2,7 +2,8 @@
 from __future__ import annotations
 
 import re
-from typing import Any, List, Optional, Sequence, Tuple
+from dataclasses import dataclass, field
+from typing import Any, FrozenSet, List, Optional, Sequence, Tuple
 
 from cre_cleaner.core.normalize import normalize_header, clean_text
 
@@ -19,6 +20,27 @@ OST_MARKERS = {
     "OST RESERVE", "OUTSTANDING", "TOTAL OST", "OWN SHARE",
 }
 NIL_LIKE = {"NIL", "N/A", "NA", "NONE", "-"}
+
+
+@dataclass(frozen=True)
+class SheetTypeRules:
+    """Tab-name typing vocabulary. Generic by default; a cedant adapter
+    supplies its own (``BaseAdapter.sheet_type_rules``) for its tab naming.
+
+    ost_tokens:            whole-word tokens that mark an outstanding tab.
+    ost_slash:             'O/S' in the tab name marks an outstanding tab.
+    dump_tokens:           tokens of production / listing dumps (not
+                           bordereaux) — such tabs are skipped unless PREM.
+    paid_without_claim:    a 'PAID' tab name is a paid-claims tab even
+                           without the word CLAIM.
+    """
+    ost_tokens: FrozenSet[str] = field(default_factory=lambda: frozenset({"OST"}))
+    ost_slash: bool = False
+    dump_tokens: FrozenSet[str] = field(default_factory=frozenset)
+    paid_without_claim: bool = False
+
+
+GENERIC_SHEET_RULES = SheetTypeRules()
 
 
 def _row_headers(row: Sequence[Any]) -> List[str]:
@@ -66,17 +88,19 @@ def find_header_row(
     return best_i if best_score >= 2 else None
 
 
-def detect_sheet_type(sheet_name: str, sample_rows: List[List[Any]]) -> str:
+def detect_sheet_type(
+    sheet_name: str, sample_rows: List[List[Any]], rules: Optional[SheetTypeRules] = None,
+) -> str:
     """Return 'premium' | 'paid' | 'outstanding' | 'skip'."""
+    rules = rules or GENERIC_SHEET_RULES
     name = normalize_header(sheet_name)
     toks = set(re.findall(r"[A-Z0-9]+", name))
-    # Standalone OS / OST / O/S tokens (AIICO SCIB: "marine os claims"). Do not
-    # use substring "OS" — it appears inside LOSS, CROSS, etc.
+    # Whole-word outstanding tokens only (substring "OS" appears inside LOSS,
+    # CROSS, …); the token set comes from the rules.
     is_ost_name = (
         "OUTSTANDING" in name
-        or "OST" in toks
-        or "OS" in toks
-        or bool(re.search(r"\bO\s*/\s*S\b", str(sheet_name).upper()))
+        or bool(toks & rules.ost_tokens)
+        or (rules.ost_slash and bool(re.search(r"\bO\s*/\s*S\b", str(sheet_name).upper())))
     )
     if is_ost_name and (
         "CLAIM" in name or "LOSS" in name or "RESERVE" in name or not ("PREMIUM" in name)
@@ -86,11 +110,11 @@ def detect_sheet_type(sheet_name: str, sample_rows: List[List[Any]]) -> str:
             return "outstanding"
     if "OUTSTANDING" in name or (("OUT" in name or "OST" in name) and "CLAIM" in name):
         return "outstanding"
-    # Production / listing dumps are not premium bordereaux (HEIRS JOMOLA).
-    if ("PROD" in toks or "PRODUCTION" in toks or "LISTING" in toks) and "PREM" not in name:
+    # Production / listing dumps are not premium bordereaux (adapter vocabulary).
+    if (toks & rules.dump_tokens) and "PREM" not in name:
         return "skip"
-    # AIICO names like "MISC. ACC PAID JANUARY" omit the word CLAIM
-    if "PAID" in name and not is_ost_name:
+    # Paid tabs named without the word CLAIM (adapter opt-in)
+    if rules.paid_without_claim and "PAID" in name and not is_ost_name:
         return "paid"
     if "CLAIM" in name and "PREMIUM" not in name and "CESSION" not in name:
         if is_ost_name or "OUT" in name or "OST" in name:

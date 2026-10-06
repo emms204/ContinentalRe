@@ -19,8 +19,9 @@ from cre_cleaner.config import QUARTER_MONTHS
 from cre_cleaner.io.excel import write_output_workbook
 from cre_cleaner.models import PipelineResult, ExceptionRecord
 from cre_cleaner.io.pdf import convert_pdfs_in_dir, list_pdfs
-from cre_cleaner.core.period_infer import infer_period
-from cre_cleaner.core.quarterly import merge_monthly_premiums, parse_claims_file
+from cre_cleaner.core.period_infer import infer_period, _iter_excel_paths
+from cre_cleaner.adapters.base import claims_file_period_conflict
+from cre_cleaner.core.quarterly import merge_monthly_premiums, parse_claims_file, parse_premium_file
 from cre_cleaner.core.reconcile import (
     build_summary,
     build_source_reconciliation,
@@ -28,13 +29,14 @@ from cre_cleaner.core.reconcile import (
     check_row_splits,
     flag_duplicate_claims,
     flag_duplicate_premium,
+    overlap_counts,
 )
 
 
-def _by_class_counts(premium_rows, claims_rows, outstanding_rows) -> dict:
-    prem_by = group_rows_by_class(premium_rows, premium_class_hint)
-    paid_by = group_rows_by_class(claims_rows, claims_class_hint)
-    ost_by = group_rows_by_class(outstanding_rows, claims_class_hint)
+def _by_class_counts(premium_rows, claims_rows, outstanding_rows, class_map=None) -> dict:
+    prem_by = group_rows_by_class(premium_rows, premium_class_hint, class_map)
+    paid_by = group_rows_by_class(claims_rows, claims_class_hint, class_map)
+    ost_by = group_rows_by_class(outstanding_rows, claims_class_hint, class_map)
     labels = ordered_class_labels(set(prem_by) | set(paid_by) | set(ost_by))
     out = {}
     for lab in labels:
@@ -46,11 +48,11 @@ def _by_class_counts(premium_rows, claims_rows, outstanding_rows) -> dict:
     return out
 
 
-def _drop_fac_rows(premium_rows, claims_rows, outstanding_rows):
+def _drop_fac_rows(premium_rows, claims_rows, outstanding_rows, class_map=None):
     """Exclude Facultative-class rows from upload output (Continental guidance)."""
-    prem = [r for r in premium_rows if not is_fac_class(premium_class_hint(r))]
-    paid = [r for r in claims_rows if not is_fac_class(claims_class_hint(r))]
-    ost = [r for r in outstanding_rows if not is_fac_class(claims_class_hint(r))]
+    prem = [r for r in premium_rows if not is_fac_class(premium_class_hint(r), class_map)]
+    paid = [r for r in claims_rows if not is_fac_class(claims_class_hint(r), class_map)]
+    ost = [r for r in outstanding_rows if not is_fac_class(claims_class_hint(r), class_map)]
     return prem, paid, ost
 
 
@@ -160,6 +162,83 @@ def _discover_premium_inputs(adapter, raw_dir: Path, year: int, quarter: int):
 _BORDEREAU_TYPES = {"all", "premium", "claims", "outstanding"}
 
 
+def _mark_secondary_audit(rec, why: str) -> None:
+    """Audit line of a scanned-but-not-loaded file: kept for the trail, left out
+    of the source reconciliation (sheet type 'secondary:...')."""
+    rec.sheet_type = f"secondary:{rec.sheet_type}"
+    rec.rows_kept = 0
+    rec.notes = f"SECONDARY SOURCE — {why}; {rec.notes}".strip("; ")
+    rec.parsed_totals, rec.parsed_rows, rec.footer_totals = {}, {}, {}
+
+
+def _scan_secondary_sources(adapter, raw_dir: Path, year: int, quarter: int, result,
+                            *, used: set, controlling_premium: list, controlling_claims: list,
+                            include_fac: bool, want_premium: bool, want_claims: bool,
+                            want_outstanding: bool) -> None:
+    """IMPL-20260929-02 (7): in-period files that discovery did not pick as
+    controlling files (e.g. '4th Qtr. 2021 - Premium ceded - LOCAL.xls', a
+    claims workbook with a premium-sounding name) are typed from content and
+    compared with what the controlling files loaded. Their rows are loaded only
+    when no controlling file of that type exists; duplicates are logged, never
+    double-counted; new rows in a secondary file are a WARN for review."""
+    for spath in adapter.in_period_files(raw_dir, year, quarter):
+        if spath in used:
+            continue
+        try:
+            paid2, ost2, exc2, aud2 = parse_claims_file(spath, include_fac=include_fac, adapter=adapter)
+            prem2, exc_p2, aud_p2 = [], [], []
+            if want_premium and any(a.sheet_type == "premium" and a.detected_type == "PREMIUM"
+                                    for a in aud2):
+                prem2, exc_p2, aud_p2 = parse_premium_file(
+                    spath, "", include_fac=include_fac, adapter=adapter)
+        except Exception as e:
+            result.exceptions.append(ExceptionRecord(
+                "WARN", "secondary_source_unreadable", spath.name,
+                detail=f"in-period file not in the controlling set could not be read: {e}"))
+            continue
+        types = sorted({a.detected_type for a in aud2 + aud_p2 if a.detected_type})
+        result.exceptions.append(ExceptionRecord(
+            "INFO", "secondary_source_scanned", spath.name,
+            detail=(f"file name places it in Q{quarter} {year} but discovery did not pick it as a "
+                    f"controlling file; content types found: {types}")))
+        loaded = set()
+        for kind, st, rows, target, wanted, ctrl in (
+            ("PAID", "paid", paid2, result.claims_rows, want_claims, controlling_claims),
+            ("OUTSTANDING", "outstanding", ost2, result.outstanding_rows, want_outstanding,
+             controlling_claims),
+            ("PREMIUM", "premium", prem2, result.premium_rows, want_premium, controlling_premium),
+        ):
+            if not rows or not wanted:
+                continue
+            names = ", ".join(sorted({p.name for p in ctrl})) or "none"
+            dup, new = overlap_counts(rows, target)
+            if not ctrl:
+                target.extend(rows)
+                loaded.add(st)
+                result.exceptions.append(ExceptionRecord(
+                    "WARN", "content_typed_source_loaded", spath.name,
+                    detail=(f"{len(rows)} {kind} rows loaded from {spath.name}: no controlling "
+                            f"{kind.lower()} file by name; typed from content — please confirm")))
+            elif new == 0:
+                result.exceptions.append(ExceptionRecord(
+                    "INFO", "duplicate_source_not_loaded", spath.name,
+                    detail=(f"all {len(rows)} {kind} rows are already loaded from controlling "
+                            f"file(s) {names}; not loaded (never double-count)")))
+            else:
+                result.exceptions.append(ExceptionRecord(
+                    "WARN", "secondary_source_not_loaded", spath.name,
+                    detail=(f"{new} of {len(rows)} {kind} rows are not in controlling file(s) "
+                            f"{names} ({dup} duplicates); file not loaded — confirm which "
+                            "file controls")))
+        for rec in aud2 + aud_p2:
+            if rec.sheet_type in loaded:
+                continue
+            _mark_secondary_audit(rec, "scanned for duplicates, not loaded")
+        result.source_audit.extend(aud2 + aud_p2)
+        if loaded:
+            result.exceptions.extend(exc2 + exc_p2)
+
+
 def normalize_bordereau_type(value: Optional[str]) -> str:
     """Phase 1 mode: premium | claims | outstanding | all."""
     v = (value or "all").strip().lower()
@@ -234,12 +313,19 @@ def run_pipeline(
     claims_leading_blank: bool = True,
     convert_pdfs: bool = False,
     bordereau_type: str = "all",
+    single_file: Optional[bool] = None,
+    extra_exceptions: Optional[list] = None,
 ) -> PipelineResult:
     """Clean one quarter from ``raw_dir``.
 
     Phase 1 defaults: PDF conversion off; year/quarter inferred from sheet
     date columns when omitted; ``bordereau_type`` selects Premium / Claims /
     Outstanding / all.
+
+    ``single_file`` (IMPL-20260929-05): True = process the uploaded file(s) in
+    ``raw_dir`` as the quarter's bordereau, skipping filename quarter gates
+    and discovery. None (default) = automatic: on when the period is inferred
+    and ``raw_dir`` is one Excel file or holds exactly one readable Excel file.
     """
     base_dir = Path(base_dir) if base_dir else Path.cwd()
     raw_dir = Path(raw_dir)
@@ -265,6 +351,7 @@ def run_pipeline(
     want_outstanding = mode in {"all", "outstanding"}
 
     adapter = get_adapter(cedant, broker)
+    class_map = adapter.class_map() if hasattr(adapter, "class_map") else None
     result = PipelineResult()
     result.exceptions.append(ExceptionRecord(
         "INFO", "adapter_status",
@@ -274,6 +361,11 @@ def run_pipeline(
         "INFO", "bordereau_type",
         detail=f"Phase 1 mode={mode}",
     ))
+    # Caller findings about the inputs (e.g. batch WARN cedant_mismatch_suspected)
+    # go into this run's exceptions, sidecar and summary.
+    for rec in extra_exceptions or []:
+        result.exceptions.append(rec)
+        print(f"{rec.severity} {rec.reason}: {rec.detail}", file=sys.stderr)
 
     # --- PDF → Excel (paused for Phase 1 unless explicitly enabled) ---
     if convert_pdfs and list_pdfs(raw_dir):
@@ -297,8 +389,24 @@ def run_pipeline(
         ))
 
     # --- Year / quarter (explicit or inferred from date columns / filenames) ---
-    if year is None or quarter is None:
+    period_inferred = year is None or quarter is None
+    excel_inputs = _iter_excel_paths(raw_dir)
+    if single_file is None:
+        single_file = period_inferred and (raw_dir.is_file() or len(excel_inputs) == 1)
+    single_file = bool(single_file)
+    if period_inferred:
         inferred = infer_period(raw_dir)
+        if inferred.filename_override:
+            result.exceptions.append(ExceptionRecord(
+                "WARN", "period_filename_override", detail=inferred.filename_override,
+            ))
+            print(f"WARN period_filename_override: {inferred.filename_override}", file=sys.stderr)
+        # Banner / row-date / file-name combination notes (IMPL-20260929-08):
+        # INFO period_banner_stale, WARN period_banner_conflict.
+        for sev, reason, detail in inferred.notes:
+            result.exceptions.append(ExceptionRecord(sev, reason, detail=detail))
+            if sev != "INFO":
+                print(f"{sev} {reason}: {detail}", file=sys.stderr)
         for w in inferred.warnings:
             result.exceptions.append(ExceptionRecord(
                 "WARN", "period_infer", detail=w,
@@ -313,20 +421,21 @@ def run_pipeline(
         if quarter is None:
             quarter = inferred.quarter
         if year is None or quarter is None:
-            result.exceptions.append(ExceptionRecord(
-                "ERROR", "period_unresolved",
-                detail=(
-                    "Could not infer year and quarter from date columns in the "
-                    "workbooks (or filenames as fallback). Ensure sheets have "
-                    "Date of Loss / Cover From / Transaction Date values."
-                ),
-            ))
+            msg = (
+                f"Could not settle the reporting period (year={year}, quarter="
+                f"{quarter}): no report banner (Q-label / From…To / As At), no "
+                "decisive date columns, and the file name does not name one "
+                "clear quarter and year. Pick the year and quarter explicitly."
+            )
+            result.exceptions.append(ExceptionRecord("ERROR", "period_ambiguous", detail=msg))
+            result.exceptions.append(ExceptionRecord("ERROR", "period_unresolved", detail=msg))
+            print(f"ERROR period_ambiguous: {msg}", file=sys.stderr)
             result.summary = {
                 "cedant": cedant, "broker": broker,
                 "year": year, "quarter": quarter,
                 "adapter_status": adapter.status_text(),
                 "bordereau_type": mode,
-                "error": "period_unresolved",
+                "error": "period_ambiguous",
             }
             return result
 
@@ -337,15 +446,36 @@ def run_pipeline(
             "ERROR", "period_invalid", detail=f"quarter must be 1–4, got {quarter}",
         ))
         return result
+    # Adapter settings may be overridden per year / quarter.
+    # (values used are logged per sheet in the source-audit notes).
+    if hasattr(adapter, "set_period"):
+        adapter.set_period(year, quarter)
+
+    single_inputs: list = []
+    if single_file:
+        single_inputs = list(excel_inputs)
+        result.exceptions.append(ExceptionRecord(
+            "INFO", "single_file_mode",
+            detail=(
+                f"Single-file mode: processing {[p.name for p in single_inputs]} as "
+                f"Q{quarter} {year} (filename quarter gates and folder discovery skipped)"
+            ),
+        ))
+        if raw_dir.is_file():
+            raw_dir = raw_dir.parent
 
     # --- Premium ---
     month_files: list = []
     prem_mode = "none"
     prem_discovered: list = []
     if want_premium:
-        month_files, prem_mode, prem_discovered = _discover_premium_inputs(
-            adapter, raw_dir, year, quarter,
-        )
+        if single_file:
+            month_files = [(0, p, f"Q{quarter}") for p in single_inputs]
+            prem_mode = "quarterly" if month_files else "none"
+        else:
+            month_files, prem_mode, prem_discovered = _discover_premium_inputs(
+                adapter, raw_dir, year, quarter,
+            )
         if prem_mode == "none":
             result.exceptions.append(ExceptionRecord(
                 "ERROR", "no_premium_files",
@@ -389,7 +519,21 @@ def run_pipeline(
     # --- Claims / outstanding ---
     claims_files: list = []
     if want_claims or want_outstanding:
-        claims_files = adapter.discover_claims_files(raw_dir, year, quarter)
+        claims_files = (list(single_inputs) if single_file
+                        else adapter.discover_claims_files(raw_dir, year, quarter))
+        # Guard: a quarter never loads another quarter's claims file, whatever
+        # the adapter's discovery matched (IMPL-20260929-02 / -03).
+        in_period = []
+        for cpath in claims_files:
+            why = None if single_file else claims_file_period_conflict(cpath.name, quarter)
+            if why:
+                result.exceptions.append(ExceptionRecord(
+                    "ERROR", "claims_file_out_of_period", cpath.name,
+                    detail=f"not loaded for Q{quarter} {year}: {why}"))
+                print(f"ERROR claims_file_out_of_period: {cpath.name}: {why}", file=sys.stderr)
+            else:
+                in_period.append(cpath)
+        claims_files = in_period
         if not claims_files:
             msg = (
                 f"No claims / outstanding files found for Q{quarter} {year} in {raw_dir} "
@@ -422,9 +566,37 @@ def run_pipeline(
         result.claims_rows = paid_all
         result.outstanding_rows = ost_all
 
+    # An inferred period that discovery filters to nothing, while the folder
+    # holds Excel files, is a wrong guess — never an empty clean.
+    if period_inferred and not single_file and not month_files and not claims_files and excel_inputs:
+        msg = (
+            f"Inferred period Q{quarter} {year} matched none of the "
+            f"{len(excel_inputs)} Excel file(s) in {raw_dir} "
+            f"({', '.join(p.name for p in excel_inputs[:5])}). Pick the year and "
+            "quarter explicitly or upload the files one at a time."
+        )
+        result.exceptions.append(ExceptionRecord("ERROR", "period_discovery_empty", detail=msg))
+        print(f"ERROR period_discovery_empty: {msg}", file=sys.stderr)
+        result.summary = {
+            "cedant": cedant, "broker": broker, "year": year, "quarter": quarter,
+            "adapter_status": adapter.status_text(), "bordereau_type": mode,
+            "error": "period_discovery_empty",
+        }
+        return result
+
+    if getattr(adapter, "content_sheet_typing", False) and not single_file:
+        _scan_secondary_sources(
+            adapter, raw_dir, year, quarter, result,
+            used={p for _m, p, _l in month_files} | set(claims_files),
+            controlling_premium=[p for _m, p, _l in month_files],
+            controlling_claims=list(claims_files),
+            include_fac=include_fac, want_premium=want_premium,
+            want_claims=want_claims, want_outstanding=want_outstanding,
+        )
+
     if not include_fac:
         result.premium_rows, result.claims_rows, result.outstanding_rows = _drop_fac_rows(
-            result.premium_rows, result.claims_rows, result.outstanding_rows
+            result.premium_rows, result.claims_rows, result.outstanding_rows, class_map,
         )
 
     for attr, getter, label in (
@@ -501,7 +673,7 @@ def run_pipeline(
 
     primary: Optional[PipelineResult] = None
     for ccy, prem_c, paid_c, ost_c in currency_groups:
-        by_class = _by_class_counts(prem_c, paid_c, ost_c)
+        by_class = _by_class_counts(prem_c, paid_c, ost_c, class_map)
         recon = build_source_reconciliation(
             result.source_audit, prem_c, paid_c, ost_c,
             currency=ccy, year=year, quarter=quarter,
@@ -555,6 +727,7 @@ def run_pipeline(
             include_fac=include_fac,
             proportion_mode=proportion_headers,
             claims_leading_blank=claims_leading_blank,
+            class_map=class_map,
         )
         writer_exc = getattr(write_output_workbook, "last_writer_exceptions", []) or []
         result.exceptions.extend(writer_exc)
@@ -610,6 +783,7 @@ def run_pipeline(
             summary=summary, collapsed=collapsed,
             include_audit_sheets=include_audit_sheets, include_fac=include_fac,
             proportion_mode=proportion_headers, claims_leading_blank=claims_leading_blank,
+            class_map=class_map,
         )
         result.output_path = str(cleaned)
         result.exceptions_path = str(ec)

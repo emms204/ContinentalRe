@@ -117,6 +117,8 @@ def parse_date(val: Any) -> Optional[datetime]:
         "%d-%b-%y",
         "%d %b %Y",
         "%d %B %Y",
+        "%B %d, %Y",
+        "%b %d, %Y",
         "%m/%d/%Y",
     ):
         try:
@@ -171,6 +173,13 @@ _CURRENCY_TOKENS = {
     "FCY": "FCY", "FOREIGN": "FCY",
 }
 _CURRENCY_SYMBOLS = (("US$", "USD"), ("$", "USD"), ("₦", "NGN"), ("€", "EUR"), ("£", "GBP"))
+_NAMED_CURRENCIES = frozenset({"NGN", "USD", "EUR", "GBP"})
+# Insurer system exports: "Currency Filter ( NAIRA at 1 )" is authoritative;
+# the report title "… FOREIGN CURRENCY" is a template label, not the book currency.
+_CURRENCY_FILTER_RE = re.compile(
+    r"CURRENCY\s*FILTER\s*\(\s*([A-Za-z]+)",
+    re.IGNORECASE,
+)
 
 
 def currency_codes(text: Any) -> set:
@@ -189,12 +198,40 @@ def currency_codes(text: Any) -> set:
     return found
 
 
+def currency_filter_code(text: Any) -> str:
+    """Named currency from a ``Currency Filter ( NAIRA … )`` style cell, else ''."""
+    s = clean_text(text)
+    if not s:
+        return ""
+    m = _CURRENCY_FILTER_RE.search(s)
+    if not m:
+        return ""
+    tok = m.group(1).upper()
+    if tok in {"NONE", "NIL", "N", "NA"}:
+        return ""
+    return _CURRENCY_TOKENS.get(tok, "")
+
+
+def prefer_named_over_fcy(codes: set) -> set:
+    """If a real ISO currency is present, drop vague FCY/FOREIGN labels.
+
+    Some report titles say ``FOREIGN CURRENCY`` even when ``Currency Filter`` is
+    NAIRA; keeping both caused premium→NGN and claims→FCY splits.
+    """
+    if not codes:
+        return codes
+    named = codes & _NAMED_CURRENCIES
+    if named:
+        return named
+    return set(codes)
+
+
 def currency_code(text: Any) -> str:
     """Single code for a CURRENCY cell (e.g. 'USD', 'N', 'Naira'), '' if unknown."""
     s = clean_text(text).upper()
     if s in {"N", "NGN", "₦"}:
         return "NGN"
-    codes = currency_codes(s)
+    codes = prefer_named_over_fcy(currency_codes(s))
     return codes.pop() if len(codes) == 1 else ""
 
 

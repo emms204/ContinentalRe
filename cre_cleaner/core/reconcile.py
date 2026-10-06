@@ -80,6 +80,15 @@ def _combine(states: Sequence[str]) -> str:
     return "not_checkable"
 
 
+def _same_nonzero(a: Optional[float], b: Optional[float]) -> bool:
+    if a is None or b is None or a == 0:
+        return False
+    try:
+        return abs(float(a) - float(b)) <= 0.005
+    except (TypeError, ValueError):
+        return False
+
+
 def check_row_splits(
     premium_rows: Sequence[PremiumRow],
     claims_rows: Sequence[ClaimsRow],
@@ -123,6 +132,15 @@ def check_row_splits(
         c[state] += 1
         if state == "mismatch":
             flag(r, "PREMIUM", f"policy={r.policy_no!r}: " + "; ".join(problems))
+        if _same_nonzero(r.sur_si, r.ret_si) and _same_nonzero(r.sur_prem, r.ret_prem):
+            a = r.audit
+            exc.append(ExceptionRecord(
+                "WARN", "treaty_equals_retention", a.source_filename, a.source_sheet,
+                a.source_row,
+                f"PREMIUM: policy={r.policy_no!r}: TREATY SI/premium ({r.sur_si:,.2f} / "
+                f"{r.sur_prem:,.2f}) equal RETENTION — check the source treaty block "
+                "(may be a genuine equal split)",
+            ))
 
     for label, rows in (("claims", claims_rows), ("outstanding", outstanding_rows)):
         c = counts.setdefault(label, {"ok": 0, "mismatch": 0, "not_checkable": 0})
@@ -427,6 +445,37 @@ def build_summary(
         "apparent_duplicate_claim_keys": dup_keys,
         "notes": notes,
     }
+
+
+def _key_num(v):
+    try:
+        return round(float(v), 2)
+    except (TypeError, ValueError):
+        return v if v not in ("", None) else None
+
+
+def transaction_key(row) -> tuple:
+    """Identity of one transaction row across files (secondary-source check)."""
+    if isinstance(row, ClaimsRow):
+        return ("C", str(row.claim_no or "").strip().upper(), str(row.policy_no or "").strip().upper(),
+                str(row.date_of_loss), _key_num(row.total_claims), _key_num(row.amount_ret),
+                _key_num(row.amount_treaty))
+    return ("P", str(row.policy_no or "").strip().upper(), str(row.name_of_insured or "").strip().upper(),
+            _key_num(row.gross_premium), _key_num(row.ret_prem), _key_num(row.sur_prem),
+            str(row.period_from), str(row.period_to))
+
+
+def overlap_counts(candidate_rows: Sequence, loaded_rows: Sequence) -> Tuple[int, int]:
+    """(rows already loaded, rows not loaded) — multiset match on transaction_key."""
+    from collections import Counter
+    pool = Counter(transaction_key(r) for r in loaded_rows)
+    dup = 0
+    for r in candidate_rows:
+        k = transaction_key(r)
+        if pool[k] > 0:
+            pool[k] -= 1
+            dup += 1
+    return dup, len(candidate_rows) - dup
 
 
 def flag_duplicate_claims(rows: Sequence[ClaimsRow], source_label: str) -> List[ExceptionRecord]:

@@ -82,7 +82,7 @@ class ClaimsRow:
     uw_yr: Any = None
     period_from: Any = None
     period_to: Any = None
-    sum_insured: Any = None  # often blank; present in Bisola gold
+    sum_insured: Any = None  # source-only; not in TEMPLATE / CLAIMS_COL_MAP
     total_claims: Any = None
     ppn_ret: Any = None
     amount_ret: Any = None
@@ -97,7 +97,7 @@ class ClaimsRow:
     audit: AuditMeta = field(default_factory=AuditMeta)
 
     def to_template_values(self) -> dict:
-        """Keys match CLAIMS_COL_MAP (upload / Bisola schema)."""
+        """Keys match CLAIMS_COL_MAP (TEMPLATE.xlsx upload schema)."""
         return {
             "INSURED": self.insured,
             "CLASS": self.class_name,
@@ -107,7 +107,6 @@ class ClaimsRow:
             "UW YR": self.uw_yr,
             "FROM": self.period_from,
             "TO": self.period_to,
-            "SUM INSURED": self.sum_insured,
             "TOTAL CLAIMS": self.total_claims,
             "PPN RET %": self.ppn_ret,
             "RET AMOUNT": self.amount_ret,
@@ -158,12 +157,17 @@ class SourceAuditRecord:
     parsed_rows: dict = field(default_factory=dict)
     # Cedant's own total/footer rows: {metric: amount}. Empty = no total row.
     footer_totals: dict = field(default_factory=dict)
+    # Content-based table type (core.table_type): PREMIUM / PAID / OUTSTANDING /
+    # UNKNOWN / OTHER, its confidence and per-table evidence + conflicts.
+    detected_type: str = ""
+    type_confidence: Optional[float] = None
+    type_evidence: str = ""
 
     AUDIT_HEADERS = [
         "Source Filename", "Source Sheet", "Sheet Type", "Header Row",
         "Rows Read", "Rows Kept", "Rows Skipped", "Source Month", "Currency",
         "Hidden Rows Skipped", "Row Sum (main amount)", "Source Total Row (main amount)",
-        "Notes",
+        "Notes", "Detected Type", "Type Confidence", "Type Evidence / Conflicts (per table)",
     ]
 
     def main_metric(self) -> str:
@@ -188,6 +192,9 @@ class SourceAuditRecord:
             row_sum,
             self.footer_totals.get(metric),
             self.notes,
+            self.detected_type,
+            self.type_confidence,
+            self.type_evidence,
         ]
 
 

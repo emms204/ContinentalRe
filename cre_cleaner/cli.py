@@ -146,7 +146,7 @@ def build_parser() -> argparse.ArgumentParser:
         action=argparse.BooleanOptionalAction,
         default=True,
         help="CLAIMS/OUTSTANDING sheets keep column A fully empty with headers in "
-             "B..S, title in B1 (TEMPLATE.xlsx / Bisola gold layout; default ON). "
+             "B..R, title in B1 (TEMPLATE.xlsx layout; default ON). "
              "Use --no-claims-leading-blank to start claims headers at column A.",
     )
     run_p.set_defaults(func=cmd_run)

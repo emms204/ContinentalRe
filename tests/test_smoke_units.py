@@ -23,12 +23,23 @@ def test_find_header_row_premium():
 
 
 def test_detect_paid_vs_outstanding():
-    assert detect_sheet_type("MISC. ACC PAID JANUARY", []) == "paid"
+    from cre_cleaner.adapters.aiico_ark import AiicoArkAdapter
+    aiico = AiicoArkAdapter().sheet_type_rules  # IMPL-20260929-04: AIICO tab rules
+    assert detect_sheet_type("MISC. ACC PAID JANUARY", [], aiico) == "paid"
     assert detect_sheet_type("MARINE HULL OUTSTANDING CLAIM", []) == "outstanding"
     assert detect_sheet_type("FIRE 2ND", [[None, "INSURED", "POLICY NO", "PREMIUM"]]) == "premium"
-    # REPORT risk 2: bare OS / O/S must not be typed as paid
-    assert detect_sheet_type("marine os claims", []) == "outstanding"
-    assert detect_sheet_type("Fire O/S Claims", []) == "outstanding"
+    # REPORT risk 2: bare OS / O/S must not be typed as paid (AIICO SCIB tabs)
+    assert detect_sheet_type("marine os claims", [], aiico) == "outstanding"
+    assert detect_sheet_type("Fire O/S Claims", [], aiico) == "outstanding"
+
+
+def test_sheet_type_rules_are_adapter_owned():
+    """IMPL-20260929-04: AIICO / HEIRS JOMOLA tab rules are not generic."""
+    from cre_cleaner.adapters import get_adapter
+    assert detect_sheet_type("MISC. ACC PAID JANUARY", []) != "paid"
+    assert detect_sheet_type("FIRE PRODUCTION", []) == "premium"
+    assert detect_sheet_type("FIRE PRODUCTION", [],
+                             get_adapter("HEIRS", "JOMOLA").sheet_type_rules) == "skip"
 
 
 def test_quarters_in_text_does_not_eat_year_digit():
@@ -69,16 +80,40 @@ def test_claims_share_headers_not_mapped_to_amounts():
 
 
 def test_unitrust_ppn_after_si_prem_blocks():
-    from cre_cleaner.core.map_columns import detect_premium_allocation_blocks
+    from cre_cleaner.adapters import get_adapter
     header = [
         "INSURED NAME", "POLICY NO", "OUR SHARE SUM INSURED", "OUR SHARE GROSS PREMIUM",
         "RETENTION SUM INSURED", "RETENTION GROSS PREMIUM", "RETENTION PPN",
         "TREATY SUM INSURED", "TREATY GROSS PREMIUM", "TREATY PPN",
     ]
-    cm = detect_premium_allocation_blocks(header, None)
-    assert cm.get("gross_premium") == 3
+    cm = get_adapter("UNITRUST", "AGRIC").detect_premium_allocation_blocks(header, None)
+    # IMPL-20260929-04 (Emmanuel): our-share columns are never TSI / GP; with no
+    # 100% column the gross fields stay blank (never another band's figures).
+    assert cm.get("gross_premium") is None and cm.get("sum_insured") is None, cm.mapping
     assert cm.ret_ppn == 6 and cm.ret_si == 4 and cm.ret_prem == 5
     assert cm.sur_ppn == 9 and cm.sur_si == 7 and cm.sur_prem == 8
+
+
+def test_unitrust_agric_bisola_gold_columns():
+    """Unitrust Agric: policy SI/GP + NET RETENTION/TREATY QUOTA SHARE blank bands.
+
+    Bisola gold Q2 2024: TOTAL SUM INSURED = Sum Insured (not Our share SI),
+    GROSS PREMIUM = Gross Premium (not Our Share of G. Prem.), RET/TREATY =
+    % then SI then premium in the next two blank-header columns.
+    """
+    from cre_cleaner.adapters import get_adapter
+    detect_premium_allocation_blocks = get_adapter("UNITRUST", "AGRIC").detect_premium_allocation_blocks
+    header = [
+        "Policy No ", "Insured ", "Policy Class ", "Risktype ", "Branch ", "Debit Note ",
+        "Company's Share ", "MPL % ", "Insurance Period ", "Sum Insured ", "Our share SI ",
+        "Gross Premium ", None, "Our Share of G. Prem. ", "NET RETENTION ", None, None,
+        "TREATY QUOTA SHARE", None, None,
+    ]
+    cm = detect_premium_allocation_blocks(header, None)
+    assert cm.get("sum_insured") == 9, cm.mapping  # Sum Insured, not Our share SI
+    assert cm.get("gross_premium") == 11, cm.mapping  # Gross Premium, not Our Share of G. Prem.
+    assert cm.ret_ppn == 14 and cm.ret_si == 15 and cm.ret_prem == 16
+    assert cm.sur_ppn == 17 and cm.sur_si == 18 and cm.sur_prem == 19
 
 
 def test_duplicate_copy_sheet_detection():
@@ -107,7 +142,8 @@ def test_flag_duplicate_premium_exact():
 
 
 def test_aiico_rtntn_labelled_blocks():
-    from cre_cleaner.core.map_columns import detect_premium_allocation_blocks
+    from cre_cleaner.adapters.aiico_ark import AiicoArkAdapter
+    detect_premium_allocation_blocks = AiicoArkAdapter().detect_premium_allocation_blocks
     header = [
         "INSURED", "POLICY NO", "COVER START", "COVER END", "SUM INSURED", "PREMIUM",
         "RTNTN PPN", "RTNTN SUM INSURED", "RTNTN PREMIUM",
@@ -282,16 +318,23 @@ def test_quarter_months_order():
 
 
 def test_class_label_mapping():
+    from cre_cleaner.adapters.aiico_ark import AiicoArkAdapter
     from cre_cleaner.core.class_labels import normalize_class_label, class_sheet_title
+    aiico = AiicoArkAdapter().class_map()  # IMPL-20260929-04: AIICO subclasses
     assert normalize_class_label("FIRE") == "Fire"
-    assert normalize_class_label("GOODS IN TRANSIT") == "General Accident"
-    assert normalize_class_label("ALL RISKS") == "General Accident"
+    assert normalize_class_label("GOODS IN TRANSIT", aiico) == "General Accident"
+    assert normalize_class_label("ALL RISKS", aiico) == "General Accident"
+    assert normalize_class_label("GOODS IN TRANSIT") == "Goods In Transit"
+    assert class_sheet_title("PUBLIC/PRODUCT LIABILITY", "CLAIMS") == "PUBLIC-PRODUCT LIABILITY - CLAIMS"
     assert normalize_class_label("MARINE HULL") == "Marine Hull"
     assert class_sheet_title("Fire", "CLAIMS") == "Fire - CLAIMS"
 
 
 def test_banner_class_and_typos():
-    from cre_cleaner.core.class_labels import banner_class_label, normalize_class_label, is_unresolved_class
+    from cre_cleaner.adapters.aiico_ark import AiicoArkAdapter
+    from cre_cleaner.core.class_labels import banner_class_label, is_unresolved_class
+    from cre_cleaner.core.class_labels import normalize_class_label as _n
+    normalize_class_label = lambda raw: _n(raw, AiicoArkAdapter().class_map())  # noqa: E731
     assert banner_class_label("FIRE PAID CLAIM") == "Fire"
     assert banner_class_label("ENGINERRING") == "Engineering"
     assert banner_class_label("ENGINEERING PAID CLAIM") == "Engineering"
@@ -306,11 +349,12 @@ def test_banner_class_and_typos():
     assert normalize_class_label("GEN. ACCIDENT") == "General Accident"
     assert normalize_class_label("GEN ACC") == "General Accident"
     assert normalize_class_label("MOTOR") == "Motor"
-    assert normalize_class_label("CASUALTY") == "Casualty"  # not mapped (pending Bisola)
+    assert normalize_class_label("CASUALTY") == "General Accident"
 
 
 def test_ppn_share_bisola_style():
-    from cre_cleaner.core.quarterly import _ppn_share
+    # IMPL-20260929-04: AIICO-only derivation (flagged 'Calculated' by the parser)
+    from cre_cleaner.adapters.aiico_common import aiico_ppn_share as _ppn_share
     # UBA OST gold: 7644.71 / 32490 ≈ 0.235294...
     assert abs(_ppn_share(7644.71, 32490) - 0.2352942444) < 1e-9
     assert abs(_ppn_share(24845.29, 32490) - 0.7647057556) < 1e-9
@@ -320,11 +364,23 @@ def test_ppn_share_bisola_style():
 
 
 def test_currency_and_split_helpers():
-    from cre_cleaner.core.normalize import currency_codes, currency_code
+    from cre_cleaner.core.normalize import (
+        currency_codes, currency_code, currency_filter_code, prefer_named_over_fcy,
+    )
     from cre_cleaner.core.reconcile import check_row_splits
     from cre_cleaner.models import PremiumRow, AuditMeta
     assert currency_codes("Q2 2025 DOLLAR BORDEREAU") == {"USD"}
     assert currency_code("Naira") == "NGN"
+    assert currency_filter_code("Currency Filter ( NAIRA at 1 )") == "NGN"
+    assert currency_filter_code("Currency Filter ( USD )") == "USD"
+    assert currency_filter_code("Currency Filter ( None )") == ""
+    assert prefer_named_over_fcy({"FCY", "NGN"}) == {"NGN"}
+    assert prefer_named_over_fcy({"FCY"}) == {"FCY"}
+    # Title says FOREIGN CURRENCY but filter names Naira → named wins in the set
+    both = currency_codes("NAICOM BORDEREAUX REPORT - FOREIGN CURRENCY") | currency_codes(
+        "Currency Filter ( NAIRA at 1 )"
+    )
+    assert prefer_named_over_fcy(both) == {"NGN"}
     row = PremiumRow(
         policy_no="P1", name_of_insured="A",
         gross_premium=100, ret_prem=40, sur_prem=60, fac_prem=0,
@@ -334,6 +390,38 @@ def test_currency_and_split_helpers():
     exc, counts = check_row_splits([row], [], [])
     assert counts["premium"]["ok"] == 1
     assert not exc
+
+
+def test_unitrust_foreign_title_stays_naira_with_currency_filter():
+    """Unitrust Agric: FOREIGN CURRENCY title + Currency Filter (NAIRA) → one NGN book."""
+    from cre_cleaner.core.quarterly import _SheetCurrency, _workbook_currency_filter_hint
+    from cre_cleaner.models import ExceptionRecord
+    from pathlib import Path
+
+    premium_top = [
+        ["UNITRUST INSURANCE COMPANY LIMITED"],
+        ["NAICOM BORDEREAUX REPORT - FOREIGN CURRENCY"],
+        ["Currency Filter ( NAIRA at 1 )"],
+        ["Policy No", "Sum Insured", "Gross Premium", "NET RETENTION"],
+    ]
+    claims_top = [
+        ["CLAIMS PAID REPORT WITH RE-INSURANCE - FOREIGN CURRENCY"],
+        ["Branch", "Policy No.", "Total Claims Paid", "Net Retention"],
+    ]
+    sheets = {"AGRIC PREMIUM": premium_top, "AGRIC PAID CLAIM": claims_top}
+    hint = _workbook_currency_filter_hint(sheets)
+    assert hint == "NGN"
+    exc: list = []
+    prem_ccy = _SheetCurrency(Path("x.xlsx"), "AGRIC PREMIUM", premium_top, exc)
+    assert prem_ccy.code == "NGN" and prem_ccy.source == "currency filter"
+    claim_exc: list = []
+    claim_ccy = _SheetCurrency(
+        Path("x.xlsx"), "AGRIC PAID CLAIM", claims_top, claim_exc,
+        file_currency_hint=hint,
+    )
+    assert claim_ccy.code == "NGN"
+    assert claim_ccy.source == "workbook currency filter"
+    assert any(e.reason == "currency_workbook_filter" for e in claim_exc)
 
 
 def test_period_infer_from_filenames():
@@ -365,6 +453,75 @@ def test_period_infer_from_date_columns():
     assert r.year == 2024 and r.quarter == 2
 
 
+def test_period_infer_from_to_banner_beats_row_dates():
+    """Unitrust Period Date From/To is the reporting quarter, not Start Date."""
+    import tempfile
+    from openpyxl import Workbook
+    from cre_cleaner.core.period_infer import (
+        _period_from_from_to_banner,
+        infer_period,
+    )
+
+    assert _period_from_from_to_banner(
+        "From:[April 01, 2023 ] To [ June 30, 2023 ]"
+    ) == (2023, 2)
+    assert _period_from_from_to_banner(
+        "\xa0From:\xa0[April 01, 2023 ] \xa0\xa0To\xa0\xa0[ June 30, 2023 ] "
+    ) == (2023, 2)
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "AGRIC PAID CLAIM"
+    # Rows 1–4 empty-ish; row 5 = Period Date banner (0-index 4 in reader).
+    ws.append(["UNITRUST"])
+    ws.append(["CLAIMS PAID REPORT"])
+    ws.append(["Print Date"])
+    ws.append([])
+    ws.append([
+        "Period Date ( Payment Date )",
+        *[""] * 28,
+        "From:[April 01, 2023 ] To [ June 30, 2023 ]",
+    ])
+    for _ in range(6):
+        ws.append([])
+    ws.append([
+        "Branch", "Pol. Class", "Start Date", "Date Of Loss", "Claim No",
+    ])
+    ws.append([
+        "HEAD OFFICE", "Agriculture", datetime(2023, 2, 13),
+        datetime(2023, 2, 14), "C1",
+    ])
+    with tempfile.TemporaryDirectory() as tmp:
+        # Filename without quarter — banner alone must yield Q2.
+        path = Path(tmp) / "TREATY AGRIC 2023.xlsx"
+        wb.save(path)
+        r = infer_period(Path(tmp))
+    assert r.ok and r.year == 2023 and r.quarter == 2
+    assert r.source == "content"
+    assert any("banner" in e.lower() for e in r.evidence)
+
+
+def test_period_infer_filename_beats_cover_date_vote():
+    """2ND QTR filename wins over cover-start dates that vote Q1 → discovery finds the file."""
+    import tempfile
+    from openpyxl import Workbook
+    from cre_cleaner.core.period_infer import infer_period
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "PAID"
+    ws.append(["INSURED", "START DATE", "DATE OF LOSS", "CLAIM NO"])
+    ws.append(["A", datetime(2023, 2, 13), datetime(2023, 2, 14), "C1"])
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "2ND QTR TREATY AGRIC 2023.xlsx"
+        wb.save(path)
+        r = infer_period(Path(tmp))
+    assert r.ok and r.year == 2023 and r.quarter == 2
+    # IMPL-20260929-05: the file name replaces the weaker date vote and the
+    # override is recorded (WARN period_filename_override in the pipeline).
+    assert r.source == "filename" and r.filename_override
+
+
 def test_adapter_registry_no_fallback():
     from cre_cleaner.adapters import get_adapter, list_adapters
     from cre_cleaner.adapters.base import UnsupportedCedantError
@@ -392,16 +549,42 @@ def test_claims_leading_blank_default():
                       title="T")
     assert ws["B1"].value == "T"
     assert all(c.value is None for c in ws["A"])
-    assert ws.max_column == 19
+    assert ws.max_column == 18  # A blank + headers B..R (TEMPLATE; no SUM INSURED)
+    hdr = [ws.cell(4, c).value for c in range(2, 19)]
+    assert "SUM INSURED" not in hdr
+    assert hdr[8] == "TO" and hdr[9] == "TOTAL CLAIMS"
+
+
+def test_claims_ppn_uses_percent_number_format():
+    """Claims PPN are fractions; Excel 0.00% displays them like Bisola (6.21%)."""
+    from openpyxl import Workbook
+    from cre_cleaner.io.excel import write_claims_rows
+    from cre_cleaner.models import ClaimsRow
+    ws = Workbook().active
+    write_claims_rows(
+        ws,
+        [ClaimsRow(
+            insured="X", policy_no="P1", claim_no="C1",
+            total_claims=188771.19, ppn_ret=0.06214301027609138,
+            amount_ret=11730.81, ppn_treaty=0.2758399732501554, amount_treaty=52070.64,
+        )],
+        title="T",
+    )
+    assert ws.cell(5, 12).value == 0.06214301027609138  # PPN RET %
+    assert ws.cell(5, 12).number_format == "0.00%"
+    assert ws.cell(5, 14).number_format == "0.00%"  # PPN TREATY %
+    assert ws.cell(5, 16).number_format == "0.00%"  # PPN FAC %
 
 
 if __name__ == "__main__":
     test_find_header_row_premium()
     test_detect_paid_vs_outstanding()
+    test_sheet_type_rules_are_adapter_owned()
     test_quarters_in_text_does_not_eat_year_digit()
     test_parse_number_trailing_minus_and_currency()
     test_claims_share_headers_not_mapped_to_amounts()
     test_unitrust_ppn_after_si_prem_blocks()
+    test_unitrust_agric_bisola_gold_columns()
     test_duplicate_copy_sheet_detection()
     test_flag_duplicate_premium_exact()
     test_aiico_rtntn_labelled_blocks()
@@ -418,11 +601,15 @@ if __name__ == "__main__":
     test_bordereau_type_and_field_completeness()
     test_period_infer_from_filenames()
     test_period_infer_from_date_columns()
+    test_period_infer_from_to_banner_beats_row_dates()
+    test_period_infer_filename_beats_cover_date_vote()
     test_quarter_months_order()
     test_class_label_mapping()
     test_banner_class_and_typos()
     test_ppn_share_bisola_style()
     test_currency_and_split_helpers()
+    test_unitrust_foreign_title_stays_naira_with_currency_filter()
     test_adapter_registry_no_fallback()
     test_claims_leading_blank_default()
+    test_claims_ppn_uses_percent_number_format()
     print("ALL UNIT TESTS PASSED")

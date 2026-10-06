@@ -9,7 +9,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import List, Tuple
 
-from cre_cleaner.adapters.aiico_ark import AiicoArkAdapter
+from cre_cleaner.adapters.monthly_files import MonthlyPremiumAdapter
 from cre_cleaner.adapters.base import (
     EXCEL_SUFFIXES,
     list_input_files,
@@ -19,14 +19,19 @@ from cre_cleaner.adapters.base import (
 )
 
 
-class MutualBenefitsArkAdapter(AiicoArkAdapter):
+class MutualBenefitsArkAdapter(MonthlyPremiumAdapter):
+    """Discovery only; column / band / class / tab rules are the generic ones
+    (IMPL-20260929-04: no longer inherits the AIICO adapter's rules)."""
+
     cedant = "MUTUAL BENEFITS"
     broker = "ARK"
     verified = False
     status_note = (
-        "Mutual Benefits & ARK: AIICO-style month discovery + quarterly fallback; "
+        "Mutual Benefits & ARK: month-file discovery + quarterly fallback; "
         "not checked against Bisola gold"
     )
+    # Kept from the pre-IMPL-04 behaviour (inherited then).
+    content_sheet_typing = True
 
     def discover_quarterly_premium_files(self, raw_dir: Path, year: int, quarter: int) -> List[Path]:
         """Class/layer premium files without a month in the name, for the quarter."""
@@ -64,7 +69,7 @@ class MutualBenefitsArkAdapter(AiicoArkAdapter):
         return out
 
     def discover_claims_files(self, raw_dir: Path, year: int, quarter: int) -> List[Path]:
-        # Prefer AIICO-style CLAIM + quarter patterns; also Mutual's
+        # CLAIM + quarter patterns; also Mutual's
         # "Treaty Paid Claim Recovery" / "LOSS BORDERAUX" naming.
         q_patterns = {
             1: ["Q1", "1ST", "FIRST"],

@@ -10,7 +10,7 @@ Plus column-by-column header comparison vs gold per sheet type.
 
 Layout: a leading column that is *fully empty* (no value in any row, incl. the
 title row) before the first header is the expected CLAIMS/OUTSTANDING layout
-(TEMPLATE.xlsx / Bisola gold: column A empty, headers B..S) and is not flagged.
+(TEMPLATE.xlsx: column A empty, headers B..R) and is not flagged.
 A leading blank header column that holds any value IS flagged under b), as is
 any blank header between the first and last header.
 """

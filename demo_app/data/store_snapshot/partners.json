@@ -1,0 +1,170 @@
+[
+  {
+    "partner_id": "79eca00a-65f3-4f2f-b585-eb1414a29c1e",
+    "name": "AIICO(AGRIC-DIRECT)",
+    "cedant": "AIICO",
+    "broker": "AGRIC DIRECT",
+    "reinsurer_id": "abc.org"
+  },
+  {
+    "partner_id": "ab19215b-732f-47a6-87d8-8660bce37eac",
+    "name": "AIICO(ARK)",
+    "cedant": "AIICO",
+    "broker": "ARK",
+    "reinsurer_id": "abc.org"
+  },
+  {
+    "partner_id": "542adf90-37d7-45da-8cc5-56783b7d5c78",
+    "name": "AIICO(ARK)",
+    "cedant": "AIICO",
+    "broker": "ARK",
+    "reinsurer_id": "abc.org"
+  },
+  {
+    "partner_id": "9cbf42b7-c66e-4022-955e-2b8dde4f5c9b",
+    "name": "AIICO(SCIB)",
+    "cedant": "AIICO",
+    "broker": "SCIB",
+    "reinsurer_id": "abc.org"
+  },
+  {
+    "partner_id": "97dfe470-551d-49b4-bcc9-43b360aa7fe8",
+    "name": "AIICO(SCIB)",
+    "cedant": "AIICO",
+    "broker": "SCIB",
+    "reinsurer_id": "abc.org"
+  },
+  {
+    "partner_id": "7810578e-48ee-4be9-8b73-c8e5203cbd89",
+    "name": "AIICO(SCIB)Negative",
+    "cedant": "AIICO(SCIB)NEGATIVE",
+    "broker": "DIRECT",
+    "reinsurer_id": "abc.org"
+  },
+  {
+    "partner_id": "9f659b04-ce84-4961-9790-54a93c19a67c",
+    "name": "AXA",
+    "cedant": "AXA",
+    "broker": "DIRECT",
+    "reinsurer_id": "abc.org"
+  },
+  {
+    "partner_id": "169eef6b-af48-43b7-a517-ff87c5312c82",
+    "name": "CHI(SCIB)",
+    "cedant": "CHI",
+    "broker": "SCIB",
+    "reinsurer_id": "abc.org"
+  },
+  {
+    "partner_id": "d92e0107-fa8c-450f-8704-94066b393f06",
+    "name": "CUSTODIAN(SCIB)",
+    "cedant": "CUSTODIAN",
+    "broker": "SCIB",
+    "reinsurer_id": "abc.org"
+  },
+  {
+    "partner_id": "7ce71497-40fa-43d4-a6ae-d16dcb728345",
+    "name": "CUSTODIAN(UAIB)",
+    "cedant": "CUSTODIAN",
+    "broker": "UAIB",
+    "reinsurer_id": "abc.org"
+  },
+  {
+    "partner_id": "59c01ea9-f8bb-468d-9587-4e625d8c7240",
+    "name": "HEIRS(HIB)",
+    "cedant": "HEIRS",
+    "broker": "HIB",
+    "reinsurer_id": "abc.org"
+  },
+  {
+    "partner_id": "b65b93ec-363c-4c0d-9c9f-11ddf0c42665",
+    "name": "HEIRS(JOMOLA)",
+    "cedant": "HEIRS",
+    "broker": "JOMOLA",
+    "reinsurer_id": "abc.org"
+  },
+  {
+    "partner_id": "18dc9445-07ca-4287-890a-f4fe4dd74a5f",
+    "name": "Heirs(DIRECT)",
+    "cedant": "HEIRS",
+    "broker": "DIRECT",
+    "reinsurer_id": "abc.org"
+  },
+  {
+    "partner_id": "b470a1ca-3d42-4bee-80a3-15aaed6d96c9",
+    "name": "LASACO(FEYBILL)",
+    "cedant": "LASACO",
+    "broker": "FEYBILL",
+    "reinsurer_id": "abc.org"
+  },
+  {
+    "partner_id": "e04a4cd5-8185-4396-95f4-0f29d946cf4c",
+    "name": "LASACO(JOMOLA)",
+    "cedant": "LASACO",
+    "broker": "JOMOLA",
+    "reinsurer_id": "abc.org"
+  },
+  {
+    "partner_id": "d1893c9c-c4c1-4f5f-820f-101298955d95",
+    "name": "LASACO(JORDANS)",
+    "cedant": "LASACO",
+    "broker": "JORDANS",
+    "reinsurer_id": "abc.org"
+  },
+  {
+    "partner_id": "ac907967-eee4-4834-8e12-251e3755c3d7",
+    "name": "MUTUAL BENEFIT(ARK)",
+    "cedant": "MUTUAL BENEFIT",
+    "broker": "ARK",
+    "reinsurer_id": "abc.org"
+  },
+  {
+    "partner_id": "b1786c33-a854-4946-91ac-9d3244df0861",
+    "name": "MUTUAL BENEFIT(JOMOLA AGRIC)",
+    "cedant": "MUTUAL BENEFIT",
+    "broker": "JOMOLA AGRIC",
+    "reinsurer_id": "abc.org"
+  },
+  {
+    "partner_id": "c025e133-09ee-4f65-bacc-e2597bc33029",
+    "name": "NEM(AON)",
+    "cedant": "NEM",
+    "broker": "AON",
+    "reinsurer_id": "abc.org"
+  },
+  {
+    "partner_id": "996f6709-9859-4aad-bad1-a0367ed682a4",
+    "name": "NEM(SCIB)",
+    "cedant": "NEM",
+    "broker": "SCIB",
+    "reinsurer_id": "abc.org"
+  },
+  {
+    "partner_id": "fb8c5de2-db41-40b2-a558-be71f0f55970",
+    "name": "ROYAL EXCHANGE(AGRIC)",
+    "cedant": "ROYAL EXCHANGE",
+    "broker": "AGRIC",
+    "reinsurer_id": "abc.org"
+  },
+  {
+    "partner_id": "0957404c-99a2-4624-997d-388a8b374549",
+    "name": "ROYAL EXCHANGE(DIRECT)",
+    "cedant": "ROYAL EXCHANGE",
+    "broker": "DIRECT",
+    "reinsurer_id": "abc.org"
+  },
+  {
+    "partner_id": "ef85f2d1-065d-4ac4-a37d-65a44ff8a322",
+    "name": "UNITRUST(AGRIC)",
+    "cedant": "UNITRUST",
+    "broker": "AGRIC",
+    "reinsurer_id": "abc.org"
+  },
+  {
+    "partner_id": "d5ad2c5f-f74b-43e6-9076-296fa80652d3",
+    "name": "UnitTrust Ark",
+    "cedant": "UNITTRUST",
+    "broker": "ARK",
+    "reinsurer_id": "abc.org"
+  }
+]
