@@ -37,9 +37,10 @@ This repo is not already connected from this session. Emmanuel does the clicks:
 2. Sign in at https://share.streamlit.io with the GitHub account that can see that repo.
 3. **Create app** → select the repo and branch.
 4. Main file path: `demo_app/app.py`
-5. Advanced settings → Python version 3.11. Requirements file: `demo_app/requirements.txt` if the form asks (otherwise the app directory's `requirements.txt` is used when the main file lives in `demo_app/`).
-6. Optional secret: `DEMO_PASSWORD` = the password you want Bisola to use. If omitted, the password is `bisola-demo`.
-7. Deploy. Copy the `*.streamlit.app` URL and send it to Bisola.
+5. Click **Advanced settings** and set **Python version to 3.11 or 3.12** (not 3.13/3.14). The pins in `requirements.txt` need binary wheels; on 3.14 Streamlit Cloud tries to build Pillow/pandas from source and fails on zlib. Python cannot be changed after deploy — delete and redeploy if the wrong version was chosen.
+6. Requirements file: `demo_app/requirements.txt` if the form asks (otherwise the app directory's `requirements.txt` is used when the main file lives in `demo_app/`).
+7. Optional secret: `DEMO_PASSWORD` = the password you want Bisola to use. If omitted, the password is `bisola-demo`.
+8. Deploy. Copy the `*.streamlit.app` URL and send it to Bisola.
 
 Confirmations written on that URL live on the Streamlit container disk. They survive a second clean in the same running app. A reboot or redeploy of the app restores the snapshot from Git and drops confirms made only on the site. That is intentional: nothing is synced to production.
 
