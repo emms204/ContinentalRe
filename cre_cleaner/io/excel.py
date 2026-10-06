@@ -238,11 +238,7 @@ def read_source_workbook(
     for sn, rows in sheets.items():
         v = vis.get(sn) or {}
         if v.get("state", "visible") != "visible":
-            filled = sum(1 for r in rows if any(clean_text(c) for c in r))
-            notes.append((
-                "WARN", "hidden_sheet_skipped", sn, 0,
-                f"Sheet is {v['state']} in the source; {filled} non-empty rows not read",
-            ))
+            # Hidden sheets stay unread; no WARN — the skip is normal for drafts.
             continue
         hidden = v.get("hidden_rows") or set()
         if hidden:

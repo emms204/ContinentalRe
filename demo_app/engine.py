@@ -303,6 +303,8 @@ def _result_warns(result: Any) -> List[Dict[str, Any]]:
     for rec in getattr(result, "exceptions", None) or []:
         if getattr(rec, "severity", "") != "WARN":
             continue
+        if getattr(rec, "reason", "") == "hidden_sheet_skipped":
+            continue
         out.append({
             "code": getattr(rec, "reason", "") or "WARN",
             "detail": getattr(rec, "detail", "") or "",
