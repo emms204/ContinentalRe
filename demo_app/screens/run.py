@@ -50,9 +50,14 @@ def render() -> None:
         type=["xls", "xlsx", "xlsm"],
         accept_multiple_files=True,
     )
-    if files:
-        st.session_state.demo_uploads = [(f.name, f.getvalue()) for f in files]
+    # Only reset the review when the upload set changes. The uploader still
+    # holds the files on later reruns (class radios, Apply and re-run); clearing
+    # the review then removes the button before its click is handled.
+    pending = [(f.name, f.getvalue()) for f in files] if files else []
+    if pending and pending != list(st.session_state.get("demo_uploads") or []):
+        st.session_state.demo_uploads = pending
         st.session_state.pop("demo_review", None)
+        st.session_state.pop("demo_outcome", None)
 
     st.caption(f"{len(_uploads())} file(s) ready · partner {partner['name']}")
 

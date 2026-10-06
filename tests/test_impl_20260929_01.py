@@ -99,18 +99,19 @@ def test_treaty_equals_retention_row_flagged():
                    ret_prem=100.0, sur_ppn=50.0, sur_si=1000.0, sur_prem=100.0)
     ok = PremiumRow(policy_no="P2", gross_premium=200.0, ret_ppn=25.0, ret_si=500.0,
                     ret_prem=50.0, sur_ppn=75.0, sur_si=1500.0, sur_prem=150.0)
-    exc, _counts = check_row_splits([r, ok], [], [])
-    reasons = [(e.reason, e.detail) for e in exc]
-    assert any(x == "treaty_equals_retention" and "P1" in d for x, d in reasons)
-    assert not any(x == "treaty_equals_retention" and "P2" in d for x, d in reasons)
+    exc, counts = check_row_splits([r, ok], [], [])
+    # Gold keeps equal-split rows; no WARN — SUMMARY still tallies ok/mismatch.
+    assert exc == []
+    assert counts["premium"]["ok"] == 2
 
 
 def test_share_sum_not_100_is_flagged_not_altered():
     r = PremiumRow(policy_no="P3", gross_premium=100.0, ret_ppn=30.0, ret_si=1.0,
                    ret_prem=30.0, sur_ppn=60.0, sur_si=2.0, sur_prem=70.0,
                    fac_ppn=0.0, fac_si=0.0, fac_prem=0.0)
-    exc, _ = check_row_splits([r], [], [])
-    assert any(e.reason == "split_mismatch" for e in exc)
+    exc, counts = check_row_splits([r], [], [])
+    assert exc == []
+    assert counts["premium"]["mismatch"] == 1
     assert r.sur_ppn == 60.0 and r.ret_ppn == 30.0
 
 

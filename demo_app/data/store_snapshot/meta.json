@@ -2,8 +2,8 @@
   "exported_at": "2026-10-06T17:07:38.059548+00:00",
   "source_project": "infrastructure-staging-418710",
   "source_dataset": "staging_mh_reinsurance_ai",
-  "partner_count": 24,
-  "class_count": 51,
-  "subclass_count": 15,
-  "note": "Demo snapshot only. Confirmations update local files and are never synced to production."
+  "partner_count": 21,
+  "class_count": 31,
+  "subclass_count": 12,
+  "note": "Demo snapshot only. Confirmations update local files and are never synced to production. Duplicate AIICO(ARK)/AIICO(SCIB) staging cedents removed for the demo UI."
 }

@@ -27,8 +27,6 @@ from cre_cleaner.core.reconcile import (
     build_source_reconciliation,
     check_row_dates,
     check_row_splits,
-    flag_duplicate_claims,
-    flag_duplicate_premium,
     overlap_counts,
 )
 
@@ -608,11 +606,8 @@ def run_pipeline(
         setattr(result, attr, kept)
         result.exceptions.extend(excs)
 
-    result.exceptions.extend(flag_duplicate_premium(result.premium_rows))
-    result.exceptions.extend(flag_duplicate_claims(result.claims_rows, "CLAIMS BORDEREAU"))
-    result.exceptions.extend(
-        flag_duplicate_claims(result.outstanding_rows, "OUTSTANDING LOSS BORDEREAU")
-    )
+    # Repeated premium/claims rows are kept as in the source and not flagged
+    # (flag_duplicate_* are no-ops).
 
     split_exc, split_counts = check_row_splits(
         result.premium_rows, result.claims_rows, result.outstanding_rows,

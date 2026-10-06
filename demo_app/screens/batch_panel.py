@@ -188,7 +188,7 @@ def render_batch() -> None:
           "Period": f"{f['year']} Q{f['quarter']}" if f.get("year") and f.get("quarter") else "—",
           "Period from": f["period_source"], "Status": f["status"]}
          for f in state.get("plan_files") or []],
-        hide_index=True, width="stretch",
+        hide_index=True, use_container_width=True,
     )
     st.markdown("#### Cleaning jobs (one per quarter)")
     st.dataframe(
@@ -197,7 +197,7 @@ def render_batch() -> None:
           "Outstanding": g["outstanding_rows"],
           "Workbooks": ", ".join(Path(o["output_path"]).name for o in g["outputs"]) or "—"}
          for g in groups],
-        hide_index=True, width="stretch",
+        hide_index=True, use_container_width=True,
     )
     for g in groups:
         if g.get("warnings"):

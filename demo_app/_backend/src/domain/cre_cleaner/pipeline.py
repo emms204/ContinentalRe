@@ -45,8 +45,6 @@ from src.domain.cre_cleaner.core.reconcile import (
     printed_total_variances,
     check_row_dates,
     check_row_splits,
-    flag_duplicate_claims,
-    flag_duplicate_premium,
     overlap_counts,
     transaction_key,
 )
@@ -435,7 +433,7 @@ def _drop_duplicate_sources(result, inputs: Sequence[Path]) -> None:
     ``near_duplicate_source_not_loaded`` names both files. Kinds only the
     older file has are kept. On a tie nothing is dropped and a WARN
     ``near_duplicate_source_unresolved`` names both. Smaller overlaps are kept
-    (the WARN ``apparent_duplicate`` review flags stay). A file with nothing
+    as in the source (row-level repeats are not flagged). A file with nothing
     left is marked secondary in the source audit."""
     from collections import Counter
     if len(inputs) < 2:
@@ -1020,11 +1018,9 @@ def _run_pipeline_impl(
         setattr(result, attr, kept)
         result.exceptions.extend(excs)
 
-    result.exceptions.extend(flag_duplicate_premium(result.premium_rows))
-    result.exceptions.extend(flag_duplicate_claims(result.claims_rows, "CLAIMS BORDEREAU"))
-    result.exceptions.extend(
-        flag_duplicate_claims(result.outstanding_rows, "OUTSTANDING LOSS BORDEREAU")
-    )
+    # Repeated premium/claims rows are kept as in the source and not flagged
+    # (flag_duplicate_* are no-ops). Whole-file near/exact duplicates are still
+    # handled by _drop_duplicate_sources above.
 
     split_exc, split_counts = check_row_splits(
         result.premium_rows, result.claims_rows, result.outstanding_rows,

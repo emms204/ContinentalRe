@@ -188,7 +188,7 @@ def render() -> None:
             }
         )
 
-    st.dataframe(rows, width="stretch", hide_index=True)
+    st.dataframe(rows, use_container_width=True, hide_index=True)
 
     if all_match:
         st.success("All three headline metrics match Bisola gold.")

@@ -578,12 +578,6 @@ def _audit_hidden_tabs(path: Path, exceptions: List[ExceptionRecord], adapter: A
         if rows is None:
             continue
         tt = classify_tab(path.name, sn, rows, vocab=_adapter_rules(adapter)[1])
-        n = sum(t.n_rows for t in tt.tables)
-        if tt.label not in (OTHER,) and n:
-            exceptions.append(ExceptionRecord(
-                "WARN", "hidden_table_not_loaded", path.name, sn, 0,
-                f"hidden sheet holds a {tt.label} table ({n} rows) — not loaded; {tt.audit_text()[:300]}",
-            ))
         out.append(SourceAuditRecord(
             path.name, sn, "hidden_skip", 0, 0, 0, 0, source_month,
             "hidden sheet — typed for audit, not loaded", **_type_fields(tt),

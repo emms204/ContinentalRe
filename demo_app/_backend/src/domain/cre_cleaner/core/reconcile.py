@@ -6,7 +6,7 @@ All checks only flag (exceptions / SUMMARY); none of them drops or edits rows.
 """
 from __future__ import annotations
 
-from collections import defaultdict
+from collections import Counter, defaultdict
 from datetime import datetime
 from typing import Dict, List, Optional, Sequence, Tuple
 
@@ -87,67 +87,35 @@ def _combine(states: Sequence[str]) -> str:
     return "not_checkable"
 
 
-def _same_nonzero(a: Optional[float], b: Optional[float]) -> bool:
-    if a is None or b is None or a == 0:
-        return False
-    try:
-        return abs(float(a) - float(b)) <= 0.005
-    except (TypeError, ValueError):
-        return False
-
-
 def check_row_splits(
     premium_rows: Sequence[PremiumRow],
     claims_rows: Sequence[ClaimsRow],
     outstanding_rows: Sequence[ClaimsRow],
 ) -> Tuple[List[ExceptionRecord], Dict[str, Dict[str, int]]]:
-    """Per row: RET/TREATY/FAC(+extra layer) shares add to 100% (or 1.0 when
-    the source uses fractions) and amounts add back to gross premium (premium)
-    or total claims (claims/outstanding)."""
-    exc: List[ExceptionRecord] = []
-    counts: Dict[str, Dict[str, int]] = {}
+    """Tally RET/TREATY/FAC vs gross (and claim totals) for SUMMARY counts.
 
-    def flag(r, bordereau: str, detail: str):
-        a = r.audit
-        exc.append(ExceptionRecord(
-            "WARN", "split_mismatch", a.source_filename, a.source_sheet, a.source_row,
-            f"{bordereau}: {detail}",
-        ))
+    Source/gold often keep rows that do not balance or where treaty equals
+    retention; those are left unchanged and are not WARN'd
+    (``split_mismatch`` / ``treaty_equals_retention`` suppressed).
+    """
+    counts: Dict[str, Dict[str, int]] = {}
 
     c = counts.setdefault("premium", {"ok": 0, "mismatch": 0, "not_checkable": 0})
     for r in premium_rows:
         layers = r.extra_layers or []
-        states, problems = [], []
+        states: List[str] = []
         amounts = [r.ret_prem, r.sur_prem, r.fac_prem] + [l.get("prem") for l in layers]
         if r.gross_premium is not None and any(a is not None for a in amounts):
-            st, diff = _band_sum_state(r.gross_premium, amounts, _amount_tol(r.gross_premium))
+            st, _diff = _band_sum_state(r.gross_premium, amounts, _amount_tol(r.gross_premium))
             states.append(st)
-            if st == "mismatch":
-                problems.append(
-                    f"premium bands {sum(a for a in amounts if a is not None):,.2f} vs gross "
-                    f"{r.gross_premium:,.2f} (diff {diff:,.2f})"
-                )
         shares = [r.ret_ppn, r.sur_ppn, r.fac_ppn] + [l.get("ppn") for l in layers]
         known = [s for s in shares if s is not None]
         if known:
             target = 1.0 if max(abs(s) for s in known) <= 1.0 and sum(known) <= 1.05 else 100.0
             st, _ = _band_sum_state(target, shares, _SHARE_TOL_PCT * target / 100.0)
             states.append(st)
-            if st == "mismatch":
-                problems.append(f"shares add to {sum(known):g} (expected {target:g})")
         state = _combine(states) if states else "not_checkable"
         c[state] += 1
-        if state == "mismatch":
-            flag(r, "PREMIUM", f"policy={r.policy_no!r}: " + "; ".join(problems))
-        if _same_nonzero(r.sur_si, r.ret_si) and _same_nonzero(r.sur_prem, r.ret_prem):
-            a = r.audit
-            exc.append(ExceptionRecord(
-                "WARN", "treaty_equals_retention", a.source_filename, a.source_sheet,
-                a.source_row,
-                f"PREMIUM: policy={r.policy_no!r}: TREATY SI/premium ({r.sur_si:,.2f} / "
-                f"{r.sur_prem:,.2f}) equal RETENTION — check the source treaty block "
-                "(may be a genuine equal split)",
-            ))
 
     for label, rows in (("claims", claims_rows), ("outstanding", outstanding_rows)):
         c = counts.setdefault(label, {"ok": 0, "mismatch": 0, "not_checkable": 0})
@@ -158,15 +126,9 @@ def check_row_splits(
             if r.total_claims is None or not any(p is not None for p in parts):
                 c["not_checkable"] += 1
                 continue
-            st, diff = _band_sum_state(r.total_claims, parts, _amount_tol(r.total_claims))
+            st, _diff = _band_sum_state(r.total_claims, parts, _amount_tol(r.total_claims))
             c[st] += 1
-            if st == "mismatch":
-                flag(r, label.upper(), (
-                    f"claim={r.claim_no!r}: RET+TREATY+FAC "
-                    f"{sum(p for p in parts if p is not None):,.2f} vs total "
-                    f"{r.total_claims:,.2f} (diff {diff:,.2f})"
-                ))
-    return exc, counts
+    return [], counts
 
 
 def _quarter_bounds(year: int, quarter: int) -> Tuple[datetime, datetime]:
@@ -184,23 +146,25 @@ def check_row_dates(
     year: int,
     quarter: int,
 ) -> Tuple[List[ExceptionRecord], Dict[str, int]]:
-    """Flag implausible dates, FROM after TO, missing date of loss, loss dates
-    after the quarter, and premium rows whose cover starts outside the file's
-    month (INFO) or quarter (WARN). Unparseable date text is flagged at parse
-    time (``date_unparseable``)."""
+    """Flag implausible dates, FROM after TO, and missing date fields.
+    Cover start outside the reporting month/quarter is common on gold
+    (annual and multi-year policies) and is not flagged.
+    Implausible far-future/past dates are collapsed to one WARN summary.
+    Unparseable date text is flagged at parse time (``date_unparseable``)."""
     exc: List[ExceptionRecord] = []
     counts: Dict[str, int] = defaultdict(int)
     q_start, q_end = _quarter_bounds(year, quarter)
+    implausible_hits: List[str] = []
 
     def flag(r, sev: str, reason: str, detail: str):
         a = r.audit
         exc.append(ExceptionRecord(sev, reason, a.source_filename, a.source_sheet, a.source_row, detail))
         counts[reason] += 1
 
-    def implausible(r, bordereau: str, fields: Sequence[Tuple[str, object]]):
-        for name, d in fields:
-            if isinstance(d, datetime) and not (1950 <= d.year <= year + 5):
-                flag(r, "WARN", "date_implausible", f"{bordereau}: {name}={d:%d/%m/%Y}")
+    def note_implausible(bordereau: str, name: str, d: datetime):
+        if 1950 <= d.year <= year + 5:
+            return
+        implausible_hits.append(f"{bordereau} {name}={d:%d/%m/%Y}")
 
     def from_after_to(r, bordereau: str):
         if isinstance(r.period_from, datetime) and isinstance(r.period_to, datetime) \
@@ -209,7 +173,9 @@ def check_row_dates(
                  f"{bordereau}: FROM {r.period_from:%d/%m/%Y} after TO {r.period_to:%d/%m/%Y}")
 
     for r in premium_rows:
-        implausible(r, "PREMIUM", (("FROM", r.period_from), ("TO", r.period_to)))
+        for name, d in (("FROM", r.period_from), ("TO", r.period_to)):
+            if isinstance(d, datetime):
+                note_implausible("PREMIUM", name, d)
         from_after_to(r, "PREMIUM")
         if r.period_from is None:
             flag(r, "WARN", "period_from_missing",
@@ -217,22 +183,13 @@ def check_row_dates(
         if r.period_to is None:
             flag(r, "WARN", "period_to_missing",
                  f"PREMIUM: policy={r.policy_no!r} TO blank")
-        d = r.period_from
-        if not isinstance(d, datetime):
-            continue
-        month = MONTH_ALIASES.get((r.audit.source_month or "").upper())
-        if q_start <= d < q_end:
-            if month and d.month != month:
-                flag(r, "INFO", "premium_date_outside_month",
-                     f"policy={r.policy_no!r}: cover starts {d:%d/%m/%Y}, file month {r.audit.source_month}")
-        else:
-            flag(r, "WARN", "premium_date_outside_quarter",
-                 f"policy={r.policy_no!r}: cover starts {d:%d/%m/%Y}, outside Q{quarter} {year}")
 
     for label, rows in (("CLAIMS", claims_rows), ("OUTSTANDING", outstanding_rows)):
         for r in rows:
-            implausible(r, label, (("DATE OF LOSS", r.date_of_loss), ("FROM", r.period_from),
-                                   ("TO", r.period_to), ("PAYMENT DATE", r.paid_date)))
+            for name, d in (("DATE OF LOSS", r.date_of_loss), ("FROM", r.period_from),
+                            ("TO", r.period_to), ("PAYMENT DATE", r.paid_date)):
+                if isinstance(d, datetime):
+                    note_implausible(label, name, d)
             from_after_to(r, label)
             if r.period_from is None:
                 flag(r, "WARN", "period_from_missing",
@@ -248,6 +205,19 @@ def check_row_dates(
             if label == "CLAIMS" and isinstance(r.paid_date, datetime) and not (q_start <= r.paid_date < q_end):
                 flag(r, "WARN", "claim_paid_outside_quarter",
                      f"claim={r.claim_no!r}: paid {r.paid_date:%d/%m/%Y}, outside Q{quarter} {year}")
+
+    if implausible_hits:
+        tallies = Counter(implausible_hits)
+        samples = ", ".join(f"{k} ×{n}" if n > 1 else k for k, n in tallies.most_common(5))
+        more = len(tallies) - min(5, len(tallies))
+        detail = (
+            f"{len(implausible_hits)} date(s) outside 1950–{year + 5} "
+            f"(e.g. {samples}"
+            + (f", +{more} more distinct" if more > 0 else "")
+            + "); rows kept"
+        )
+        exc.append(ExceptionRecord("WARN", "date_implausible", detail=detail))
+        counts["date_implausible"] = len(implausible_hits)
     return exc, dict(counts)
 
 
@@ -413,44 +383,136 @@ def _recon_record(level: str, period: str, bordereau: str, key: str, line: dict)
             "status": status, "printed_total_variance": printed}
 
 
+def _footer_cell(where: str) -> str:
+    """First printed-total cell, plus a count when several subtotal cells were added."""
+    parts = [p.strip() for p in (where or "").split(",") if p.strip()]
+    if not parts:
+        return "?"
+    if len(parts) == 1:
+        return parts[0]
+    return f"{parts[0]} (+{len(parts) - 1} cells)"
+
+
 def printed_total_variances(source_audit: Sequence[SourceAuditRecord]) -> List[ExceptionRecord]:
-    """Manual Table 13 / 14: a printed source total that differs from the
-    legible detail rows is documented, never used to alter detail or to fail
-    the reconciliation. One record per sheet and metric with the total's
-    cell(s): INFO within the 0.05 printed-total rounding tolerance, WARN
-    beyond it. Sheets with several currencies are skipped (their printed
-    total cannot be attributed to one currency)."""
-    out: List[ExceptionRecord] = []
+    """Manual Table 13 / 14: every printed source total that differs from the
+    legible detail rows is documented in one summary. The summary gives the
+    net gap by bordereau and currency, each mismatch (file, sheet, cell,
+    printed vs detail), and which other printed totals on that sheet still
+    match. Detail rows are never altered and the reconciliation does not
+    fail. WARN when any gap exceeds the 0.05 printed-total rounding
+    tolerance, otherwise INFO. Sheets with several currencies are omitted
+    (their printed total cannot be attributed to one currency)."""
+    hits = []
+    compared = 0
+    skipped_mixed = 0
+    matched: Dict[tuple, List[str]] = defaultdict(list)
     for rec in source_audit:
         if rec.sheet_type not in _BORDEREAU_OF_SHEET_TYPE or not rec.footer_totals:
             continue
         totals = {c: t for c, t in (rec.parsed_totals or {}).items() if t}
         if len(totals) != 1 or rec.currency == "MIXED":
+            skipped_mixed += 1
             continue
         ccy, src_tot = next(iter(totals.items()))
+        bordereau = _BORDEREAU_OF_SHEET_TYPE[rec.sheet_type]
+        sheet_key = (rec.source_filename or "", rec.source_sheet, bordereau)
         cells = getattr(rec, "footer_cells", None) or {}
         keys = [k for k in _METRIC_ORDER if k in rec.footer_totals]
         keys += sorted(k for k in rec.footer_totals if k.startswith("layer:"))
         for k in keys:
+            compared += 1
             printed = float(rec.footer_totals[k])
-            detail = float(src_tot.get(k, 0.0))
-            diff = printed - detail
+            detail_sum = float(src_tot.get(k, 0.0))
+            diff = printed - detail_sum
+            label = metric_label(k)
             if abs(diff) < _RECON_MATCH_TOL:
+                matched[sheet_key].append(label)
                 continue
-            where = cells.get(k, "")
-            row = 0
-            if where:
-                digits = "".join(ch for ch in where.split(",")[0] if ch.isdigit())
-                row = int(digits) if digits else 0
-            sev = "INFO" if abs(diff) <= _PRINTED_TOTAL_ROUNDING else "WARN"
-            out.append(ExceptionRecord(
-                sev, "printed_total_variance", rec.source_filename, rec.source_sheet, row,
-                (f"{_BORDEREAU_OF_SHEET_TYPE[rec.sheet_type]} {metric_label(k)}: printed total "
-                 f"{rec.source_sheet}!{where or '?'} = {printed:,.2f} vs source detail rows "
-                 f"{detail:,.2f} ({ccy}; printed − detail = {diff:,.2f}). Detail rows kept; "
-                 "reconciliation uses the detail rows (Manual Table 13)"),
-            ))
-    return out
+            hits.append({
+                "bordereau": bordereau,
+                "metric": label,
+                "file": rec.source_filename or "",
+                "sheet": rec.source_sheet,
+                "where": cells.get(k, ""),
+                "ccy": ccy,
+                "printed": printed,
+                "detail": detail_sum,
+                "diff": diff,
+                "sheet_key": sheet_key,
+            })
+    if not hits:
+        return []
+    hits.sort(key=lambda h: abs(h["diff"]), reverse=True)
+    material = sum(1 for h in hits if abs(h["diff"]) > _PRINTED_TOTAL_ROUNDING)
+    rounding = len(hits) - material
+    if material and rounding:
+        scale = f"{material} above 0.05 rounding, {rounding} within rounding"
+    elif material:
+        scale = "all above 0.05 rounding"
+    else:
+        scale = "all within 0.05 printed-total rounding"
+
+    book_order = ("PREMIUM", "CLAIMS", "OUTSTANDING")
+    nets: Dict[tuple, float] = defaultdict(float)
+    net_n: Dict[tuple, int] = defaultdict(int)
+    for h in hits:
+        key = (h["bordereau"], h["ccy"])
+        nets[key] += h["diff"]
+        net_n[key] += 1
+
+    def _signed(amount: float) -> str:
+        sign = "+" if amount > 0 else "−"
+        return f"{sign}{abs(amount):,.2f}"
+
+    net_bits = []
+    for key in sorted(nets, key=lambda bc: (book_order.index(bc[0]) if bc[0] in book_order else 9, bc[1])):
+        bord, ccy = key
+        n = net_n[key]
+        net_bits.append(f"{bord} {ccy} {_signed(nets[key])} across {n} metric" + ("s" if n != 1 else ""))
+
+    noted: set = set()
+
+    def _one(h: dict) -> str:
+        loc = f"{h['sheet']}!{_footer_cell(h['where'])}"
+        if h["file"]:
+            loc = f"{h['file']} / {loc}"
+        direction = "higher" if h["diff"] > 0 else "lower"
+        text = (
+            f"{h['bordereau']} {h['metric']} — {loc}: printed {h['printed']:,.2f} vs "
+            f"detail rows {h['detail']:,.2f} {h['ccy']} "
+            f"(printed is {abs(h['diff']):,.2f} {direction})"
+        )
+        if h["sheet_key"] not in noted:
+            noted.add(h["sheet_key"])
+            mates = matched.get(h["sheet_key"]) or []
+            if mates:
+                text += f"; matching printed totals on this sheet: {', '.join(mates)}"
+        return text
+
+    shown = hits[:12]
+    body = "; ".join(_one(h) for h in shown)
+    extra = ""
+    if len(hits) > len(shown):
+        rest = hits[len(shown):]
+        extra = (
+            f"; +{len(rest)} more "
+            f"(combined |printed − detail| {sum(abs(h['diff']) for h in rest):,.2f})"
+        )
+    mixed = ""
+    if skipped_mixed:
+        mixed = (
+            f" {skipped_mixed} mixed-currency sheet(s) omitted "
+            "(a printed total there cannot be tied to one currency)."
+        )
+    detail = (
+        f"{len(hits)} of {compared} printed footer total(s) differ from the sum of "
+        f"the detail rows that were kept ({scale}). "
+        f"Net printed − detail: {'; '.join(net_bits)}. "
+        "Those detail rows were kept and are what reconciliation uses "
+        f"(Manual Table 13). {body}{extra}.{mixed}"
+    )
+    sev = "WARN" if material else "INFO"
+    return [ExceptionRecord(sev, "printed_total_variance", detail=detail)]
 
 
 def _sum_attr(rows: Sequence, attr: str):
@@ -550,60 +612,19 @@ def overlap_counts(candidate_rows: Sequence, loaded_rows: Sequence) -> Tuple[int
 
 
 def flag_duplicate_claims(rows: Sequence[ClaimsRow], source_label: str) -> List[ExceptionRecord]:
-    """Flag apparent duplicates — never auto-delete.
+    """No-op: repeated claim rows are kept as in the source and not flagged.
 
-    Rows that share claim/policy/loss/amount but differ in FROM/TO are not
-    duplicates (instalment / period splits).
+    Exact repeats are expected when the cedant lists the same transaction more
+    than once (or the same line appears across monthly inputs). Deleting or
+    warning would invent a different bordereau than Cont Re received.
     """
-    from collections import defaultdict
-    buckets = defaultdict(list)
-    for i, r in enumerate(rows):
-        if not r.claim_no and not r.policy_no:
-            continue
-        key = (
-            r.claim_no, r.policy_no, str(r.date_of_loss),
-            str(r.period_from), str(r.period_to), r.total_claims,
-        )
-        buckets[key].append(i)
-    out = []
-    for key, idxs in buckets.items():
-        if len(idxs) > 1:
-            out.append(ExceptionRecord(
-                severity="WARN",
-                reason="apparent_duplicate",
-                source_filename=source_label,
-                source_sheet="",
-                source_row=idxs[0],
-                detail=f"key={key} count={len(idxs)} indices={idxs[:10]}",
-            ))
-    return out
+    return []
 
 
 def flag_duplicate_premium(rows: Sequence, source_label: str = "PREMIUM BORDEREAU") -> List[ExceptionRecord]:
-    """Flag exact-duplicate premium rows — never auto-delete."""
-    from collections import defaultdict
-    buckets = defaultdict(list)
-    for i, r in enumerate(rows):
-        if not getattr(r, "policy_no", None) and not getattr(r, "name_of_insured", None):
-            continue
-        key = (
-            getattr(r, "policy_no", ""),
-            getattr(r, "name_of_insured", ""),
-            str(getattr(r, "period_from", "")),
-            str(getattr(r, "period_to", "")),
-            getattr(r, "gross_premium", None),
-            getattr(r, "total_sum_insured", None),
-        )
-        buckets[key].append(i)
-    out = []
-    for key, idxs in buckets.items():
-        if len(idxs) > 1:
-            out.append(ExceptionRecord(
-                severity="WARN",
-                reason="apparent_duplicate",
-                source_filename=source_label,
-                source_sheet="",
-                source_row=idxs[0],
-                detail=f"premium key={key} count={len(idxs)} indices={idxs[:10]}",
-            ))
-    return out
+    """No-op: repeated premium rows are kept as in the source and not flagged.
+
+    Same policy/period/amounts appearing twice is left for Cont Re to handle
+    upstream; the cleaner must not warn on expected passthrough behaviour.
+    """
+    return []

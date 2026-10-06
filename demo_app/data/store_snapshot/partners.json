@@ -14,31 +14,10 @@
     "reinsurer_id": "abc.org"
   },
   {
-    "partner_id": "542adf90-37d7-45da-8cc5-56783b7d5c78",
-    "name": "AIICO(ARK)",
-    "cedant": "AIICO",
-    "broker": "ARK",
-    "reinsurer_id": "abc.org"
-  },
-  {
     "partner_id": "9cbf42b7-c66e-4022-955e-2b8dde4f5c9b",
     "name": "AIICO(SCIB)",
     "cedant": "AIICO",
     "broker": "SCIB",
-    "reinsurer_id": "abc.org"
-  },
-  {
-    "partner_id": "97dfe470-551d-49b4-bcc9-43b360aa7fe8",
-    "name": "AIICO(SCIB)",
-    "cedant": "AIICO",
-    "broker": "SCIB",
-    "reinsurer_id": "abc.org"
-  },
-  {
-    "partner_id": "7810578e-48ee-4be9-8b73-c8e5203cbd89",
-    "name": "AIICO(SCIB)Negative",
-    "cedant": "AIICO(SCIB)NEGATIVE",
-    "broker": "DIRECT",
     "reinsurer_id": "abc.org"
   },
   {

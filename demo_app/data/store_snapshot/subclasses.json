@@ -101,16 +101,6 @@
   },
   {
     "aliases": [],
-    "cedent_id": "542adf90-37d7-45da-8cc5-56783b7d5c78",
-    "class_id": "0c413acb-a728-4b3c-82c4-bb8eee7c9588",
-    "reinsurer_id": "abc.org",
-    "retention_limit": null,
-    "subclass_id": "05260933-8c28-4102-937b-bfdab2f25a08",
-    "subclass_name": "volcano_eruption",
-    "variations": []
-  },
-  {
-    "aliases": [],
     "cedent_id": "ab19215b-732f-47a6-87d8-8660bce37eac",
     "class_id": "0c413acb-a728-4b3c-82c4-bb8eee7c9588",
     "reinsurer_id": "abc.org",
@@ -121,27 +111,7 @@
   },
   {
     "aliases": [],
-    "cedent_id": "97dfe470-551d-49b4-bcc9-43b360aa7fe8",
-    "class_id": "0c413acb-a728-4b3c-82c4-bb8eee7c9588",
-    "reinsurer_id": "abc.org",
-    "retention_limit": null,
-    "subclass_id": "05260933-8c28-4102-937b-bfdab2f25a08",
-    "subclass_name": "volcano_eruption",
-    "variations": []
-  },
-  {
-    "aliases": [],
     "cedent_id": "9f659b04-ce84-4961-9790-54a93c19a67c",
-    "class_id": "0c413acb-a728-4b3c-82c4-bb8eee7c9588",
-    "reinsurer_id": "abc.org",
-    "retention_limit": null,
-    "subclass_id": "05260933-8c28-4102-937b-bfdab2f25a08",
-    "subclass_name": "volcano_eruption",
-    "variations": []
-  },
-  {
-    "aliases": [],
-    "cedent_id": "7810578e-48ee-4be9-8b73-c8e5203cbd89",
     "class_id": "0c413acb-a728-4b3c-82c4-bb8eee7c9588",
     "reinsurer_id": "abc.org",
     "retention_limit": null,

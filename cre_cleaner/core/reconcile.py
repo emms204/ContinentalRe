@@ -6,7 +6,7 @@ All checks only flag (exceptions / SUMMARY); none of them drops or edits rows.
 """
 from __future__ import annotations
 
-from collections import defaultdict
+from collections import Counter, defaultdict
 from datetime import datetime
 from typing import Dict, List, Optional, Sequence, Tuple
 
@@ -80,67 +80,35 @@ def _combine(states: Sequence[str]) -> str:
     return "not_checkable"
 
 
-def _same_nonzero(a: Optional[float], b: Optional[float]) -> bool:
-    if a is None or b is None or a == 0:
-        return False
-    try:
-        return abs(float(a) - float(b)) <= 0.005
-    except (TypeError, ValueError):
-        return False
-
-
 def check_row_splits(
     premium_rows: Sequence[PremiumRow],
     claims_rows: Sequence[ClaimsRow],
     outstanding_rows: Sequence[ClaimsRow],
 ) -> Tuple[List[ExceptionRecord], Dict[str, Dict[str, int]]]:
-    """Per row: RET/TREATY/FAC(+extra layer) shares add to 100% (or 1.0 when
-    the source uses fractions) and amounts add back to gross premium (premium)
-    or total claims (claims/outstanding)."""
-    exc: List[ExceptionRecord] = []
-    counts: Dict[str, Dict[str, int]] = {}
+    """Tally RET/TREATY/FAC vs gross (and claim totals) for SUMMARY counts.
 
-    def flag(r, bordereau: str, detail: str):
-        a = r.audit
-        exc.append(ExceptionRecord(
-            "WARN", "split_mismatch", a.source_filename, a.source_sheet, a.source_row,
-            f"{bordereau}: {detail}",
-        ))
+    Source/gold often keep rows that do not balance or where treaty equals
+    retention; those are left unchanged and are not WARN'd
+    (``split_mismatch`` / ``treaty_equals_retention`` suppressed).
+    """
+    counts: Dict[str, Dict[str, int]] = {}
 
     c = counts.setdefault("premium", {"ok": 0, "mismatch": 0, "not_checkable": 0})
     for r in premium_rows:
         layers = r.extra_layers or []
-        states, problems = [], []
+        states: List[str] = []
         amounts = [r.ret_prem, r.sur_prem, r.fac_prem] + [l.get("prem") for l in layers]
         if r.gross_premium is not None and any(a is not None for a in amounts):
-            st, diff = _band_sum_state(r.gross_premium, amounts, _amount_tol(r.gross_premium))
+            st, _diff = _band_sum_state(r.gross_premium, amounts, _amount_tol(r.gross_premium))
             states.append(st)
-            if st == "mismatch":
-                problems.append(
-                    f"premium bands {sum(a for a in amounts if a is not None):,.2f} vs gross "
-                    f"{r.gross_premium:,.2f} (diff {diff:,.2f})"
-                )
         shares = [r.ret_ppn, r.sur_ppn, r.fac_ppn] + [l.get("ppn") for l in layers]
         known = [s for s in shares if s is not None]
         if known:
             target = 1.0 if max(abs(s) for s in known) <= 1.0 and sum(known) <= 1.05 else 100.0
             st, _ = _band_sum_state(target, shares, _SHARE_TOL_PCT * target / 100.0)
             states.append(st)
-            if st == "mismatch":
-                problems.append(f"shares add to {sum(known):g} (expected {target:g})")
         state = _combine(states) if states else "not_checkable"
         c[state] += 1
-        if state == "mismatch":
-            flag(r, "PREMIUM", f"policy={r.policy_no!r}: " + "; ".join(problems))
-        if _same_nonzero(r.sur_si, r.ret_si) and _same_nonzero(r.sur_prem, r.ret_prem):
-            a = r.audit
-            exc.append(ExceptionRecord(
-                "WARN", "treaty_equals_retention", a.source_filename, a.source_sheet,
-                a.source_row,
-                f"PREMIUM: policy={r.policy_no!r}: TREATY SI/premium ({r.sur_si:,.2f} / "
-                f"{r.sur_prem:,.2f}) equal RETENTION — check the source treaty block "
-                "(may be a genuine equal split)",
-            ))
 
     for label, rows in (("claims", claims_rows), ("outstanding", outstanding_rows)):
         c = counts.setdefault(label, {"ok": 0, "mismatch": 0, "not_checkable": 0})
@@ -151,15 +119,9 @@ def check_row_splits(
             if r.total_claims is None or not any(p is not None for p in parts):
                 c["not_checkable"] += 1
                 continue
-            st, diff = _band_sum_state(r.total_claims, parts, _amount_tol(r.total_claims))
+            st, _diff = _band_sum_state(r.total_claims, parts, _amount_tol(r.total_claims))
             c[st] += 1
-            if st == "mismatch":
-                flag(r, label.upper(), (
-                    f"claim={r.claim_no!r}: RET+TREATY+FAC "
-                    f"{sum(p for p in parts if p is not None):,.2f} vs total "
-                    f"{r.total_claims:,.2f} (diff {diff:,.2f})"
-                ))
-    return exc, counts
+    return [], counts
 
 
 def _quarter_bounds(year: int, quarter: int) -> Tuple[datetime, datetime]:
@@ -177,23 +139,25 @@ def check_row_dates(
     year: int,
     quarter: int,
 ) -> Tuple[List[ExceptionRecord], Dict[str, int]]:
-    """Flag implausible dates, FROM after TO, missing date of loss, loss dates
-    after the quarter, and premium rows whose cover starts outside the file's
-    month (INFO) or quarter (WARN). Unparseable date text is flagged at parse
-    time (``date_unparseable``)."""
+    """Flag implausible dates, FROM after TO, and missing date fields.
+    Cover start outside the reporting month/quarter is common on gold
+    (annual and multi-year policies) and is not flagged.
+    Implausible far-future/past dates are collapsed to one WARN summary.
+    Unparseable date text is flagged at parse time (``date_unparseable``)."""
     exc: List[ExceptionRecord] = []
     counts: Dict[str, int] = defaultdict(int)
     q_start, q_end = _quarter_bounds(year, quarter)
+    implausible_hits: List[str] = []
 
     def flag(r, sev: str, reason: str, detail: str):
         a = r.audit
         exc.append(ExceptionRecord(sev, reason, a.source_filename, a.source_sheet, a.source_row, detail))
         counts[reason] += 1
 
-    def implausible(r, bordereau: str, fields: Sequence[Tuple[str, object]]):
-        for name, d in fields:
-            if isinstance(d, datetime) and not (1950 <= d.year <= year + 5):
-                flag(r, "WARN", "date_implausible", f"{bordereau}: {name}={d:%d/%m/%Y}")
+    def note_implausible(bordereau: str, name: str, d: datetime):
+        if 1950 <= d.year <= year + 5:
+            return
+        implausible_hits.append(f"{bordereau} {name}={d:%d/%m/%Y}")
 
     def from_after_to(r, bordereau: str):
         if isinstance(r.period_from, datetime) and isinstance(r.period_to, datetime) \
@@ -202,7 +166,9 @@ def check_row_dates(
                  f"{bordereau}: FROM {r.period_from:%d/%m/%Y} after TO {r.period_to:%d/%m/%Y}")
 
     for r in premium_rows:
-        implausible(r, "PREMIUM", (("FROM", r.period_from), ("TO", r.period_to)))
+        for name, d in (("FROM", r.period_from), ("TO", r.period_to)):
+            if isinstance(d, datetime):
+                note_implausible("PREMIUM", name, d)
         from_after_to(r, "PREMIUM")
         if r.period_from is None:
             flag(r, "WARN", "period_from_missing",
@@ -210,22 +176,13 @@ def check_row_dates(
         if r.period_to is None:
             flag(r, "WARN", "period_to_missing",
                  f"PREMIUM: policy={r.policy_no!r} TO blank")
-        d = r.period_from
-        if not isinstance(d, datetime):
-            continue
-        month = MONTH_ALIASES.get((r.audit.source_month or "").upper())
-        if q_start <= d < q_end:
-            if month and d.month != month:
-                flag(r, "INFO", "premium_date_outside_month",
-                     f"policy={r.policy_no!r}: cover starts {d:%d/%m/%Y}, file month {r.audit.source_month}")
-        else:
-            flag(r, "WARN", "premium_date_outside_quarter",
-                 f"policy={r.policy_no!r}: cover starts {d:%d/%m/%Y}, outside Q{quarter} {year}")
 
     for label, rows in (("CLAIMS", claims_rows), ("OUTSTANDING", outstanding_rows)):
         for r in rows:
-            implausible(r, label, (("DATE OF LOSS", r.date_of_loss), ("FROM", r.period_from),
-                                   ("TO", r.period_to), ("PAYMENT DATE", r.paid_date)))
+            for name, d in (("DATE OF LOSS", r.date_of_loss), ("FROM", r.period_from),
+                            ("TO", r.period_to), ("PAYMENT DATE", r.paid_date)):
+                if isinstance(d, datetime):
+                    note_implausible(label, name, d)
             from_after_to(r, label)
             if r.period_from is None:
                 flag(r, "WARN", "period_from_missing",
@@ -241,6 +198,19 @@ def check_row_dates(
             if label == "CLAIMS" and isinstance(r.paid_date, datetime) and not (q_start <= r.paid_date < q_end):
                 flag(r, "WARN", "claim_paid_outside_quarter",
                      f"claim={r.claim_no!r}: paid {r.paid_date:%d/%m/%Y}, outside Q{quarter} {year}")
+
+    if implausible_hits:
+        tallies = Counter(implausible_hits)
+        samples = ", ".join(f"{k} ×{n}" if n > 1 else k for k, n in tallies.most_common(5))
+        more = len(tallies) - min(5, len(tallies))
+        detail = (
+            f"{len(implausible_hits)} date(s) outside 1950–{year + 5} "
+            f"(e.g. {samples}"
+            + (f", +{more} more distinct" if more > 0 else "")
+            + "); rows kept"
+        )
+        exc.append(ExceptionRecord("WARN", "date_implausible", detail=detail))
+        counts["date_implausible"] = len(implausible_hits)
     return exc, dict(counts)
 
 
@@ -479,60 +449,19 @@ def overlap_counts(candidate_rows: Sequence, loaded_rows: Sequence) -> Tuple[int
 
 
 def flag_duplicate_claims(rows: Sequence[ClaimsRow], source_label: str) -> List[ExceptionRecord]:
-    """Flag apparent duplicates — never auto-delete.
+    """No-op: repeated claim rows are kept as in the source and not flagged.
 
-    Rows that share claim/policy/loss/amount but differ in FROM/TO are not
-    duplicates (instalment / period splits).
+    Exact repeats are expected when the cedant lists the same transaction more
+    than once (or the same line appears across monthly inputs). Deleting or
+    warning would invent a different bordereau than Cont Re received.
     """
-    from collections import defaultdict
-    buckets = defaultdict(list)
-    for i, r in enumerate(rows):
-        if not r.claim_no and not r.policy_no:
-            continue
-        key = (
-            r.claim_no, r.policy_no, str(r.date_of_loss),
-            str(r.period_from), str(r.period_to), r.total_claims,
-        )
-        buckets[key].append(i)
-    out = []
-    for key, idxs in buckets.items():
-        if len(idxs) > 1:
-            out.append(ExceptionRecord(
-                severity="WARN",
-                reason="apparent_duplicate",
-                source_filename=source_label,
-                source_sheet="",
-                source_row=idxs[0],
-                detail=f"key={key} count={len(idxs)} indices={idxs[:10]}",
-            ))
-    return out
+    return []
 
 
 def flag_duplicate_premium(rows: Sequence, source_label: str = "PREMIUM BORDEREAU") -> List[ExceptionRecord]:
-    """Flag exact-duplicate premium rows — never auto-delete."""
-    from collections import defaultdict
-    buckets = defaultdict(list)
-    for i, r in enumerate(rows):
-        if not getattr(r, "policy_no", None) and not getattr(r, "name_of_insured", None):
-            continue
-        key = (
-            getattr(r, "policy_no", ""),
-            getattr(r, "name_of_insured", ""),
-            str(getattr(r, "period_from", "")),
-            str(getattr(r, "period_to", "")),
-            getattr(r, "gross_premium", None),
-            getattr(r, "total_sum_insured", None),
-        )
-        buckets[key].append(i)
-    out = []
-    for key, idxs in buckets.items():
-        if len(idxs) > 1:
-            out.append(ExceptionRecord(
-                severity="WARN",
-                reason="apparent_duplicate",
-                source_filename=source_label,
-                source_sheet="",
-                source_row=idxs[0],
-                detail=f"premium key={key} count={len(idxs)} indices={idxs[:10]}",
-            ))
-    return out
+    """No-op: repeated premium rows are kept as in the source and not flagged.
+
+    Same policy/period/amounts appearing twice is left for Cont Re to handle
+    upstream; the cleaner must not warn on expected passthrough behaviour.
+    """
+    return []

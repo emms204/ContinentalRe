@@ -137,7 +137,8 @@ def test_flag_duplicate_premium_exact():
     c = PremiumRow(policy_no="P1", name_of_insured="A",
                    period_from=datetime(2024, 1, 1), period_to=datetime(2024, 6, 30),
                    gross_premium=100, total_sum_insured=1000)
-    assert len(flag_duplicate_premium([a, b])) == 1
+    # Row-level repeats are kept as in the source and are not flagged.
+    assert flag_duplicate_premium([a, b]) == []
     assert flag_duplicate_premium([a, c]) == []
 
 
@@ -225,7 +226,8 @@ def test_duplicate_claims_differ_by_period_not_flagged():
                   period_from=datetime(2024, 1, 1), period_to=datetime(2024, 3, 31),
                   total_claims=100),
     ]
-    assert len(flag_duplicate_claims(same, "CLAIMS")) == 1
+    # Exact claim repeats are also left unflagged (passthrough).
+    assert flag_duplicate_claims(same, "CLAIMS") == []
 
 
 def test_blank_from_to_flagged():
