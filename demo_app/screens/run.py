@@ -116,8 +116,7 @@ def _review(review, partner_id, year, quarter, bordereau_type, delivery) -> None
     names = [o["class_name"] for o in options]
     st.subheader("Confirm classes")
     st.caption("Keep saves an alias on this site for the selected partner. Ignore drops those rows for this run only.")
-    for w in review.get("warnings") or []:
-        st.warning(f"{w.get('code')}: {w.get('detail')}")
+    _notices(review.get("warnings"))
     decisions = []
     for i, entry in enumerate(review.get("unresolved") or []):
         label = entry.get("label") or ""
@@ -171,6 +170,19 @@ def _review(review, partner_id, year, quarter, bordereau_type, delivery) -> None
         st.rerun()
 
 
+def _notices(warnings) -> None:
+    ordered = sorted(
+        list(warnings or []),
+        key=lambda w: 0 if w.get("code") == "claims_file_ignored" else 1,
+    )
+    for w in ordered:
+        text = f"{w.get('code')}: {w.get('detail') or w.get('message') or ''}"
+        if w.get("code") == "claims_file_ignored":
+            st.error(text)
+        else:
+            st.warning(text)
+
+
 def _downloads(outcome) -> None:
     if outcome.ignored_files:
         st.warning("Ignored files: " + "; ".join(
@@ -180,8 +192,7 @@ def _downloads(outcome) -> None:
         st.info("Ignored class rows: " + "; ".join(
             f"{i.get('label')} ({i.get('records', '?')} records)" for i in outcome.ignored
         ))
-    for w in outcome.warnings:
-        st.warning(f"{w.get('code')}: {w.get('detail')}")
+    _notices(outcome.warnings)
     for item in outcome.files:
         st.download_button(
             f"Download {item.name}",

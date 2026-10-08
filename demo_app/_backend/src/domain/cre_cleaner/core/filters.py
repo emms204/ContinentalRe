@@ -1,10 +1,18 @@
 """Include/exclude transaction rows; exception logging helpers."""
 from __future__ import annotations
 
+import re
+from datetime import date, datetime
 from typing import Any, Optional, Sequence
 
 from src.domain.cre_cleaner.config import SKIP_TOKENS
-from src.domain.cre_cleaner.core.normalize import clean_text, parse_number, as_text_id
+from src.domain.cre_cleaner.core.normalize import (
+    as_text_id,
+    clean_text,
+    parse_date,
+    parse_number,
+    parse_period,
+)
 
 
 def is_blank_row(row: Sequence[Any]) -> bool:
@@ -98,6 +106,86 @@ def looks_like_section_header(row: Sequence[Any]) -> bool:
         # lone datetime month banner
         return True  # single-cell rows are rarely transactions
     return False
+
+
+# One token, no spaces, at least four digits, and a letter, slash, or hyphen.
+# Segments are split on / . - . Bare amounts (7093988.05) fail the letter/slash/
+# hyphen lookahead, so a sum sitting in INSURED is not treated as a policy number.
+POLICY_RE = re.compile(
+    r"^(?=(?:[^0-9]*[0-9]){4})(?=.*[A-Z/-])[A-Z0-9]+(?:[/.-][A-Z0-9]+)*$"
+)
+DATE_TXT = re.compile(
+    r"^\d{4}-\d{2}-\d{2}([ T]00:00:00)?$|^\d{1,2}[/.-]\d{1,2}[/.-]\d{2,4}$"
+)
+
+
+def _filled_cell(value: Any) -> bool:
+    if value is None or isinstance(value, bool):
+        return False
+    if isinstance(value, str) and not value.strip():
+        return False
+    return True
+
+
+def is_date_cell(value: Any) -> bool:
+    """True for a datetime/date cell or text that matches DATE_TXT."""
+    if isinstance(value, bool) or value is None:
+        return False
+    if isinstance(value, datetime):
+        return True
+    if isinstance(value, date):
+        return True
+    if isinstance(value, (int, float)):
+        return False
+    return DATE_TXT.match(str(value).strip()) is not None
+
+
+def is_policy_value(value: Any) -> bool:
+    """POLICY_RE on str(value).strip().upper(), length <= 40, and not a date."""
+    if value is None or isinstance(value, bool) or isinstance(value, (datetime, date)):
+        return False
+    text = str(value).strip().upper()
+    if not text or len(text) > 40 or DATE_TXT.match(text):
+        return False
+    return POLICY_RE.match(text) is not None
+
+
+def _parses_date_or_range(value: Any) -> bool:
+    if is_date_cell(value) or parse_date(value) is not None:
+        return True
+    start, end = parse_period(value)
+    return start is not None and end is not None
+
+
+def row_identity_failures(
+    insured_cell: Any,
+    policy_cell: Any,
+    from_cell: Any,
+    to_cell: Any,
+) -> set:
+    """Raw-cell identity failures.
+
+    F1: INSURED is a policy number or a date.
+    F2: POLICY NO is a date or datetime.
+    F3: both period cells are filled and neither is a date or a range.
+    A row fails the headerless-block trigger only on F1 or F2. F3 is evidence
+    that the dates are bad while the identity columns are still in the right place.
+    """
+    failures = set()
+    if _filled_cell(insured_cell) and (
+        is_policy_value(insured_cell) or is_date_cell(insured_cell)
+    ):
+        failures.add("F1")
+    if _filled_cell(policy_cell) and is_date_cell(policy_cell):
+        failures.add("F2")
+    if (
+        _filled_cell(from_cell)
+        and _filled_cell(to_cell)
+        and not _parses_date_or_range(from_cell)
+        and not _parses_date_or_range(to_cell)
+    ):
+        failures.add("F3")
+    return failures
 
 
 def has_min_transaction_evidence(

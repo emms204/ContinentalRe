@@ -35,7 +35,7 @@ HARD_ERROR_REASONS = frozenset({
     "no_claims_files", "period_unresolved", "period_ambiguous",
     "period_discovery_empty", "period_invalid", "bordereau_type_invalid",
     "claims_file_out_of_period", "batch_group_exception",
-    "class_unresolved", "upload_structure_invalid",
+    "class_unresolved", "class_outside_single_class", "upload_structure_invalid",
 })
 
 STATUS_GROUPED = "grouped"
@@ -63,6 +63,11 @@ class FilePlan:
     cedant_warning: str = ""             # → WARN cedant_mismatch_suspected
     broker_warning: str = ""             # → WARN broker_mismatch_suspected
     period_warning: str = ""             # → WARN period_override_conflict
+    period_label_warning: str = ""       # → WARN period_label_conflict (exceptions only)
+    has_claims: bool = False
+    claims_weak: bool = False
+    named_year: Optional[int] = None
+    named_quarter: Optional[int] = None
     confidence: str = ""
     evidence: List[str] = field(default_factory=list)
     warnings: List[str] = field(default_factory=list)
@@ -383,6 +388,52 @@ def period_override_warning(name: str, inferred: Tuple[Optional[int], Optional[i
 
 # --- planning ---------------------------------------------------------------
 
+def _adapter_period_source(cedant: str, broker: str) -> str:
+    """``label`` only when that adapter says so. No adapter → content."""
+    if not cedant or not broker:
+        return "content"
+    try:
+        from src.domain.cre_cleaner.adapters import get_adapter
+        from src.domain.cre_cleaner.adapters.base import UnsupportedCedantError
+        return get_adapter(cedant, broker).setting("period_source")
+    except UnsupportedCedantError:
+        return "content"
+
+
+def _follow_claims_without_picker(plan: "BatchPlan") -> None:
+    """An undated claims file joins the one period the rest of the batch shares.
+
+    Only when nothing was selected. A file that names a quarter or year is
+    limited to groups that match that name. More than one candidate leaves
+    the file period_ambiguous.
+    """
+    agreed: List[Tuple[int, int]] = []
+    for fp in plan.files:
+        if fp.status == STATUS_GROUPED and fp.year and fp.quarter in (1, 2, 3, 4):
+            key = (int(fp.year), int(fp.quarter))
+            if key not in agreed:
+                agreed.append(key)
+    if not agreed:
+        return
+    for fp in plan.files:
+        if fp.status != STATUS_PERIOD_AMBIGUOUS or not fp.claims_weak:
+            continue
+        compatible = [
+            (y, q) for y, q in agreed
+            if (fp.named_year is None or int(fp.named_year) == y)
+            and (fp.named_quarter is None or int(fp.named_quarter) == q)
+        ]
+        if len(compatible) != 1:
+            continue
+        y, q = compatible[0]
+        fp.year, fp.quarter = y, q
+        fp.status = STATUS_GROUPED
+        fp.period_source = "batch"
+        fp.period_warning = (
+            f"{fp.name}: claims file had no reporting period; cleaned as {y} Q{q} with the batch"
+        )
+
+
 def plan_batch(
     files: Iterable[Path],
     *,
@@ -476,8 +527,13 @@ def plan_batch(
         # Period: the IMPL-05 single-file inference on this file alone.
         # A bare year folder anywhere in the path counts (IMPL-20261006-04):
         # infer_period -> filename_period reads the nearest one from ``p``.
-        inf = infer_period(p)
+        inf = infer_period(p, period_source=_adapter_period_source(fp.cedant, fp.broker))
         fp.confidence = inf.confidence
+        fp.period_label_warning = inf.period_label_warning or ""
+        fp.has_claims = any(kind in ("paid", "outstanding") for kind in (inf.sheet_kinds or []))
+        fp.claims_weak = bool(inf.claims_weak)
+        fp.named_year = inf.named_year
+        fp.named_quarter = inf.named_quarter
         fp.evidence = list(inf.evidence[:6])
         fp.warnings = list(inf.warnings) + ([inf.filename_override] if inf.filename_override else [])
         fp.warnings += [f"{reason}: {detail}" for sev, reason, detail in inf.notes if sev != "INFO"]
@@ -553,6 +609,8 @@ def plan_batch(
                 "set the year and quarter for this file"
             )
 
+    _follow_claims_without_picker(plan)
+
     groups: Dict[Tuple[str, str, int, int], BatchGroup] = {}
     for fp in plan.files:
         if fp.status != STATUS_GROUPED:
@@ -611,6 +669,7 @@ def run_group(
                 ("cedant_mismatch_suspected", fp.cedant_warning),
                 ("broker_mismatch_suspected", getattr(fp, "broker_warning", "")),
                 ("period_override_conflict", getattr(fp, "period_warning", "")),
+                ("period_label_conflict", getattr(fp, "period_label_warning", "")),
             ):
                 if text:
                     extra.append(ExceptionRecord("WARN", reason, fp.name, detail=text))

@@ -1,6 +1,7 @@
 """Parse premium / claims sheets and merge monthly premiums for a quarter."""
 from __future__ import annotations
 
+import logging
 import re
 from collections import defaultdict
 from pathlib import Path
@@ -33,6 +34,8 @@ from cre_cleaner.core.map_columns import (
     detect_premium_allocation_blocks,
     extra_alias_columns,
     map_simple_columns,
+    missing_required_fields,
+    refresh_unmapped,
     merge_group_subheaders,
     _looks_like_allocation_subrow,
 )
@@ -418,6 +421,63 @@ def _period_cells(row, cmap: ColumnMap, header: Sequence[Any], flag) -> Tuple[An
     return period_from, period_to
 
 
+_mapping_log = logging.getLogger("cre_cleaner.mapping")
+
+
+def _period_sources_mapped(cmap: ColumnMap) -> Tuple[bool, bool]:
+    """Whether Insurance Period From and To each have a source column.
+
+    One PERIOD cell supplies both. An unmapped side is a sheet-level gap,
+    not a blank cell on every row.
+    """
+    if cmap.get("period") is not None:
+        return True, True
+    return cmap.get("period_from") is not None, cmap.get("period_to") is not None
+
+
+def _emit_mapping_gaps(
+    path: Path,
+    sheet: str,
+    header_row: Optional[int],
+    unmapped: Sequence[str],
+    missing: Sequence[str],
+    exceptions: List,
+) -> str:
+    """One sheet-level record per gap, for the exceptions sidecar and the API.
+
+    ``unmapped_headers`` is the only unmapped-header warning. Ties stay in
+    the source-audit note; ignored and borrowed blocks keep their own records.
+    ``required_field_unmapped`` is one record per sheet. Per-row period
+    warnings stay in reconcile and only fire when the column was mapped.
+    """
+    excel_row = (header_row + 1) if header_row is not None else 0
+    if unmapped:
+        detail = "Unmapped headers: " + ", ".join(unmapped)
+        exceptions.append(ExceptionRecord(
+            "WARN", "unmapped_headers", path.name, sheet, excel_row, detail,
+        ))
+        _mapping_log.warning(
+            "unmapped_headers file=%s sheet=%s headers=%s",
+            path.name, sheet, list(unmapped),
+        )
+    if missing:
+        candidates = ", ".join(unmapped) if unmapped else "(none)"
+        detail = (
+            f"field={', '.join(missing)}; sheet={sheet}; "
+            f"candidate unmapped headers: {candidates}"
+        )
+        exceptions.append(ExceptionRecord(
+            "WARN", "required_field_unmapped", path.name, sheet, excel_row, detail,
+        ))
+        _mapping_log.warning(
+            "required_field_unmapped file=%s sheet=%s fields=%s candidates=%s",
+            path.name, sheet, list(missing), list(unmapped),
+        )
+    if not unmapped:
+        return ""
+    return "; unmapped headers: " + ", ".join(unmapped)
+
+
 def _first_data_row(raw_rows: List[List[Any]]) -> Optional[int]:
     for i, r in enumerate(raw_rows[:60]):
         filled = sum(1 for c in r if clean_text(c))
@@ -662,6 +722,8 @@ def parse_premium_file(
         primary_label = ""
         kept = skipped = read_n = 0
         tie_notes: List[str] = []
+        gap_unmapped: List[str] = []
+        gap_missing: List[str] = []
 
         for hi, header_at in enumerate(header_indices):
             if header_at in header_override:
@@ -694,6 +756,13 @@ def parse_premium_file(
                     "Band SI/premium left blank rather than copied from another band's "
                     "columns: " + "; ".join(cmap.borrowed_blocks),
                 ))
+            refresh_unmapped(cmap, header)
+            for h in cmap.unmapped_headers:
+                if h not in gap_unmapped:
+                    gap_unmapped.append(h)
+            for field in missing_required_fields(cmap, "premium"):
+                if field not in gap_missing:
+                    gap_missing.append(field)
             end = header_indices[hi + 1] if hi + 1 < len(header_indices) else len(raw_rows)
             next_group_row = end - 1 if hi + 1 < len(header_indices) else None
             metric_cols = _premium_metric_cols(cmap)
@@ -791,6 +860,7 @@ def parse_premium_file(
                     ))
 
                 period_from, period_to = _period_cells(row, cmap, header, flag_date)
+                from_mapped, to_mapped = _period_sources_mapped(cmap)
 
                 uw = cell(row, cmap.get("uw_year"))
                 if isinstance(uw, float) and uw == int(uw):
@@ -871,6 +941,8 @@ def parse_premium_file(
                         class_source=class_source,
                         class_label_raw=class_raw,
                         currency=ccy.for_row(cell(row, cmap.get("currency"))),
+                        period_from_mapped=from_mapped,
+                        period_to_mapped=to_mapped,
                     ),
                 )
                 if adapter is not None:
@@ -892,6 +964,9 @@ def parse_premium_file(
         if adapter is not None and hasattr(adapter, "settings_note"):
             notes += "; " + adapter.settings_note()
         notes += _tie_note(tie_notes)
+        notes += _emit_mapping_gaps(
+            path, sn, hdr_i, gap_unmapped, gap_missing, exceptions,
+        )
         if len(header_indices) > 1:
             notes += f"; {len(header_indices)} header blocks"
         if banners_seen:
@@ -1057,6 +1132,8 @@ def _parse_claims_sheet(
     banners_seen: List[str] = []
     section_raw = ""
     tie_notes: List[str] = []
+    gap_unmapped: List[str] = []
+    gap_missing: List[str] = []
     ppn_calc_rows: List[int] = []
 
     def _banner_class(cell_text: str) -> str:
@@ -1096,6 +1173,13 @@ def _parse_claims_sheet(
         extra_cols = extra_alias_columns(
             header, aliases["amount_treaty"], list(cmap.mapping.values()),
         ) + list(getattr(cmap, "extra_amount_columns", []))
+        refresh_unmapped(cmap, header, *(i for i, _lab in extra_cols))
+        for h in cmap.unmapped_headers:
+            if h not in gap_unmapped:
+                gap_unmapped.append(h)
+        for field in missing_required_fields(cmap, "claims"):
+            if field not in gap_missing:
+                gap_missing.append(field)
         for _i, label in extra_cols:
             if label not in layer_labels:
                 layer_labels.append(label)
@@ -1207,6 +1291,7 @@ def _parse_claims_sheet(
                 ))
 
             period_from, period_to = _period_cells(row, cmap, header, flag_date)
+            from_mapped, to_mapped = _period_sources_mapped(cmap)
 
             uw = cell(row, cmap.get("uw_yr"))
             if isinstance(uw, float) and uw == int(uw):
@@ -1277,6 +1362,8 @@ def _parse_claims_sheet(
                     class_source=class_source,
                     class_label_raw=class_raw,
                     currency=ccy.for_row(cell(row, cmap.get("currency"))),
+                    period_from_mapped=from_mapped,
+                    period_to_mapped=to_mapped,
                 ),
             )
             rows_out.append(crow)
@@ -1296,6 +1383,9 @@ def _parse_claims_sheet(
                   f"no proportion columns) on {len(ppn_calc_rows)} rows: "
                   + _row_list(ppn_calc_rows))
     notes += _tie_note(tie_notes)
+    notes += _emit_mapping_gaps(
+        path, sn, hdr_i, gap_unmapped, gap_missing, exceptions,
+    )
     if banners_seen:
         notes += f"; section banners: {', '.join(banners_seen)}"
     if layer_labels:

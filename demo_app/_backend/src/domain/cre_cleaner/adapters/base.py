@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 
 from src.domain.cre_cleaner.config import MONTH_ALIASES, MONTH_NAMES, QUARTER_MONTHS
-from src.domain.cre_cleaner.core.class_labels import ClassMap
+from src.domain.cre_cleaner.core.class_labels import BISOLA_CLASS_ORDER, ClassMap
 from src.domain.cre_cleaner.core.detect import GENERIC_SHEET_RULES, SheetTypeRules
 from src.domain.cre_cleaner.core.map_columns import (
     CLAIMS_ALIASES,
@@ -204,12 +204,23 @@ class BaseAdapter(ABC):
     #     source PPN columns only (blank when none); True = when the tab has
     #     no PPN columns, PPN = band amount / total claims, every derived row
     #     flagged 'Calculated' in the source-audit notes.
+    # single_class: None, or one BISOLA_CLASS_ORDER label. When set, a row
+    # with no class (and a label nothing else resolves) is that class.
+    # Recognised classes other than this one stay unresolved
+    # (class_outside_single_class). Validated in setting_source; the value
+    # is not a SETTING_CHOICES tuple because any approved class is legal.
+    # period_source: "content" keeps date ranges and banners as the reporting
+    # period. "label" uses the quarter named by the file, then a statement
+    # banner, and leaves the sheet dates as a conflict note.
     BASE_SETTINGS: Dict[str, Any] = {
         "uw_year_from_start_date": False, "tsi_gp_basis": "100", "claims_ppn_calculated": False,
+        "single_class": None,
+        "period_source": "content",
     }
     SETTING_CHOICES: Dict[str, Tuple[Any, ...]] = {
         "uw_year_from_start_date": (False, True), "tsi_gp_basis": ("100", "our_share"),
         "claims_ppn_calculated": (False, True),
+        "period_source": ("content", "label"),
     }
     settings: Dict[str, Any] = {}
     settings_by_period: Dict[Tuple[int, Optional[int]], Dict[str, Any]] = {}
@@ -243,6 +254,11 @@ class BaseAdapter(ABC):
         choices = self.SETTING_CHOICES.get(name)
         if choices is not None and value not in choices:
             raise ValueError(f"{type(self).__name__} setting {name}={value!r}; expected one of {choices}")
+        if name == "single_class" and value is not None and value not in BISOLA_CLASS_ORDER:
+            raise ValueError(
+                f"{type(self).__name__} setting single_class={value!r}; "
+                f"expected None or one of {tuple(BISOLA_CLASS_ORDER)}"
+            )
         return value, src
 
     def setting(self, name: str) -> Any:

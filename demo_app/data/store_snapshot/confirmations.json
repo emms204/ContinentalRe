@@ -13,7 +13,21 @@
         "template_class": "Marine Hull",
         "at": "2026-10-06T21:24:23.424730+00:00"
       }
+    ],
+    "9cbf42b7-c66e-4022-955e-2b8dde4f5c9b": [
+      {
+        "raw_label": "Marine paid claims",
+        "store_class": "marine_hull",
+        "template_class": "Marine Hull",
+        "at": "2026-10-07T17:39:57.990489+00:00"
+      },
+      {
+        "raw_label": "marine os claims",
+        "store_class": "marine_hull",
+        "template_class": "Marine Hull",
+        "at": "2026-10-07T17:39:58.000255+00:00"
+      }
     ]
   },
-  "updated_at": "2026-10-06T21:24:23.424739+00:00"
+  "updated_at": "2026-10-07T17:39:58.000267+00:00"
 }

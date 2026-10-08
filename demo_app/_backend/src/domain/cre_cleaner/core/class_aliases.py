@@ -51,6 +51,7 @@ CLASS_ALIASES_LOADED = "class_aliases_loaded"
 STORE_CLASS_UNMAPPED = "store_class_unmapped"
 STORE_CLASS_NOT_APPROVED = "store_class_not_approved"
 STORE_CONFLICTS_BUILTIN = "store_conflicts_builtin"
+STORE_OVERRIDES_BUILTIN = "store_overrides_builtin"
 STORE_LABEL_AMBIGUOUS = "store_label_ambiguous"
 STORE_VARIATION_TOO_BROAD = "store_variation_too_broad"
 
@@ -100,6 +101,11 @@ class ConfirmedAliases:
     # normalised label -> (tier "alias"/"variation", store class name)
     provenance: Mapping[str, Tuple[str, str]] = field(default_factory=dict)
     warnings: Tuple[Mapping[str, Any], ...] = ()
+    # Store entries a single-class partner kept even though the built-in map
+    # names a different class. INFO, not warnings: the built-in map does not win.
+    overrides: Tuple[Mapping[str, Any], ...] = ()
+    # True when the store was read and the partner has no live class rows.
+    empty_store: bool = False
     partner_id: Optional[str] = None
 
     @classmethod
@@ -123,7 +129,8 @@ def _builtin(label: str, class_map: Optional[ClassMap]) -> str:
 
 def build_partner_aliases(rows: Iterable[Any], store_map: Optional[Mapping[str, str]],
                           class_map: Optional[ClassMap] = None,
-                          partner_id: Optional[str] = None) -> ConfirmedAliases:
+                          partner_id: Optional[str] = None,
+                          single_class: Optional[str] = None) -> ConfirmedAliases:
     """Resolve one partner's ``insurance_class`` rows into a run vocabulary.
 
     ``rows``: mappings/objects with ``class_name``, ``aliases``, ``variations``
@@ -134,6 +141,7 @@ def build_partner_aliases(rows: Iterable[Any], store_map: Optional[Mapping[str, 
     cmap = class_map or GENERIC_CLASS_MAP
     approved = approved_class_labels(cmap) - {FAC_CLASS_LABEL, "Other"}
     warnings: List[Dict[str, Any]] = []
+    overrides: List[Dict[str, Any]] = []
     warned: Set[Tuple[str, str]] = set()
 
     def warn(code: str, message: str, **extra: Any) -> None:
@@ -195,19 +203,32 @@ def build_partner_aliases(rows: Iterable[Any], store_map: Optional[Mapping[str, 
             entry = raw_of[(tier, key)]
             builtin = _builtin(entry, cmap) or _builtin(key, cmap)
             if builtin and builtin != template:
-                warn(STORE_CONFLICTS_BUILTIN,
-                     f"Store {tier} {entry!r} of {sorted(stores)[0]!r} says {template!r} but the "
-                     f"built-in map says {builtin!r}; the built-in map wins.",
-                     label=entry, store_class=sorted(stores)[0], tier=tier,
-                     class_name=template, builtin_class=builtin)
-                if tier == TIER_ALIAS:
-                    mapping.pop(key, None)
-                    provenance.pop(key, None)
-                continue
+                if single_class and template == single_class:
+                    overrides.append({
+                        "code": STORE_OVERRIDES_BUILTIN,
+                        "message": (
+                            f"Store {tier} {entry!r} of {sorted(stores)[0]!r} places the label "
+                            f"in {template!r}; the built-in map says {builtin!r}. "
+                            "The partner is single-class, so the store entry is used."
+                        ),
+                        "label": entry, "store_class": sorted(stores)[0], "tier": tier,
+                        "class_name": template, "builtin_class": builtin,
+                    })
+                else:
+                    warn(STORE_CONFLICTS_BUILTIN,
+                         f"Store {tier} {entry!r} of {sorted(stores)[0]!r} says {template!r} but the "
+                         f"built-in map says {builtin!r}; the built-in map wins.",
+                         label=entry, store_class=sorted(stores)[0], tier=tier,
+                         class_name=template, builtin_class=builtin)
+                    if tier == TIER_ALIAS:
+                        mapping.pop(key, None)
+                        provenance.pop(key, None)
+                    continue
             mapping[key] = template
             provenance[key] = (tier, sorted(stores)[0])
     return ConfirmedAliases(mapping=mapping, available=True, provenance=provenance,
-                            warnings=tuple(warnings), partner_id=partner_id)
+                            warnings=tuple(warnings), overrides=tuple(overrides),
+                            partner_id=partner_id)
 
 
 class AliasedClassMap(ClassMap):
@@ -247,6 +268,19 @@ def with_confirmed_aliases(class_map: Optional[ClassMap],
     if aliases is None or not aliases.available or not aliases.mapping:
         return class_map
     return AliasedClassMap(class_map, aliases.mapping)
+
+
+def mark_single_class(class_map: Optional[ClassMap], single_class: Optional[str]) -> Optional[ClassMap]:
+    """Carry ``single_class`` on the run's map and consult kept store entries
+    before the built-in map. No-op when the adapter has no single class.
+    The wrapper is a new object, so a shared adapter map is not mutated."""
+    if not single_class:
+        return class_map
+    if not isinstance(class_map, AliasedClassMap):
+        class_map = AliasedClassMap(class_map, {})
+    class_map.single_class = single_class
+    class_map.store_before_builtin = True
+    return class_map
 
 
 def confirmed_label(raw: Any, class_map: Optional[ClassMap]) -> str:

@@ -138,6 +138,14 @@ def _quarter_bounds(year: int, quarter: int) -> Tuple[datetime, datetime]:
     return start, end
 
 
+def _period_column_mapped(row, side: str) -> bool:
+    """True when this row's FROM/TO column was mapped (or a PERIOD cell covers it).
+
+    Default True keeps rows built outside the parser on the old blank-cell check.
+    """
+    return bool(getattr(getattr(row, "audit", None), f"period_{side}_mapped", True))
+
+
 def check_row_dates(
     premium_rows: Sequence[PremiumRow],
     claims_rows: Sequence[ClaimsRow],
@@ -177,10 +185,10 @@ def check_row_dates(
             if isinstance(d, datetime):
                 note_implausible("PREMIUM", name, d)
         from_after_to(r, "PREMIUM")
-        if r.period_from is None:
+        if r.period_from is None and _period_column_mapped(r, "from"):
             flag(r, "WARN", "period_from_missing",
                  f"PREMIUM: policy={r.policy_no!r} FROM blank")
-        if r.period_to is None:
+        if r.period_to is None and _period_column_mapped(r, "to"):
             flag(r, "WARN", "period_to_missing",
                  f"PREMIUM: policy={r.policy_no!r} TO blank")
 
@@ -191,10 +199,10 @@ def check_row_dates(
                 if isinstance(d, datetime):
                     note_implausible(label, name, d)
             from_after_to(r, label)
-            if r.period_from is None:
+            if r.period_from is None and _period_column_mapped(r, "from"):
                 flag(r, "WARN", "period_from_missing",
                      f"{label}: claim={r.claim_no!r} FROM blank")
-            if r.period_to is None:
+            if r.period_to is None and _period_column_mapped(r, "to"):
                 flag(r, "WARN", "period_to_missing",
                      f"{label}: claim={r.claim_no!r} TO blank")
             if r.date_of_loss is None:

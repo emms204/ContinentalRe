@@ -123,8 +123,18 @@ def normalize_class_label(raw: Optional[str], class_map: Optional[ClassMap] = No
     ``class_map`` is the adapter's map (generic + that cedant's extras);
     default: generic only.     Unknown non-empty values return ``\"\"`` so they cannot become a new
     sheet by title-casing. Empty input → ``\"Other\"``.
+
+    A single-class run sets ``store_before_builtin`` on the map. Store entries
+    kept for that class are consulted before the built-in map. Every other
+    partner leaves the flag unset, so this function is unchanged for them.
     """
     cmap = class_map or GENERIC_CLASS_MAP
+    if getattr(cmap, "store_before_builtin", False):
+        early = getattr(cmap, "confirmed_label", None)
+        if early is not None:
+            hit = early(raw)
+            if hit:
+                return hit
     if raw is None:
         return "Other"
     key = _norm_key(str(raw))
@@ -178,12 +188,19 @@ def unapproved_class_rows(rows, class_getter, class_map: Optional[ClassMap] = No
     """Rows whose class does not resolve to an approved label.
 
     Each item is ``(original_label, filename, sheet, count)``.
+    A single-class map places empty / unresolved labels on that class, so
+    those rows are approved. A different approved class stays unapproved.
     """
     allowed = approved_class_labels(class_map)
+    single = getattr(class_map, "single_class", None)
     buckets: Dict[Tuple[str, str, str], int] = {}
     for row in rows:
         raw = (class_getter(row) or "").strip()
-        label = normalize_class_label(raw, class_map)
+        text = text_for_single_class(row, raw) if single else raw
+        label = (
+            resolve_class_label(text, class_map, single)
+            if single else normalize_class_label(raw, class_map)
+        )
         if label in allowed:
             continue
         audit = getattr(row, "audit", None)
@@ -208,6 +225,45 @@ def format_unapproved_classes(items) -> str:
         "Map these labels to an approved class or correct the source: "
         + "; ".join(parts)
     )
+
+
+def _map_base(class_map: Optional[ClassMap]) -> Optional[ClassMap]:
+    """The built-in map under an alias wrapper, or the map itself."""
+    return getattr(class_map, "base", None) or class_map
+
+
+def resolve_class_label(raw: Optional[str], class_map: Optional[ClassMap] = None,
+                        single_class: Optional[str] = None) -> str:
+    """Sheet class for one hint.
+
+    Without ``single_class`` this is ``normalize_class_label``. With it:
+
+    * Facultative stays Facultative (still dropped later).
+    * A store entry for the single class wins over the built-in map.
+    * An empty hint, ``Other``, a bare-unresolved hint, or a label nothing
+      resolves becomes the single class.
+    * A different approved class returns ``\"\"`` so the run can answer
+      ``class_outside_single_class`` instead of opening that class's sheet.
+    """
+    single = single_class or getattr(class_map, "single_class", None)
+    if not single:
+        return normalize_class_label(raw, class_map)
+    base = _map_base(class_map)
+    if is_fac_class(raw, base):
+        return FAC_CLASS_LABEL
+    early = getattr(class_map, "confirmed_label", None)
+    store = early(raw) if early is not None else ""
+    if store == single:
+        return single
+    text = "" if raw is None else str(raw).strip()
+    if not text or is_unresolved_class(text):
+        return single
+    builtin = normalize_class_label(text, base)
+    if builtin in ("", "Other", single):
+        return single
+    if builtin in approved_class_labels(base):
+        return ""
+    return single
 
 
 def is_unresolved_class(raw: Optional[str]) -> bool:
@@ -327,12 +383,38 @@ def ordered_class_labels(labels: Iterable[str]) -> List[str]:
     return seen
 
 
+def text_for_single_class(row, hint: str) -> str:
+    """Label the single-class resolver should see.
+
+    A section banner collapses ``PLANTATION FIRE`` to ``Fire`` and stores
+    that on ``class_hint``. The banner text stays on ``class_label_raw``.
+    The store alias is on that raw text, so a raw label that differs from
+    the collapsed hint is what gets resolved.
+    """
+    audit = getattr(row, "audit", None)
+    raw = (getattr(audit, "class_label_raw", "") or "").strip()
+    hint = (hint or "").strip()
+    if raw and raw.casefold() != hint.casefold():
+        return raw
+    return hint
+
+
 def group_rows_by_class(rows: Sequence, class_getter,
                         class_map: Optional[ClassMap] = None) -> Dict[str, list]:
-    """Group row objects by normalized Bisola class label."""
+    """Group row objects by normalized Bisola class label.
+
+    A single-class map places empty and unresolved hints on that class.
+    A hint that resolves to a different approved class is left out of every
+    sheet (the pipeline blocks the run before this write).
+    """
     out: Dict[str, list] = {}
+    single = getattr(class_map, "single_class", None)
     for r in rows:
-        lab = normalize_class_label(class_getter(r), class_map)
+        raw = class_getter(r)
+        text = text_for_single_class(r, raw) if single else raw
+        lab = resolve_class_label(text, class_map, single) if single else normalize_class_label(raw, class_map)
+        if not lab:
+            continue
         out.setdefault(lab, []).append(r)
     return out
 

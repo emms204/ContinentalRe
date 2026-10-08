@@ -141,8 +141,10 @@ def clean(
     with tempfile.TemporaryDirectory(prefix="bisola_demo_") as tmp:
         root = Path(tmp)
         raw = root / "raw"
+        if year is not None:
+            raw = raw / str(int(year))
         out = root / "out"
-        raw.mkdir()
+        raw.mkdir(parents=True)
         out.mkdir()
         paths = []
         for name, data in uploads:
@@ -180,7 +182,9 @@ def clean(
                 paths, cedant=cedant, broker=broker,
                 selected_year=int(year), selected_quarter=quarter,
             )
-            ignore_statuses = {"year_mismatch", "quarter_mismatch", "period_uninferable"}
+            ignore_statuses = {
+                "year_mismatch", "quarter_mismatch", "period_uninferable", "period_ambiguous",
+            }
             hard = []
             for item in getattr(plan, "pending", None) or []:
                 if item.status in ignore_statuses:
@@ -189,6 +193,24 @@ def clean(
                     })
                 else:
                     hard.append(item)
+            if plan.groups:
+                if len(plan.groups) == 1:
+                    period = f"{plan.groups[0].year} Q{plan.groups[0].quarter}"
+                else:
+                    period = ", ".join(
+                        f"{group.year} Q{group.quarter}" for group in plan.groups
+                    )
+                for item in plan.pending:
+                    if item.status not in ignore_statuses or not getattr(item, "has_claims", False):
+                        continue
+                    warnings.append({
+                        "code": "claims_file_ignored",
+                        "detail": (
+                            f"{item.name}: claims file not cleaned ({item.status}: {item.detail}); "
+                            f"{period} cleaned without it — check the year or set file_periods"
+                        ),
+                        "file": item.name,
+                    })
             if hard:
                 detail = "; ".join(f"{item.name}: {item.detail}" for item in hard)
                 raise CleanError(f"Could not clean every file. {detail}")

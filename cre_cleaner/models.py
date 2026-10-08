@@ -20,6 +20,10 @@ class AuditMeta:
     # ISO-ish code (NGN, USD, EUR, GBP) or FCY when the source only says
     # "foreign". Rows of different currencies are never summed together.
     currency: str = "NGN"
+    # False when the sheet had no source column for that side. Reconcile then
+    # skips the per-row blank warning; the sheet carries required_field_unmapped.
+    period_from_mapped: bool = True
+    period_to_mapped: bool = True
 
 
 @dataclass

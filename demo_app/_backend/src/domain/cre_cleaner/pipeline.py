@@ -17,8 +17,11 @@ from src.domain.cre_cleaner.core.class_labels import (
     group_rows_by_class,
     is_fac_class,
     is_unresolved_class,
+    normalize_class_label,
     ordered_class_labels,
     premium_class_hint,
+    resolve_class_label,
+    text_for_single_class,
     unapproved_class_rows,
 )
 from src.domain.cre_cleaner.core.class_suggest import unresolved_class_entries
@@ -26,9 +29,11 @@ from src.domain.cre_cleaner.core.class_aliases import (
     ALIAS_STORE_UNAVAILABLE,
     CLASS_ALIAS_APPLIED,
     CLASS_ALIASES_LOADED,
+    STORE_OVERRIDES_BUILTIN,
     ConfirmedAliases,
     alias_applications,
     confirmed_label,
+    mark_single_class,
     with_confirmed_aliases,
 )
 from src.domain.cre_cleaner.config import QUARTER_MONTHS
@@ -138,8 +143,92 @@ def _drop_ignored_rows(rows, class_getter, ignored):
     return kept, n
 
 
+def _block_outside_single_class(result, outside_rows, single_class, class_map,
+                                cedant, broker, year, quarter) -> None:
+    """A recognised class other than the partner's single class blocks the run."""
+    buckets: dict = {}
+    for row, getter, _bordereau in outside_rows:
+        hint = (getter(row) or "").strip() or "(blank)"
+        audit = getattr(row, "audit", None)
+        key = (
+            hint,
+            getattr(audit, "source_filename", "") if audit else "",
+            getattr(audit, "source_sheet", "") if audit else "",
+        )
+        buckets[key] = buckets.get(key, 0) + 1
+    parts = []
+    unresolved = []
+    base = getattr(class_map, "base", None) or class_map
+    for (label, fname, sheet), n in buckets.items():
+        raw = "" if label == "(blank)" else label
+        builtin = normalize_class_label(raw, base)
+        if builtin in ("", "Other"):
+            builtin = ""
+        where = f"{fname} / {sheet}" if fname and sheet else (fname or sheet or "workbook")
+        parts.append(f"{label!r} (built-in {builtin or 'unresolved'}) on {where} ({n} record(s))")
+        unresolved.append({
+            "label": label,
+            "file": fname or "",
+            "sheet": sheet or "",
+            "records": int(n),
+            "builtin_class": builtin,
+            "type": "class",
+            "cedant": str(cedant or "").upper(),
+            "broker": str(broker or "").upper(),
+            "actions": ["keep", "ignore"],
+            "suggestion": (
+                {"class": builtin, "rule": "normalized_exact", "matched_against": builtin}
+                if builtin else None
+            ),
+            "suggestion_reason": "built-in class map" if builtin else "",
+            "suggestion_candidates": [],
+        })
+    detail = (
+        f"Class outside the partner's single class {single_class} — confirm it as "
+        "an alias of that class or correct the source: " + "; ".join(parts)
+    )
+    result.exceptions.append(ExceptionRecord("ERROR", "class_outside_single_class", detail=detail))
+    result.summary = {
+        "cedant": str(cedant or "").upper(),
+        "broker": str(broker or "").upper(),
+        "year": year,
+        "quarter": quarter,
+        "error": "class_outside_single_class",
+        "detail": detail,
+        "unresolved": unresolved,
+    }
+
+
+def _record_source_subclasses(result) -> None:
+    """One INFO source_subclass per raw label, file and sheet. The upload
+    workbook is unchanged; the raw text is only in the exceptions sidecar."""
+    buckets: dict = {}
+    for rows in (result.premium_rows, result.claims_rows, result.outstanding_rows):
+        for row in rows or []:
+            audit = getattr(row, "audit", None)
+            raw = (getattr(audit, "class_label_raw", "") or "").strip()
+            if not raw:
+                continue
+            key = (
+                raw,
+                getattr(audit, "source_filename", "") or "",
+                getattr(audit, "source_sheet", "") or "",
+            )
+            buckets[key] = buckets.get(key, 0) + 1
+    for (label, fname, sheet), n in sorted(buckets.items()):
+        result.exceptions.append(ExceptionRecord(
+            "INFO", "source_subclass", fname, sheet,
+            detail=f"{label!r} ({n} record(s))",
+        ))
+
+
+def _label_key(hint: str) -> str:
+    return hint if hint else "(blank)"
+
+
 def _divert_unresolved_class(rows, class_getter, bordereau: str, blocked: Optional[list] = None,
-                             class_map=None):
+                             class_map=None, single_class: Optional[str] = None,
+                             applied: Optional[dict] = None, outside: Optional[list] = None):
     """Rows with no class, or a class too broad to place (bare MARINE), are
     NOT written to an 'Other' sheet; they go to the exceptions sidecar.
 
@@ -156,6 +245,28 @@ def _divert_unresolved_class(rows, class_getter, bordereau: str, blocked: Option
     buckets: dict = {}
     for r in rows:
         hint = (class_getter(r) or "").strip()
+        if single_class:
+            text = text_for_single_class(r, hint)
+            placed = resolve_class_label(text, class_map, single_class)
+            if placed:
+                kept.append(r)
+                store_hit = confirmed_label(text, class_map)
+                base = getattr(class_map, "base", None) or class_map
+                builtin = normalize_class_label(text, base) if text else "Other"
+                # A store hit is class_alias_applied. The single-class default
+                # covers empty, Other, bare-unresolved, and labels nothing resolves.
+                if applied is not None and store_hit != single_class and builtin != single_class:
+                    audit = getattr(r, "audit", None)
+                    bucket = (
+                        _label_key(hint),
+                        getattr(audit, "source_filename", "") if audit else "",
+                        getattr(audit, "source_sheet", "") if audit else "",
+                    )
+                    applied[bucket] = applied.get(bucket, 0) + 1
+                continue
+            if outside is not None:
+                outside.append((r, class_getter, bordereau))
+            continue
         if hint and (not is_unresolved_class(hint) or confirmed_label(hint, class_map)):
             kept.append(r)
             continue
@@ -741,6 +852,7 @@ def _run_pipeline_impl(
     for rec in extra_exceptions or []:
         result.exceptions.append(rec)
         print(f"{rec.severity} {rec.reason}: {rec.detail}", file=sys.stderr)
+    single_class = adapter.setting("single_class")
     if class_aliases is not None:
         if not class_aliases.available:
             msg = (
@@ -758,11 +870,22 @@ def _run_pipeline_impl(
                 print(f"WARN {code}: {text}", file=sys.stderr)
             class_map = with_confirmed_aliases(class_map, class_aliases)
             tiers = class_aliases.counts()
+            order = (
+                "before the built-in map where the store names this partner's single class"
+                if single_class else "after the built-in map"
+            )
             result.exceptions.append(ExceptionRecord(
                 "INFO", CLASS_ALIASES_LOADED,
                 detail=(f"partner class store: {tiers.get('alias', 0)} alias label(s) and "
                         f"{tiers.get('variation', 0)} variation label(s) apply to this run "
-                        "(after the built-in map; keywords are never used)"),
+                        f"({order}; keywords are never used)"),
+            ))
+    if single_class:
+        class_map = mark_single_class(class_map, single_class)
+        for note in getattr(class_aliases, "overrides", ()) or ():
+            result.exceptions.append(ExceptionRecord(
+                "INFO", STORE_OVERRIDES_BUILTIN,
+                detail=str(note.get("message") or ""),
             ))
 
     # --- PDF → Excel (paused for Phase 1 unless explicitly enabled) ---
@@ -794,7 +917,10 @@ def _run_pipeline_impl(
     single_file = bool(single_file)
     if period_inferred:
         # A bare year folder anywhere in the input path counts (IMPL-20261006-04).
-        inferred = infer_period(raw_dir, folder_year=folder_year(raw_dir))
+        inferred = infer_period(
+            raw_dir, folder_year=folder_year(raw_dir),
+            period_source=adapter.setting("period_source"),
+        )
         if inferred.filename_override:
             result.exceptions.append(ExceptionRecord(
                 "WARN", "period_filename_override", detail=inferred.filename_override,
@@ -1006,6 +1132,8 @@ def _run_pipeline_impl(
         )
 
     diverted_blocked: list = []
+    applied_single: dict = {}
+    outside_rows: list = []
     for attr, getter, label in (
         ("premium_rows", premium_class_hint, "PREMIUM"),
         ("claims_rows", claims_class_hint, "CLAIMS"),
@@ -1013,10 +1141,16 @@ def _run_pipeline_impl(
     ):
         kept, excs = _divert_unresolved_class(
             getattr(result, attr), getter, label, blocked=diverted_blocked,
-            class_map=class_map,
+            class_map=class_map, single_class=single_class,
+            applied=applied_single, outside=outside_rows,
         )
         setattr(result, attr, kept)
         result.exceptions.extend(excs)
+    if outside_rows:
+        _block_outside_single_class(
+            result, outside_rows, single_class, class_map, cedant, broker, year, quarter,
+        )
+        return result
 
     # Repeated premium/claims rows are kept as in the source and not flagged
     # (flag_duplicate_* are no-ops). Whole-file near/exact duplicates are still
@@ -1117,6 +1251,13 @@ def _run_pipeline_impl(
             "INFO", CLASS_ALIAS_APPLIED,
             detail=f"{label!r} -> {cls} by the partner class store ({n} record(s))",
         ))
+    if single_class:
+        for (label, fname, sheet), n in sorted(applied_single.items()):
+            result.exceptions.append(ExceptionRecord(
+                "INFO", "single_class_applied", fname, sheet,
+                detail=f"{label!r} -> {single_class} ({n} record(s))",
+            ))
+        _record_source_subclasses(result)
 
     currency_groups = _split_by_currency(
         result.premium_rows, result.claims_rows, result.outstanding_rows,

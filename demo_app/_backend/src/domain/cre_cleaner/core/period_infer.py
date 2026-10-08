@@ -105,6 +105,14 @@ _REPORTING_DATE_WEIGHT = 3.0
 _ROW_REPORTING_HEADERS: Tuple[str, ...] = _REPORTING_DATE_HEADERS + (
     "ENTRY DATE", "DATE OF ENTRY", "DATE ENTERED",
 )
+# Claims sheets vote only with these. Loss, cover, notification and the
+# MONTH column do not. The four settlement spellings sit beside the
+# reporting-date headers already used for premium.
+_CLAIMS_REPORTING_HEADERS: Tuple[str, ...] = _ROW_REPORTING_HEADERS + (
+    "TRANS. DATE", "DATE OF PAYMENT", "SETTLEMENT DATE", "DATE SETTLED",
+    "DATE OF SETTLEMENT",
+)
+_CLAIMS_REPORTING_WEIGHT = 3.0
 _ROW_LOSS_HEADERS: Tuple[str, ...] = ("DATE OF LOSS", "LOSS DATE", "DOL")
 _ROW_MIN_MAJORITY = 5      # dated rows needed before a row-date year is decisive
 _ROW_MIN_REFERENCE = 2     # dated rows needed for the staleness reference year
@@ -133,6 +141,17 @@ class PeriodInference:
     # True when banners, row dates and the file name were already combined
     # per field (IMPL-08): infer_period returns it as-is.
     combined: bool = False
+    # Claims sheets present and none of them had a banner or a reporting-date
+    # vote. Loss, cover and underwriting dates are not reporting evidence.
+    claims_weak: bool = False
+    sheet_kinds: List[str] = field(default_factory=list)
+    # Quarter and year the file name itself states, before content or a folder
+    # fills them. Batch-follow uses these to stay compatible with the name.
+    named_year: Optional[int] = None
+    named_quarter: Optional[int] = None
+    # WARN text for period_label_conflict. Empty when the label rule did not
+    # run or the label and the dates do not conflict. Exceptions file only.
+    period_label_warning: str = ""
 
     @property
     def ok(self) -> bool:
@@ -318,35 +337,9 @@ def _iter_excel_paths(raw_dir: Path) -> List[Path]:
     )
 
 
-def _collect_dates_from_sheet(
-    rows: Sequence[Sequence[Any]],
-    *,
-    max_header_scan: int = 30,
-    max_data_rows: int = 400,
-    detail: Optional[dict] = None,
-) -> Tuple[Counter, Counter, List[str], Optional[Tuple[int, int]]]:
-    """Return (year_votes, quarter_votes, evidence, banner_period).
-
-    ``banner_period`` is (year, quarter) when a title row names both — that is
-    the reporting period and must beat historical Date-of-Loss votes.
-
-    ``detail`` (optional dict) is filled with ``banner_kind`` (range / as_at /
-    label), ``banner_text`` and ``row_years`` / ``row_tier``: one year count per
-    dated data row in the row-date columns (reporting tier, else loss tier).
-    """
-    if detail is None:
-        detail = {}
-    detail.update(banner_kind=None, banner_text="", row_years=Counter(), row_tier=None)
-    year_votes: Counter = Counter()
-    quarter_votes: Counter = Counter()
-    evidence: List[str] = []
-    banner_period: Optional[Tuple[int, int]] = None
-    if not rows:
-        return year_votes, quarter_votes, evidence, banner_period
-
-    # Banner / title rows above the header often name the reporting quarter
-    # ("Q2, 2024 …") or the report date range ("From: [April 01, 2023] To
-    # [June 30, 2023]", "As At [September 30, 2024]").
+def _scan_banner(rows, detail, evidence) -> Optional[Tuple[int, int]]:
+    """First title row that names a reporting period. Sheet names are not read."""
+    banner_period = None
     for r in rows[:12]:
         text = " ".join(str(c) for c in r if c not in (None, ""))
         if not text.strip():
@@ -375,13 +368,42 @@ def _collect_dates_from_sheet(
         qs = quarters_in_text(text)
         ys = years_in_text(text)
         if qs and ys:
-            # One clear reporting label (e.g. "2024 CLAIMS BORDEREAU - Q2, 2024")
             y = max(ys) if len(ys) <= 2 else Counter(ys).most_common(1)[0][0]
             q = sorted(qs)[0] if len(qs) == 1 else Counter(qs).most_common(1)[0][0]
             banner_period = (int(y), int(q))
             detail.update(banner_kind="label", banner_text=text)
             evidence.append(f"banner {text[:80]!r} → {y} Q{q}")
             break
+    return banner_period
+
+
+def _collect_dates_from_sheet(
+    rows: Sequence[Sequence[Any]],
+    *,
+    max_header_scan: int = 30,
+    max_data_rows: int = 400,
+    detail: Optional[dict] = None,
+) -> Tuple[Counter, Counter, List[str], Optional[Tuple[int, int]]]:
+    """Return (year_votes, quarter_votes, evidence, banner_period).
+
+    ``banner_period`` is (year, quarter) when a title row names both — that is
+    the reporting period and must beat historical Date-of-Loss votes.
+
+    ``detail`` (optional dict) is filled with ``banner_kind`` (range / as_at /
+    label), ``banner_text`` and ``row_years`` / ``row_tier``: one year count per
+    dated data row in the row-date columns (reporting tier, else loss tier).
+    """
+    if detail is None:
+        detail = {}
+    detail.update(banner_kind=None, banner_text="", row_years=Counter(), row_tier=None)
+    year_votes: Counter = Counter()
+    quarter_votes: Counter = Counter()
+    evidence: List[str] = []
+    banner_period: Optional[Tuple[int, int]] = None
+    if not rows:
+        return year_votes, quarter_votes, evidence, banner_period
+
+    banner_period = _scan_banner(rows, detail, evidence)
 
     header_idx = None
     col_weights: dict[int, float] = {}
@@ -480,9 +502,101 @@ def _row_year_counts(rows, header_idx, max_header_scan, max_data_rows, detail) -
             return
 
 
+def _dated_cell(value):
+    d = parse_date(value)
+    if d is None or not (1990 <= d.year <= 2100):
+        return None
+    return d.date() if isinstance(d, datetime) else d
+
+
+def _collect_claims_dates(
+    rows: Sequence[Sequence[Any]],
+    *,
+    max_header_scan: int = 30,
+    max_data_rows: int = 400,
+    detail: Optional[dict] = None,
+) -> Tuple[Counter, Counter, List[str], Optional[Tuple[int, int]]]:
+    """Claims-sheet votes: banners and reporting-date columns only.
+
+    Loss, cover, notification and underwriting-year columns are counted into
+    ``detail['loss_years']`` for the stale-banner check and never vote.
+    A quarter is voted only when one (year, quarter) holds more than half of
+    the dated reporting rows.
+    """
+    if detail is None:
+        detail = {}
+    detail.update(
+        banner_kind=None, banner_text="", row_years=Counter(), row_tier=None,
+        loss_years=Counter(),
+    )
+    year_votes: Counter = Counter()
+    quarter_votes: Counter = Counter()
+    evidence: List[str] = []
+    if not rows:
+        return year_votes, quarter_votes, evidence, None
+    banner_period = _scan_banner(rows, detail, evidence)
+
+    header_idx = None
+    rep_cols: List[int] = []
+    loss_cols: List[int] = []
+    for i, row in enumerate(rows[:max_header_scan]):
+        rep = [j for j, c in enumerate(row) if c not in (None, "")
+               and any(header_has_phrase(str(c), h) for h in _CLAIMS_REPORTING_HEADERS)]
+        loss = [j for j, c in enumerate(row) if c not in (None, "")
+                and any(header_has_phrase(str(c), h) for h in _ROW_LOSS_HEADERS)]
+        if rep or loss:
+            header_idx, rep_cols, loss_cols = i, rep, loss
+            if rep:
+                break
+    if header_idx is not None and loss_cols:
+        counts: Counter = Counter()
+        for row in rows[header_idx + 1: header_idx + 1 + max_data_rows]:
+            for j in loss_cols:
+                if j >= len(row):
+                    continue
+                d = _dated_cell(row[j])
+                if d is not None:
+                    counts[d.year] += 1
+                    break
+        detail["loss_years"] = counts
+    if header_idx is None or not rep_cols:
+        return year_votes, quarter_votes, evidence, banner_period
+
+    pairs: Counter = Counter()
+    for row in rows[header_idx + 1: header_idx + 1 + max_data_rows]:
+        if not any(c not in (None, "") for c in row):
+            continue
+        for j in rep_cols:
+            if j >= len(row):
+                continue
+            d = _dated_cell(row[j])
+            if d is None:
+                continue
+            pairs[(d.year, _quarter_of(d))] += 1
+            break
+    n = sum(pairs.values())
+    if n:
+        years: Counter = Counter()
+        for (y, _q), c in pairs.items():
+            years[y] += c
+        detail.update(row_years=years, row_tier="reporting")
+        for y, c in years.items():
+            year_votes[y] += c * _CLAIMS_REPORTING_WEIGHT
+        top, top_n = pairs.most_common(1)[0]
+        if top_n / n > 0.5:
+            quarter_votes[top[1]] += top_n * _CLAIMS_REPORTING_WEIGHT
+        evidence.append(
+            f"claims reporting dates: {n} row(s), quarter "
+            + (f"Q{top[1]}" if top_n / n > 0.5 else "unset")
+        )
+    return year_votes, quarter_votes, evidence, banner_period
+
+
 def infer_period_from_workbook_content(
     paths: Sequence[Path],
     named: Optional[Tuple[Optional[int], Optional[int], List[str]]] = None,
+    *,
+    include_label_banners: bool = True,
 ) -> PeriodInference:
     """Majority vote over date-column values across Excel workbooks.
 
@@ -497,7 +611,12 @@ def infer_period_from_workbook_content(
     banners: List[Tuple[Tuple[int, int], str, str, str]] = []
     row_rep: Counter = Counter()
     row_loss: Counter = Counter()
+    claims_loss: Counter = Counter()
+    sheet_kinds: List[str] = []
+    claims_sheets = 0
+    claims_with_reporting = 0
     files_ok = 0
+    from src.domain.cre_cleaner.core.detect import detect_sheet_type
 
     for path in paths:
         try:
@@ -507,16 +626,28 @@ def infer_period_from_workbook_content(
             continue
         file_hits = 0
         for sn, rows in sheets.items():
+            kind = detect_sheet_type(sn, rows[:30])
+            sheet_kinds.append(kind)
             det: dict = {}
-            yv, qv, ev, banner = _collect_dates_from_sheet(rows, detail=det)
-            if banner is not None:
-                banners.append((banner, det.get("banner_kind") or "label",
-                                det.get("banner_text") or "", f"{path.name}/{sn}"))
+            claims_sheet = kind in ("paid", "outstanding")
+            if claims_sheet:
+                claims_sheets += 1
+                yv, qv, ev, banner = _collect_claims_dates(rows, detail=det)
+                if det.get("loss_years"):
+                    claims_loss.update(det["loss_years"])
+            else:
+                yv, qv, ev, banner = _collect_dates_from_sheet(rows, detail=det)
+            kind_name = det.get("banner_kind") or "label"
+            if banner is not None and (include_label_banners or kind_name != "label"):
+                banners.append((banner, kind_name, det.get("banner_text") or "", f"{path.name}/{sn}"))
             if det.get("row_tier") == "reporting":
                 row_rep.update(det["row_years"])
-            elif det.get("row_tier") == "loss":
+            elif det.get("row_tier") == "loss" and not claims_sheet:
                 row_loss.update(det["row_years"])
-            if yv or qv or banner is not None:
+            reported = bool(yv or qv or banner is not None)
+            if claims_sheet and reported:
+                claims_with_reporting += 1
+            if reported:
                 file_hits += 1
                 year_votes.update(yv)
                 quarter_votes.update(qv)
@@ -525,10 +656,17 @@ def infer_period_from_workbook_content(
         if file_hits:
             files_ok += 1
 
+    def _stamp(result: PeriodInference) -> PeriodInference:
+        result.sheet_kinds = list(sheet_kinds)
+        result.claims_weak = claims_sheets > 0 and claims_with_reporting == 0
+        return result
+
     # Banners present: combine banners, row dates and the file name per field.
     if banners:
-        return _combine_evidence(banners, row_rep, row_loss, named, evidence,
-                                 year_votes, quarter_votes)
+        return _stamp(_combine_evidence(
+            banners, row_rep, row_loss, named, evidence, year_votes, quarter_votes,
+            claims_loss=claims_loss,
+        ))
 
     year, y_w = _vote(year_votes)
     quarter, q_w = _vote(quarter_votes)
@@ -554,12 +692,13 @@ def infer_period_from_workbook_content(
         result.warnings.append("No usable dates found in workbook date columns")
         result.confidence = "none"
         result.source = "none"
-    return result
+    return _stamp(result)
 
 
 def _combine_evidence(banners, row_rep: Counter, row_loss: Counter, named,
                       evidence: List[str], year_votes: Counter,
-                      quarter_votes: Counter) -> PeriodInference:
+                      quarter_votes: Counter,
+                      claims_loss: Optional[Counter] = None) -> PeriodInference:
     """Per-field period from banners + row dates + file name (IMPL-08).
 
     See the module docstring for the order. Every override or discarded
@@ -593,11 +732,28 @@ def _combine_evidence(banners, row_rep: Counter, row_loss: Counter, named,
         key = (" ".join(str(text).split()).upper(), int(y), int(q))
         uniq.setdefault(key, {"y": int(y), "q": int(q), "kind": kind,
                               "text": key[0], "where": []})["where"].append(where)
+    # Loss dates on claims sheets mark a banner stale. They do not set the year.
+    claims_loss = claims_loss or Counter()
+    loss_n = sum(claims_loss.values())
+    loss_ref = loss_maj = None
+    if loss_n >= _ROW_MIN_REFERENCE:
+        loss_top, loss_top_n = claims_loss.most_common(1)[0]
+        loss_bulk = [y for y, c in claims_loss.items() if c / loss_n >= _ROW_REFERENCE_SHARE]
+        loss_ref = max(loss_bulk) if loss_bulk else loss_top
+        if loss_n >= _ROW_MIN_MAJORITY and loss_top_n / loss_n > 0.5:
+            loss_maj = loss_top
+
     live, stale = [], []
     for b in uniq.values():
-        too_old = ref is not None and b["y"] < ref - _STALE_YEARS
+        too_old = (
+            (ref is not None and b["y"] < ref - _STALE_YEARS)
+            or (loss_ref is not None and b["y"] < loss_ref - _STALE_YEARS)
+        )
         too_new = tier == "reporting" and ref is not None and b["y"] > ref + _STALE_YEARS
-        before_losses = tier == "loss" and maj is not None and b["y"] < maj
+        before_losses = (
+            (tier == "loss" and maj is not None and b["y"] < maj)
+            or (loss_maj is not None and b["y"] < loss_maj)
+        )
         (stale if (too_old or too_new or before_losses) else live).append(b)
 
     def _desc(bs):
@@ -789,11 +945,166 @@ def _labels_for(paths: Sequence[Path], root: Optional[Path] = None) -> List[str]
     return out
 
 
+def _parse_label_source(text: str) -> Tuple[Optional[int], Optional[int], bool]:
+    """(quarter, year, unparseable). An unparseable source gives neither.
+
+    A fiscal pair of consecutive years uses the later year. Two
+    non-consecutive years, more than two years, or more than one quarter
+    makes the source unparseable.
+    """
+    qs = set(quarters_in_text(text))
+    ys = set(years_in_text(text))
+    bad = len(qs) > 1 or len(ys) > 2 or (len(ys) == 2 and abs(max(ys) - min(ys)) != 1)
+    if bad:
+        return None, None, True
+    quarter = next(iter(qs)) if len(qs) == 1 else None
+    if len(ys) == 2:
+        year = max(ys)
+    elif len(ys) == 1:
+        year = next(iter(ys))
+    else:
+        year = None
+    return quarter, year, False
+
+
+def _statement_label_texts(path: Path) -> List[str]:
+    """Banner labels only, de-duplicated by text. Sheet names are not labels."""
+    from src.domain.cre_cleaner.io.excel import read_workbook_sheets
+
+    try:
+        sheets = read_workbook_sheets(path)
+    except Exception:
+        return []
+    seen = set()
+    out: List[str] = []
+    for _sn, rows in sheets.items():
+        detail: dict = {}
+        evidence: List[str] = []
+        _scan_banner(rows, detail, evidence)
+        if detail.get("banner_kind") != "label":
+            continue
+        text = " ".join(str(detail.get("banner_text") or "").split())
+        key = text.upper()
+        if not text or key in seen:
+            continue
+        seen.add(key)
+        out.append(text)
+    return out
+
+
+def label_period(path: Path, *, folder_year: Optional[int] = None) -> Optional[PeriodInference]:
+    """Period named by the file, else by a statement banner.
+
+    Returns None when no label quarter exists, so the caller keeps today's
+    date-range logic. A settled label is confidence high.
+    """
+    path = Path(path)
+    fn_q, fn_y, fn_bad = _parse_label_source(path.stem)
+    banner_q = banner_y = None
+    banner_bad = False
+    parsed = []
+    for text in _statement_label_texts(path):
+        q, y, bad = _parse_label_source(text)
+        if bad or q is None:
+            banner_bad = banner_bad or bad
+            continue
+        parsed.append((q, y))
+    quarters = {q for q, _y in parsed}
+    if len(quarters) > 1:
+        banner_bad = True
+    elif len(quarters) == 1:
+        banner_q = next(iter(quarters))
+        years = {y for _q, y in parsed if y is not None}
+        if len(years) == 1:
+            banner_y = next(iter(years))
+        elif len(years) > 1:
+            banner_bad = True
+            banner_q = None
+    notes: List[Tuple[str, str, str]] = []
+    if fn_bad:
+        notes.append((
+            "INFO", "period_label_unparseable",
+            f"{path.name}: file name does not name one quarter and one year",
+        ))
+    if banner_bad:
+        notes.append((
+            "INFO", "period_label_unparseable",
+            f"{path.name}: statement banner does not name one quarter and one year",
+        ))
+    if fn_q is not None and not fn_bad:
+        quarter, source, year = fn_q, "file name", fn_y
+        if year is None and banner_y is not None:
+            year = banner_y
+    elif banner_q is not None:
+        quarter, source, year = banner_q, "banner", banner_y if banner_y is not None else fn_y
+    else:
+        if not notes:
+            return None
+        empty = PeriodInference(confidence="none", source="none", notes=notes)
+        return empty
+
+    date_inf = infer_period_from_workbook_content(
+        [path], named=(None, None, []), include_label_banners=False,
+    )
+    if year is None and folder_year is not None:
+        year = int(folder_year)
+    if year is None and date_inf.year is not None:
+        year = int(date_inf.year)
+    result = PeriodInference(
+        year=year, quarter=int(quarter), confidence="high", source="label",
+        evidence=[f"label {year} Q{quarter} from {source}"],
+        notes=notes,
+    )
+    parts = []
+    if fn_q is not None and banner_q is not None and (
+        fn_q != banner_q or (fn_y is not None and banner_y is not None and fn_y != banner_y)
+    ):
+        parts.append(
+            f"file name {fn_y if fn_y is not None else '—'} Q{fn_q} disagrees with "
+            f"banner {banner_y if banner_y is not None else '—'} Q{banner_q}"
+        )
+    ranges_disagree = any(
+        "banner ranges name quarters" in detail for _sev, _reason, detail in date_inf.notes
+    )
+    date_txt = (
+        f"{date_inf.year} Q{date_inf.quarter}" if date_inf.ok else "unset"
+    )
+    if date_inf.ok and (date_inf.year != year or date_inf.quarter != quarter):
+        parts.append(f"date period {date_txt}")
+    elif ranges_disagree:
+        parts.append(f"date ranges disagree ({date_txt})")
+    if parts and year is not None:
+        result.period_label_warning = (
+            f"{path.name}: label {year} Q{quarter} from {source}; " + "; ".join(parts)
+        )
+        result.notes.append(("WARN", "period_label_conflict", result.period_label_warning))
+    return result
+
+
+def _annotate(result: PeriodInference, content: Optional[PeriodInference],
+              paths: Sequence[Path]) -> PeriodInference:
+    if content is not None:
+        result.claims_weak = bool(content.claims_weak)
+        result.sheet_kinds = list(content.sheet_kinds)
+    if len(paths) == 1:
+        qs = set(quarters_in_text(paths[0].stem))
+        ys = set(years_in_text(paths[0].stem))
+        result.named_quarter = next(iter(qs)) if len(qs) == 1 else None
+        if len(ys) == 1:
+            result.named_year = next(iter(ys))
+        elif len(ys) == 2 and abs(max(ys) - min(ys)) == 1:
+            result.named_year = max(ys)
+    if content is not None and content.claims_weak and not content.ok and result.ok:
+        result.confidence = "low"
+    return result
+
+
 def infer_period(
     raw_dir: Path,
     *,
     filenames: Optional[Sequence[str]] = None,
     folder_year: Optional[int] = None,
+    period_source: str = "content",
 ) -> PeriodInference:
     """Banners (high) win; a clearly different file name beats weaker content
     (``filename_override``); file names alone when content says nothing.
@@ -801,63 +1112,72 @@ def infer_period(
 
     ``folder_year``: a bare year folder from the upload / object path
     (IMPL-20261006-04), used by ``filename_period`` like a year-named folder
-    when a file's own path has none."""
+    when a file's own path has none.
+
+    ``period_source="label"`` (AIICO AGRIC-DIRECT): the quarter in the file
+    name, else a statement banner, wins over the date ranges. Every other
+    partner stays on ``content``.
+    """
     raw_dir = Path(raw_dir)
     excel_paths = _iter_excel_paths(raw_dir)
+    label_notes: List[Tuple[str, str, str]] = []
+    if period_source == "label" and len(excel_paths) == 1:
+        fy = folder_year if folder_year is not None else globals()["folder_year"](excel_paths[0])
+        labeled = label_period(excel_paths[0], folder_year=fy)
+        if labeled is not None and labeled.quarter in (1, 2, 3, 4) and labeled.year is not None:
+            return _annotate(labeled, None, excel_paths)
+        if labeled is not None:
+            label_notes = list(labeled.notes)
     named = filename_period(excel_paths, filenames=filenames, folder_year=folder_year)
     content = infer_period_from_workbook_content(excel_paths, named=named)
     if content.combined:
-        return content
-    # Claims/outstanding sheets often vote "high" from Date-of-Loss / cover-from
-    # history. A file name (or year-named parent folder) that clearly names a
-    # different year or quarter is the reporting period and must win.
-    ny, nq, _nev = named
-    if content.ok and (
-        (ny is not None and ny != content.year)
-        or (nq is not None and nq != content.quarter)
-    ):
-        return _apply_filename(content, named)
-    if content.ok and content.confidence == "high":
-        return content
-    if content.ok:  # medium / low: a clearly different file name wins
-        return _apply_filename(content, named)
-
-    all_paths: List[Path] = list(excel_paths)
-    if raw_dir.is_file():
-        all_paths = [raw_dir]
-    elif raw_dir.is_dir():
-        all_paths = [
-            p for p in raw_dir.rglob("*")
-            if p.is_file() and not p.name.startswith("~$") and not p.name.startswith(".")
-        ]
-    labels = list(filenames or [])
-    labels.extend(_labels_for(all_paths, root=raw_dir if raw_dir.is_dir() else raw_dir.parent))
-    if raw_dir.is_dir():
-        labels.extend(raw_dir.parts[-3:])
-    fallback = infer_period_from_labels(labels)
-
-    # Content that is ok returned above (high as-is; medium/low through the
-    # file-name check). From here content is not ok: file names decide, and
-    # a year without a quarter stays unresolved.
-    if content.ok and not fallback.ok:
-        return content
-    if fallback.ok and not content.ok:
-        fallback.evidence = content.evidence + fallback.evidence
-        return fallback
-    if content.ok and fallback.ok:
-        mixed = PeriodInference(
-            year=content.year or fallback.year,
-            quarter=content.quarter or fallback.quarter,
-            confidence="medium",
-            source="mixed",
-            evidence=content.evidence + fallback.evidence,
-            warnings=content.warnings + fallback.warnings,
-        )
-        return mixed
-    out = content if content.evidence else fallback
-    out.warnings = list(dict.fromkeys(content.warnings + fallback.warnings))
-    out.evidence = content.evidence + fallback.evidence
-    return out
+        result = content
+    else:
+        ny, nq, _nev = named
+        if content.ok and (
+            (ny is not None and ny != content.year)
+            or (nq is not None and nq != content.quarter)
+        ):
+            result = _apply_filename(content, named)
+        elif content.ok and content.confidence == "high":
+            result = content
+        elif content.ok:
+            result = _apply_filename(content, named)
+        else:
+            all_paths: List[Path] = list(excel_paths)
+            if raw_dir.is_file():
+                all_paths = [raw_dir]
+            elif raw_dir.is_dir():
+                all_paths = [
+                    p for p in raw_dir.rglob("*")
+                    if p.is_file() and not p.name.startswith("~$") and not p.name.startswith(".")
+                ]
+            labels = list(filenames or [])
+            labels.extend(_labels_for(all_paths, root=raw_dir if raw_dir.is_dir() else raw_dir.parent))
+            if raw_dir.is_dir():
+                labels.extend(raw_dir.parts[-3:])
+            fallback = infer_period_from_labels(labels)
+            if content.ok and not fallback.ok:
+                result = content
+            elif fallback.ok and not content.ok:
+                fallback.evidence = content.evidence + fallback.evidence
+                result = fallback
+            elif content.ok and fallback.ok:
+                result = PeriodInference(
+                    year=content.year or fallback.year,
+                    quarter=content.quarter or fallback.quarter,
+                    confidence="medium",
+                    source="mixed",
+                    evidence=content.evidence + fallback.evidence,
+                    warnings=content.warnings + fallback.warnings,
+                )
+            else:
+                result = content if content.evidence else fallback
+                result.warnings = list(dict.fromkeys(content.warnings + fallback.warnings))
+                result.evidence = content.evidence + fallback.evidence
+    if label_notes:
+        result.notes = label_notes + list(result.notes)
+    return _annotate(result, content, excel_paths)
 
 
 _YEAR_FOLDER_RE = re.compile(r"(19|20)\d{2}")

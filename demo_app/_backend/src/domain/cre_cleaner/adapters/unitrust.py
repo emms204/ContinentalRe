@@ -139,7 +139,11 @@ class UnitrustAgricAdapter(QuarterlyWorkbookAdapter):
     # Sum Insured / Gross Premium / %) — merged into one header.
     band_subrow_layout = True
     # Explicit settings (base.py); per-period overrides go in settings_by_period.
-    settings = {"tsi_gp_basis": "our_share", "uw_year_from_start_date": False}
+    settings = {
+        "tsi_gp_basis": "our_share",
+        "uw_year_from_start_date": False,
+        "single_class": "Agriculture",
+    }
 
     def claims_exclude(self, field: str, norm: str) -> bool:
         # Outstanding tab: 'Period Balance' is a reserve movement, not the

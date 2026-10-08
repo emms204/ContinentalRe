@@ -42,7 +42,11 @@ class AiicoAgricDirectAdapter(QuarterlyWorkbookAdapter):
     'Calculated'), as for the other AIICO adapters and as before IMPL-04."""
     cedant = "AIICO"
     broker = "AGRIC DIRECT"
-    settings = {"claims_ppn_calculated": True}
+    settings = {
+        "claims_ppn_calculated": True,
+        "single_class": "Agriculture",
+        "period_source": "label",
+    }
 
     verified = False
     status_note = (
@@ -67,6 +71,7 @@ class NemAonAdapter(QuarterlyWorkbookAdapter):
 class MutualBenefitsJomolaAgricAdapter(QuarterlyWorkbookAdapter):
     cedant = "MUTUAL BENEFITS"
     broker = "JOMOLA AGRIC"
+    settings = {"single_class": "Agriculture"}
     verified = False
     status_note = "Mutual Benefits Jomola Agric: quarterly returns; unverified"
 
@@ -75,5 +80,6 @@ class RoyalExchangeAgricAdapter(QuarterlyWorkbookAdapter):
     premium_layout_rules = RoyalExchangePremiumRules()
     cedant = "ROYAL EXCHANGE"
     broker = "AGRIC"
+    settings = {"single_class": "Agriculture"}
     verified = False
     status_note = "Royal Exchange Agric: quarterly returns; unverified"

@@ -38,6 +38,7 @@ def test_rtntn_treaty_ppn_layout_2022_onwards():
          "TREATY SUM INSURED", "TREATY PREMIUM1"]
     cm = detect_premium_allocation_blocks(h, None)
     assert _bands(cm) == ((7, 8, 9), (10, 11, 12))
+    assert cm.get("period_from") == 3 and cm.get("period_to") == 4
     h2 = h[:10] + ["TREATY PPN2", "TREATY SUM INSURED 1", "TREATY PREMIUM2"]
     cm2 = detect_premium_allocation_blocks(h2, None)
     assert _bands(cm2) == ((7, 8, 9), (10, 11, 12))
@@ -50,6 +51,7 @@ def test_quota_share_block_still_treaty():
          "QUOTA SHARE SUM INSURED", "QUOTA SHARE PREMIUM"]
     cm = detect_premium_allocation_blocks(h, None)
     assert _bands(cm) == ((7, 8, 9), (10, 11, 12))
+    assert cm.get("period_from") == 3 and cm.get("period_to") == 4
 
 
 def test_two_treaty_layers_first_is_treaty_band_second_extra():

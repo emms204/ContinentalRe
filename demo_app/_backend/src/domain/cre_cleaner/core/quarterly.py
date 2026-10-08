@@ -1,10 +1,14 @@
 """Parse premium / claims sheets and merge monthly premiums for a quarter."""
 from __future__ import annotations
 
+import copy
+import logging
 import re
-from collections import defaultdict
+from collections import Counter, defaultdict
+from datetime import date, datetime
+from itertools import combinations
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 
 from src.domain.cre_cleaner.core.class_labels import (
     banner_class_label,
@@ -18,11 +22,14 @@ from src.domain.cre_cleaner.core.detect import (
     class_from_sheet_name,
 )
 from src.domain.cre_cleaner.core.filters import (
+    DATE_TXT,
+    has_min_transaction_evidence,
     is_blank_row,
     is_nil_row,
-    looks_like_total_row,
+    is_policy_value,
     looks_like_section_header,
-    has_min_transaction_evidence,
+    looks_like_total_row,
+    row_identity_failures,
 )
 from src.domain.cre_cleaner.io.excel import read_source_workbook, read_workbook_sheets
 from src.domain.cre_cleaner.core.table_type import OTHER, UNKNOWN, TabType, classify_tab
@@ -33,6 +40,8 @@ from src.domain.cre_cleaner.core.map_columns import (
     detect_premium_allocation_blocks,
     extra_alias_columns,
     map_simple_columns,
+    missing_required_fields,
+    refresh_unmapped,
     merge_group_subheaders,
     _looks_like_allocation_subrow,
 )
@@ -441,6 +450,63 @@ def _period_cells(row, cmap: ColumnMap, header: Sequence[Any], flag) -> Tuple[An
     return period_from, period_to
 
 
+_mapping_log = logging.getLogger("cre_cleaner.mapping")
+
+
+def _period_sources_mapped(cmap: ColumnMap) -> Tuple[bool, bool]:
+    """Whether Insurance Period From and To each have a source column.
+
+    One PERIOD cell supplies both. An unmapped side is a sheet-level gap,
+    not a blank cell on every row.
+    """
+    if cmap.get("period") is not None:
+        return True, True
+    return cmap.get("period_from") is not None, cmap.get("period_to") is not None
+
+
+def _emit_mapping_gaps(
+    path: Path,
+    sheet: str,
+    header_row: Optional[int],
+    unmapped: Sequence[str],
+    missing: Sequence[str],
+    exceptions: List,
+) -> str:
+    """One sheet-level record per gap, for the exceptions sidecar and the API.
+
+    ``unmapped_headers`` is the only unmapped-header warning. Ties stay in
+    the source-audit note; ignored and borrowed blocks keep their own records.
+    ``required_field_unmapped`` is one record per sheet. Per-row period
+    warnings stay in reconcile and only fire when the column was mapped.
+    """
+    excel_row = (header_row + 1) if header_row is not None else 0
+    if unmapped:
+        detail = "Unmapped headers: " + ", ".join(unmapped)
+        exceptions.append(ExceptionRecord(
+            "WARN", "unmapped_headers", path.name, sheet, excel_row, detail,
+        ))
+        _mapping_log.warning(
+            "unmapped_headers file=%s sheet=%s headers=%s",
+            path.name, sheet, list(unmapped),
+        )
+    if missing:
+        candidates = ", ".join(unmapped) if unmapped else "(none)"
+        detail = (
+            f"field={', '.join(missing)}; sheet={sheet}; "
+            f"candidate unmapped headers: {candidates}"
+        )
+        exceptions.append(ExceptionRecord(
+            "WARN", "required_field_unmapped", path.name, sheet, excel_row, detail,
+        ))
+        _mapping_log.warning(
+            "required_field_unmapped file=%s sheet=%s fields=%s candidates=%s",
+            path.name, sheet, list(missing), list(unmapped),
+        )
+    if not unmapped:
+        return ""
+    return "; unmapped headers: " + ", ".join(unmapped)
+
+
 def _first_data_row(raw_rows: List[List[Any]]) -> Optional[int]:
     for i, r in enumerate(raw_rows[:60]):
         filled = sum(1 for c in r if clean_text(c))
@@ -585,6 +651,639 @@ def _audit_hidden_tabs(path: Path, exceptions: List[ExceptionRecord], adapter: A
     return out
 
 
+_HEADERLESS_MIN_ROWS = 3
+_HEADERLESS_FAIL_RATIO = 0.8
+_COLUMN_MAJORITY = 0.8
+_MONEY_NUMERIC_RATIO = 0.9
+_CONSISTENCY_FLOOR = 0.5
+_CONSISTENCY_SLACK = 0.25
+_IDENTITY_KEYS = {
+    "insured", "policy_no", "period", "period_from", "period_to",
+    "claim_no", "date_of_loss",
+}
+_PREMIUM_MONEY_ATTRS = (
+    "ret_ppn", "ret_si", "ret_prem", "sur_ppn", "sur_si", "sur_prem",
+    "fac_ppn", "fac_si", "fac_prem",
+)
+
+
+def _col_letter(idx: int) -> str:
+    from openpyxl.utils import get_column_letter
+    return get_column_letter(idx + 1)
+
+
+def _as_date(value: Any):
+    parsed = parse_date(value)
+    if parsed is None:
+        return None
+    return parsed.date() if isinstance(parsed, datetime) else parsed
+
+
+def _is_year_value(value: Any) -> bool:
+    if isinstance(value, bool) or isinstance(value, (datetime, date)):
+        return False
+    if isinstance(value, float) and value == int(value):
+        value = int(value)
+    if isinstance(value, int):
+        return 1900 <= value <= 2100
+    text = str(value).strip()
+    return len(text) == 4 and text.isdigit() and 1900 <= int(text) <= 2100
+
+
+def _value_kind(value: Any) -> Optional[str]:
+    """Majority label for one non-empty identity-zone cell."""
+    if isinstance(value, (datetime, date)) and not isinstance(value, bool):
+        return "date"
+    if not isinstance(value, (int, float, bool)) and value is not None:
+        text = str(value).strip()
+        if DATE_TXT.match(text) and parse_date(value) is not None:
+            return "date"
+    start, end = parse_period(value)
+    if start is not None and end is not None:
+        return "range"
+    if is_policy_value(value):
+        return "policy"
+    if _is_year_value(value):
+        return "year"
+    if not isinstance(value, (datetime, date, bool)) and parse_number(value) is not None:
+        return "number"
+    text = "" if isinstance(value, (datetime, date)) else clean_text(value)
+    if sum(1 for ch in text if ch.isalpha()) >= 3:
+        return "name"
+    return None
+
+
+def _majority_kind(values: Sequence[Any]) -> Optional[str]:
+    kinds = []
+    nonempty = 0
+    for value in values:
+        if value is None or isinstance(value, str) and not value.strip():
+            continue
+        if isinstance(value, str) and not clean_text(value):
+            continue
+        nonempty += 1
+        kind = _value_kind(value)
+        if kind:
+            kinds.append(kind)
+    if nonempty == 0 or not kinds:
+        return None
+    best, count = Counter(kinds).most_common(1)[0]
+    if count / nonempty >= _COLUMN_MAJORITY:
+        return best
+    return None
+
+
+def _money_column_indexes(cmap: ColumnMap, kind: str, metric_cols: Dict[str, Optional[int]]) -> Set[int]:
+    found = {idx for idx in metric_cols.values() if isinstance(idx, int)}
+    if kind == "premium":
+        for name in ("sum_insured", "gross_premium"):
+            idx = cmap.get(name)
+            if idx is not None:
+                found.add(idx)
+        for attr in _PREMIUM_MONEY_ATTRS:
+            idx = getattr(cmap, attr)
+            if idx is not None:
+                found.add(idx)
+        for _label, ppn, si, prem in cmap.extra_treaty_blocks:
+            for idx in (ppn, si, prem):
+                if idx is not None:
+                    found.add(idx)
+    else:
+        for name in (
+            "total_claims", "amount_ret", "amount_treaty", "amount_fac",
+            "ppn_ret", "ppn_treaty", "ppn_fac",
+        ):
+            idx = cmap.get(name)
+            if idx is not None:
+                found.add(idx)
+        for idx, _label in getattr(cmap, "extra_amount_columns", []):
+            found.add(idx)
+    return found
+
+
+def _money_span(indexes: Set[int]) -> str:
+    if not indexes:
+        return ""
+    ordered = sorted(indexes)
+    if ordered[-1] - ordered[0] + 1 == len(ordered):
+        return f"{_col_letter(ordered[0])}\u2013{_col_letter(ordered[-1])}"
+    return ", ".join(_col_letter(idx) for idx in ordered)
+
+
+def _role_text(roles: Dict[str, int]) -> str:
+    order = (
+        "insured", "policy_no", "claim_no", "date_of_loss",
+        "period_from", "period_to", "period",
+    )
+    return ", ".join(f"{key}={_col_letter(roles[key])}" for key in order if key in roles)
+
+
+def _separator_row(row: Sequence[Any], cmap: ColumnMap, kind: str,
+                   metric_cols: Dict[str, Optional[int]]) -> bool:
+    if is_blank_row(row):
+        return True
+    insured_i = cmap.get("insured")
+    policy_i = cmap.get("policy_no")
+    insured = clean_text(cell(row, insured_i)) if insured_i is not None else ""
+    policy = as_text_id(cell(row, policy_i)) if policy_i is not None else ""
+    keys: List[Optional[int]] = [insured_i, policy_i]
+    if kind == "claims":
+        keys.append(cmap.get("claim_no"))
+    if _is_footer_row(row, insured, policy, _footer_values(row, metric_cols)):
+        return True
+    if looks_like_total_row(row, keys):
+        return True
+    filled = [clean_text(c) for c in row if clean_text(c)]
+    if len(filled) == 1 and (banner_class_label(filled[0]) or looks_like_section_header(row)):
+        return True
+    if kind == "claims" and _has_claims_header_labels(row):
+        return True
+    return False
+
+
+def _period_pair(row: Sequence[Any], cmap: ColumnMap, header: Sequence[Any]) -> Tuple[Any, Any]:
+    period_i = cmap.get("period")
+    if period_i is None:
+        return cell(row, cmap.get("period_from")), cell(row, cmap.get("period_to"))
+    to_cell = None
+    if header is not None and not clean_text(cell(header, period_i + 1)):
+        to_cell = cell(row, period_i + 1)
+    return cell(row, period_i), to_cell
+
+
+def _row_fails_identity(row: Sequence[Any], cmap: ColumnMap, header: Sequence[Any]) -> bool:
+    from_cell, to_cell = _period_pair(row, cmap, header)
+    failures = row_identity_failures(
+        cell(row, cmap.get("insured")), cell(row, cmap.get("policy_no")), from_cell, to_cell,
+    )
+    # F3 alone is a bad date on a correctly placed row, not a shifted block.
+    return "F1" in failures or "F2" in failures
+
+
+def _triggered_pieces(segment: Sequence[Tuple[int, Sequence[Any]]], cmap: ColumnMap,
+                      header: Sequence[Any]) -> List[List[int]]:
+    flags = [(ridx, _row_fails_identity(row, cmap, header)) for ridx, row in segment]
+    bad = sum(1 for _ridx, failed in flags if failed)
+    if flags and bad >= _HEADERLESS_MIN_ROWS and bad / len(flags) >= _HEADERLESS_FAIL_RATIO:
+        return [[ridx for ridx, _failed in flags]]
+    runs: List[List[int]] = []
+    current: List[int] = []
+    for ridx, failed in flags:
+        if failed:
+            current.append(ridx)
+        elif current:
+            runs.append(current)
+            current = []
+    if current:
+        runs.append(current)
+    if not runs:
+        return []
+    longest = max(len(run) for run in runs)
+    if longest < _HEADERLESS_MIN_ROWS:
+        return []
+    return [run for run in runs if len(run) == longest]
+
+
+def _numeric_cell(value: Any) -> bool:
+    if value is None or isinstance(value, (datetime, date, bool)):
+        return False
+    return parse_number(value) is not None
+
+
+def _amount(row: Sequence[Any], idx: Optional[int]) -> Optional[float]:
+    if idx is None:
+        return None
+    value = cell(row, idx)
+    if isinstance(value, (datetime, date, bool)):
+        return None
+    return parse_number(value)
+
+
+def _row_consistent(row: Sequence[Any], cmap: ColumnMap, kind: str) -> Optional[bool]:
+    """True when a computable share or amount check passes, False when one runs and fails."""
+    if kind == "premium":
+        checks = []
+        gross = _amount(row, cmap.get("gross_premium"))
+        ret_prem = _amount(row, cmap.ret_prem)
+        treaty_prem = _amount(row, cmap.sur_prem)
+        fac_prem = _amount(row, cmap.fac_prem)
+        if gross not in (None, 0) and ret_prem is not None and treaty_prem is not None:
+            total = ret_prem + treaty_prem + (fac_prem if fac_prem is not None else 0)
+            checks.append(abs(total - gross) <= abs(gross) * 0.01 + 1e-6)
+        ret_ppn = _amount(row, cmap.ret_ppn)
+        treaty_ppn = _amount(row, cmap.sur_ppn)
+        fac_ppn = _amount(row, cmap.fac_ppn)
+        if ret_ppn is not None and treaty_ppn is not None:
+            total = ret_ppn + treaty_ppn + (fac_ppn if fac_ppn is not None else 0)
+            checks.append(abs(total - 100) <= 1)
+        if not checks:
+            return None
+        return any(checks)
+    total = _amount(row, cmap.get("total_claims"))
+    ret = _amount(row, cmap.get("amount_ret"))
+    treaty = _amount(row, cmap.get("amount_treaty"))
+    fac = _amount(row, cmap.get("amount_fac"))
+    if total in (None, 0) or ret is None or treaty is None:
+        return None
+    summed = ret + treaty + (fac if fac is not None else 0)
+    return abs(summed - total) <= abs(total) * 0.01 + 1e-6
+
+
+def _consistency_rate(rows: Sequence[Sequence[Any]], cmap: ColumnMap, kind: str) -> Optional[float]:
+    if not rows:
+        return None
+    results = [_row_consistent(row, cmap, kind) for row in rows]
+    if all(result is None for result in results):
+        return None
+    return sum(1 for result in results if result is True) / len(rows)
+
+
+def _from_to_holds(rows: Sequence[Sequence[Any]], left: int, right: int) -> bool:
+    ordered = 0
+    for row in rows:
+        start = _as_date(cell(row, left))
+        end = _as_date(cell(row, right))
+        if start is not None and end is not None and start <= end:
+            ordered += 1
+    return bool(rows) and ordered / len(rows) >= _COLUMN_MAJORITY
+
+
+def _median_span(rows: Sequence[Sequence[Any]], left: int, right: int) -> Optional[int]:
+    spans = []
+    for row in rows:
+        start = _as_date(cell(row, left))
+        end = _as_date(cell(row, right))
+        if start is not None and end is not None:
+            spans.append((end - start).days)
+    if not spans:
+        return None
+    spans.sort()
+    return spans[len(spans) // 2]
+
+
+def _slash_median(rows: Sequence[Sequence[Any]], idx: int) -> Optional[float]:
+    counts = []
+    for row in rows:
+        value = cell(row, idx)
+        if is_policy_value(value):
+            counts.append(str(value).strip().count("/"))
+    if not counts:
+        return None
+    counts.sort()
+    return float(counts[len(counts) // 2])
+
+
+def _assign_headerless_roles(
+    rows: Sequence[Sequence[Any]],
+    types: Dict[int, str],
+    kind: str,
+) -> Tuple[Optional[Dict[str, int]], str]:
+    names = [idx for idx, label in types.items() if label == "name"]
+    policies = [idx for idx, label in types.items() if label == "policy"]
+    dates = [idx for idx, label in types.items() if label == "date"]
+    ranges = [idx for idx, label in types.items() if label == "range"]
+    if len(names) != 1:
+        letters = ", ".join(_col_letter(idx) for idx in names) or "none"
+        return None, f"insured: {len(names)} name columns ({letters})"
+    roles: Dict[str, int] = {"insured": names[0]}
+    if kind == "premium":
+        if len(policies) != 1:
+            letters = ", ".join(_col_letter(idx) for idx in policies) or "none"
+            return None, f"policy_no: {len(policies)} policy columns ({letters})"
+        roles["policy_no"] = policies[0]
+    else:
+        # A claim number matches POLICY_RE. More slashes means the policy;
+        # an equal slash count cannot be told apart, so the block stays unresolved.
+        if len(policies) != 2:
+            return None, (
+                f"policy_no: {len(policies)} policy-like columns; "
+                "cannot tell claim_no apart from policy_no"
+            )
+        left, right = policies
+        left_slashes = _slash_median(rows, left)
+        right_slashes = _slash_median(rows, right)
+        if left_slashes is None or right_slashes is None or left_slashes == right_slashes:
+            return None, "policy_no: cannot tell claim_no apart from policy_no (same slash count)"
+        if left_slashes > right_slashes:
+            roles["policy_no"], roles["claim_no"] = left, right
+        else:
+            roles["policy_no"], roles["claim_no"] = right, left
+    period_reason = _assign_period_roles(rows, dates, ranges, roles, kind)
+    if period_reason:
+        return None, period_reason
+    return roles, ""
+
+
+def _assign_period_roles(
+    rows: Sequence[Sequence[Any]],
+    dates: Sequence[int],
+    ranges: Sequence[int],
+    roles: Dict[str, int],
+    kind: str,
+) -> str:
+    if len(ranges) > 1 or (ranges and len(dates) > (1 if kind == "claims" else 0)):
+        return f"period: {len(dates)} date columns and {len(ranges)} range columns"
+    if len(ranges) == 1 and kind == "premium" and not dates:
+        roles["period"] = ranges[0]
+        return ""
+    if len(ranges) == 1 and kind == "claims" and len(dates) == 1:
+        roles["period"] = ranges[0]
+        roles["date_of_loss"] = dates[0]
+        return ""
+    if ranges:
+        return f"period: {len(dates)} date columns and {len(ranges)} range columns"
+    if len(dates) == 2 and kind == "premium":
+        return _assign_from_to(rows, dates, roles)
+    if len(dates) == 3 and kind == "claims":
+        reason = _assign_from_to_by_span(rows, dates, roles)
+        if reason:
+            return reason
+        used = {roles.get("period_from"), roles.get("period_to")}
+        leftover = [idx for idx in dates if idx not in used]
+        if len(leftover) != 1:
+            return "date_of_loss: ambiguous date columns"
+        roles["date_of_loss"] = leftover[0]
+        return ""
+    if kind == "claims":
+        return f"date_of_loss: {len(dates)} date columns and {len(ranges)} range columns"
+    return f"period: {len(dates)} date columns and {len(ranges)} range columns"
+
+
+def _assign_from_to(rows: Sequence[Sequence[Any]], dates: Sequence[int],
+                    roles: Dict[str, int]) -> str:
+    left, right = dates
+    left_first = _from_to_holds(rows, left, right)
+    right_first = _from_to_holds(rows, right, left)
+    if left_first and not right_first:
+        roles["period_from"], roles["period_to"] = left, right
+        return ""
+    if right_first and not left_first:
+        roles["period_from"], roles["period_to"] = right, left
+        return ""
+    return "period: two date columns do not order into FROM and TO"
+
+
+def _assign_from_to_by_span(rows: Sequence[Sequence[Any]], dates: Sequence[int],
+                            roles: Dict[str, int]) -> str:
+    ranked = []
+    for left, right in combinations(dates, 2):
+        if _from_to_holds(rows, left, right) and not _from_to_holds(rows, right, left):
+            span = _median_span(rows, left, right)
+            if span is not None:
+                ranked.append((span, left, right))
+        elif _from_to_holds(rows, right, left) and not _from_to_holds(rows, left, right):
+            span = _median_span(rows, right, left)
+            if span is not None:
+                ranked.append((span, right, left))
+    if not ranked:
+        return "period: date columns do not order into FROM and TO"
+    ranked.sort(key=lambda item: item[0], reverse=True)
+    if len(ranked) > 1 and ranked[0][0] == ranked[1][0]:
+        return "period: two date pairs have the same span"
+    _span, left, right = ranked[0]
+    roles["period_from"], roles["period_to"] = left, right
+    return ""
+
+
+def _headerless_map(cmap: ColumnMap, roles: Dict[str, int], types: Dict[int, str], kind: str) -> ColumnMap:
+    local = copy.deepcopy(cmap)
+    uw_key = "uw_year" if kind == "premium" else "uw_yr"
+    uw_i = cmap.get(uw_key)
+    new_indexes = set(roles.values())
+    keep_uw = uw_i is not None and uw_i not in new_indexes and types.get(uw_i) == "year"
+    for key, idx in list(local.mapping.items()):
+        if key in _IDENTITY_KEYS or key == uw_key or idx in new_indexes:
+            local.mapping.pop(key, None)
+    if keep_uw and uw_i is not None:
+        local.mapping[uw_key] = uw_i
+    local.mapping.update(roles)
+    return local
+
+
+def _plan_headerless_block(
+    raw_rows: List[List[Any]],
+    data_start: int,
+    end: int,
+    cmap: ColumnMap,
+    header: Sequence[Any],
+    path: Path,
+    sheet: str,
+    header_at: int,
+    exceptions: List[ExceptionRecord],
+    kind: str,
+    metric_cols: Dict[str, Optional[int]],
+) -> Tuple[Dict[int, ColumnMap], Set[int], List[List[int]]]:
+    """Re-map a headerless shifted run inside one header block.
+
+    Returns (row index → replacement map, row indexes to exclude, excel-row groups
+    that were accepted). Rows that do not trigger are left to the existing loop.
+    """
+    segments: List[List[Tuple[int, Sequence[Any]]]] = []
+    current: List[Tuple[int, Sequence[Any]]] = []
+    for ridx in range(data_start, end):
+        row = raw_rows[ridx]
+        if _separator_row(row, cmap, kind, metric_cols):
+            if current:
+                segments.append(current)
+                current = []
+            continue
+        current.append((ridx, row))
+    if current:
+        segments.append(current)
+
+    triggered: List[Tuple[int, List[int]]] = []
+    for seg_i, segment in enumerate(segments):
+        for piece in _triggered_pieces(segment, cmap, header):
+            triggered.append((seg_i, piece))
+
+    maps: Dict[int, ColumnMap] = {}
+    skip: Set[int] = set()
+    groups: List[List[int]] = []
+    money_idxs = _money_column_indexes(cmap, kind, metric_cols)
+    header_excel = header_at + 1 if header_at >= 0 else 0
+    for seg_i, piece in triggered:
+        rows = [raw_rows[ridx] for ridx in piece]
+        first = piece[0] + 1
+        last = piece[-1] + 1
+        width = max((len(row) for row in rows), default=0)
+        candidates = [idx for idx in range(width) if idx not in money_idxs]
+        types = {
+            idx: kind_name
+            for idx in candidates
+            if (kind_name := _majority_kind([cell(row, idx) for row in rows]))
+        }
+        roles, reason = _assign_headerless_roles(rows, types, kind)
+        if roles is None:
+            _emit_headerless(exceptions, path, sheet, first, last, len(piece), reason, False)
+            skip.update(piece)
+            continue
+        if not money_idxs:
+            _emit_headerless(
+                exceptions, path, sheet, first, last, len(piece),
+                "money: no mapped money columns", False,
+            )
+            skip.update(piece)
+            continue
+        numeric = {idx: sum(1 for row in rows if _numeric_cell(cell(row, idx))) for idx in money_idxs}
+        worst_idx, worst_n = min(numeric.items(), key=lambda item: item[1])
+        if worst_n / len(rows) < _MONEY_NUMERIC_RATIO:
+            pct = int(round(100 * worst_n / len(rows)))
+            _emit_headerless(
+                exceptions, path, sheet, first, last, len(piece),
+                f"money: column {_col_letter(worst_idx)} numeric on {pct}% of rows", False,
+            )
+            skip.update(piece)
+            continue
+        block_rate = _consistency_rate(rows, cmap, kind)
+        ref_rows = _headerless_reference_rows(segments, triggered, seg_i, piece)
+        ref_rate = _consistency_rate(ref_rows, cmap, kind)
+        if block_rate is not None and (
+            block_rate < _CONSISTENCY_FLOOR
+            or (ref_rate is not None and block_rate < ref_rate - _CONSISTENCY_SLACK)
+        ):
+            block_pct = int(round(100 * block_rate))
+            ref_txt = (
+                f"{int(round(100 * ref_rate))}% header rows" if ref_rate is not None else "no header rows"
+            )
+            _emit_headerless(
+                exceptions, path, sheet, first, last, len(piece),
+                f"consistency {block_pct}% vs {ref_txt}", False,
+            )
+            skip.update(piece)
+            continue
+        local = _headerless_map(cmap, roles, types, kind)
+        for ridx in piece:
+            maps[ridx] = local
+        excel_rows = [ridx + 1 for ridx in piece]
+        groups.append(excel_rows)
+        _emit_headerless(
+            exceptions, path, sheet, first, last, len(piece), "", True,
+            roles=roles, header_excel=header_excel, money_idxs=money_idxs,
+            numeric_n=worst_n, block_rate=block_rate, ref_rate=ref_rate,
+        )
+    return maps, skip, groups
+
+
+def _headerless_reference_rows(
+    segments: Sequence[Sequence[Tuple[int, Sequence[Any]]]],
+    triggered: Sequence[Tuple[int, List[int]]],
+    seg_i: int,
+    piece: Sequence[int],
+) -> List[Sequence[Any]]:
+    """Nearest header-layout rows: the rest of this segment, else the preceding one."""
+    piece_set = set(piece)
+    others = [row for ridx, row in segments[seg_i] if ridx not in piece_set]
+    if others:
+        return others
+    triggered_segs = {index for index, _piece in triggered}
+
+    def _clean(index: int) -> List[Sequence[Any]]:
+        if index in triggered_segs:
+            return []
+        return [row for _ridx, row in segments[index]]
+
+    for index in range(seg_i - 1, -1, -1):
+        rows = _clean(index)
+        if rows:
+            return rows
+    for index in range(seg_i + 1, len(segments)):
+        rows = _clean(index)
+        if rows:
+            return rows
+    return []
+
+
+def _emit_headerless(
+    exceptions: List[ExceptionRecord],
+    path: Path,
+    sheet: str,
+    first: int,
+    last: int,
+    count: int,
+    reason: str,
+    accepted: bool,
+    roles: Optional[Dict[str, int]] = None,
+    header_excel: int = 0,
+    money_idxs: Optional[Set[int]] = None,
+    numeric_n: int = 0,
+    block_rate: Optional[float] = None,
+    ref_rate: Optional[float] = None,
+) -> None:
+    span = f"rows {first}\u2013{last} ({count})"
+    if not accepted:
+        exceptions.append(ExceptionRecord(
+            "WARN", "headerless_block_unresolved", path.name, sheet, first,
+            f"{span}: no header row; not re-mapped ({reason}). Rows excluded.",
+        ))
+        return
+    block_pct = int(round(100 * block_rate)) if block_rate is not None else 0
+    if ref_rate is None:
+        ref_txt = "no header rows"
+    else:
+        ref_txt = f"{int(round(100 * ref_rate))}% header rows"
+    exceptions.append(ExceptionRecord(
+        "WARN", "headerless_block_remapped", path.name, sheet, first,
+        (
+            f"{span}: no header row; columns re-mapped from content: {_role_text(roles or {})}; "
+            f"money columns kept from header row {header_excel} ({_money_span(money_idxs or set())}); "
+            f"money check: {numeric_n}/{count} numeric, consistency {block_pct}% vs {ref_txt}."
+        ),
+    ))
+
+
+def _same_amount(left: Any, right: Any) -> bool:
+    if left is None or right is None:
+        return left is None and right is None
+    return abs(float(left) - float(right)) < 0.005
+
+
+def _same_day(left: Any, right: Any) -> bool:
+    if left is None or right is None:
+        return False
+    left_day = left.date() if isinstance(left, datetime) else left
+    right_day = right.date() if isinstance(right, datetime) else right
+    return left_day == right_day
+
+
+def _note_headerless_repeats(
+    sheet_rows: Sequence[Any],
+    groups: Sequence[Sequence[int]],
+    path: Path,
+    sheet: str,
+    exceptions: List[ExceptionRecord],
+) -> None:
+    """INFO only. Repeats stay in the output; nothing is dropped."""
+    remapped = {excel_row for group in groups for excel_row in group}
+    by_row = {row.audit.source_row: row for row in sheet_rows}
+    for group in groups:
+        pairs = []
+        for excel_row in sorted(group):
+            row = by_row.get(excel_row)
+            if row is None or not row.policy_no:
+                continue
+            for other in sorted(sheet_rows, key=lambda item: item.audit.source_row):
+                if other.audit.source_row in remapped:
+                    continue
+                if (
+                    row.policy_no == other.policy_no
+                    and _same_amount(row.total_sum_insured, other.total_sum_insured)
+                    and _same_amount(row.gross_premium, other.gross_premium)
+                    and _same_day(row.period_from, other.period_from)
+                ):
+                    pairs.append((excel_row, other.audit.source_row))
+                    break
+        if not pairs:
+            continue
+        listed = ", ".join(f"r{left}\u2192r{right}" for left, right in pairs)
+        exceptions.append(ExceptionRecord(
+            "INFO", "headerless_block_possible_repeat", path.name, sheet, min(group),
+            (
+                f"{len(pairs)} exact repeats of a header-block row on policy, "
+                f"sum insured, gross premium and FROM: {listed}"
+            ),
+        ))
+
+
 def parse_premium_file(
     path: Path,
     source_month: str,
@@ -684,7 +1383,11 @@ def parse_premium_file(
         layer_labels: List[str] = []
         primary_label = ""
         kept = skipped = read_n = 0
+        sheet_out_at = len(rows_out)
+        remapped_groups: List[List[int]] = []
         tie_notes: List[str] = []
+        gap_unmapped: List[str] = []
+        gap_missing: List[str] = []
 
         for hi, header_at in enumerate(header_indices):
             if header_at in header_override:
@@ -717,6 +1420,13 @@ def parse_premium_file(
                     "Band SI/premium left blank rather than copied from another band's "
                     "columns: " + "; ".join(cmap.borrowed_blocks),
                 ))
+            refresh_unmapped(cmap, header)
+            for h in cmap.unmapped_headers:
+                if h not in gap_unmapped:
+                    gap_unmapped.append(h)
+            for field in missing_required_fields(cmap, "premium"):
+                if field not in gap_missing:
+                    gap_missing.append(field)
             end = header_indices[hi + 1] if hi + 1 < len(header_indices) else len(raw_rows)
             next_group_row = end - 1 if hi + 1 < len(header_indices) else None
             metric_cols = _premium_metric_cols(cmap)
@@ -750,12 +1460,25 @@ def parse_premium_file(
 
             insured_i = cmap.get("insured")
             policy_i = cmap.get("policy_no")
+            header_cmap = cmap
+            block_maps, block_skip, block_groups = _plan_headerless_block(
+                raw_rows, data_start, end, header_cmap, header, path, sn,
+                header_at, exceptions, "premium", metric_cols,
+            )
+            remapped_groups.extend(block_groups)
 
             for ridx in range(data_start, end):
                 row = raw_rows[ridx]
                 excel_row = ridx + 1  # 1-based
                 if is_blank_row(row):
                     continue
+                if ridx in block_skip:
+                    read_n += 1
+                    skipped += 1
+                    continue
+                cmap = block_maps.get(ridx, header_cmap)
+                insured_i = cmap.get("insured")
+                policy_i = cmap.get("policy_no")
                 if ridx == next_group_row and all(parse_number(c) is None for c in row):
                     # Band-label row of the next header block, not data.
                     continue
@@ -814,6 +1537,7 @@ def parse_premium_file(
                     ))
 
                 period_from, period_to = _period_cells(row, cmap, header, flag_date)
+                from_mapped, to_mapped = _period_sources_mapped(cmap)
 
                 uw = cell(row, cmap.get("uw_year"))
                 if isinstance(uw, float) and uw == int(uw):
@@ -894,6 +1618,8 @@ def parse_premium_file(
                         class_source=class_source,
                         class_label_raw=class_raw,
                         currency=ccy.for_row(cell(row, cmap.get("currency"))),
+                        period_from_mapped=from_mapped,
+                        period_to_mapped=to_mapped,
                     ),
                 )
                 if adapter is not None:
@@ -909,12 +1635,16 @@ def parse_premium_file(
                 kept += 1
             totals.end_section()
 
+        _note_headerless_repeats(rows_out[sheet_out_at:], remapped_groups, path, sn, exceptions)
         if layer_labels:
             exceptions.append(_treaty_layer_note(path, sn, primary_label, layer_labels))
         notes = f"class_hint={class_hint}; currency={ccy.audit_code()} ({ccy.source})"
         if adapter is not None and hasattr(adapter, "settings_note"):
             notes += "; " + adapter.settings_note()
         notes += _tie_note(tie_notes)
+        notes += _emit_mapping_gaps(
+            path, sn, hdr_i, gap_unmapped, gap_missing, exceptions,
+        )
         if len(header_indices) > 1:
             notes += f"; {len(header_indices)} header blocks"
         if banners_seen:
@@ -1080,6 +1810,8 @@ def _parse_claims_sheet(
     banners_seen: List[str] = []
     section_raw = ""
     tie_notes: List[str] = []
+    gap_unmapped: List[str] = []
+    gap_missing: List[str] = []
     ppn_calc_rows: List[int] = []
 
     def _banner_class(cell_text: str) -> str:
@@ -1119,6 +1851,13 @@ def _parse_claims_sheet(
         extra_cols = extra_alias_columns(
             header, aliases["amount_treaty"], list(cmap.mapping.values()),
         ) + list(getattr(cmap, "extra_amount_columns", []))
+        refresh_unmapped(cmap, header, *(i for i, _lab in extra_cols))
+        for h in cmap.unmapped_headers:
+            if h not in gap_unmapped:
+                gap_unmapped.append(h)
+        for field in missing_required_fields(cmap, "claims"):
+            if field not in gap_missing:
+                gap_missing.append(field)
         for _i, label in extra_cols:
             if label not in layer_labels:
                 layer_labels.append(label)
@@ -1147,11 +1886,24 @@ def _parse_claims_sheet(
             if bi in header_indices and bi != header_at:
                 break
 
+        header_cmap = cmap
+        block_maps, block_skip, _block_groups = _plan_headerless_block(
+            raw_rows, data_start, end, header_cmap, header, path, sn,
+            header_at, exceptions, "claims", metric_cols,
+        )
+
         for ridx in range(data_start, end):
             row = raw_rows[ridx]
             excel_row = ridx + 1
             if is_blank_row(row):
                 continue
+            if ridx in block_skip:
+                read_n += 1
+                skipped += 1
+                continue
+            cmap = block_maps.get(ridx, header_cmap)
+            insured_i = cmap.get("insured")
+            policy_i = cmap.get("policy_no")
             ne = [clean_text(c) for c in row if clean_text(c)]
             if len(ne) == 1:
                 mapped = _banner_class(ne[0])
@@ -1230,6 +1982,7 @@ def _parse_claims_sheet(
                 ))
 
             period_from, period_to = _period_cells(row, cmap, header, flag_date)
+            from_mapped, to_mapped = _period_sources_mapped(cmap)
 
             uw = cell(row, cmap.get("uw_yr"))
             if isinstance(uw, float) and uw == int(uw):
@@ -1300,6 +2053,8 @@ def _parse_claims_sheet(
                     class_source=class_source,
                     class_label_raw=class_raw,
                     currency=ccy.for_row(cell(row, cmap.get("currency"))),
+                    period_from_mapped=from_mapped,
+                    period_to_mapped=to_mapped,
                 ),
             )
             rows_out.append(crow)
@@ -1319,6 +2074,9 @@ def _parse_claims_sheet(
                   f"no proportion columns) on {len(ppn_calc_rows)} rows: "
                   + _row_list(ppn_calc_rows))
     notes += _tie_note(tie_notes)
+    notes += _emit_mapping_gaps(
+        path, sn, hdr_i, gap_unmapped, gap_missing, exceptions,
+    )
     if banners_seen:
         notes += f"; section banners: {', '.join(banners_seen)}"
     if layer_labels:

@@ -37,10 +37,13 @@ PREMIUM_ALIASES: Dict[str, List[str]] = {
         "UNDERWRITING YEAR", "UDW YEAR", "UW YEAR", "U YEAR", "U/YEAR", "UW YR", "UY", "UW",
     ],
     "period_from": [
-        "EFFECTIVE DATE", "COVER START", "PERIOD FROM", "START DATE", "COVER FROM", "INCEPTION",
-        "FROM",
+        "RISK COV FROM", "COV FROM", "COVER FROM", "PERIOD FROM", "INCEPTION",
+        "EFFECTIVE DATE", "COVER START", "START DATE", "FROM",
     ],
-    "period_to": ["EXPIRY DATE", "COVER END", "PERIOD TO", "END DATE", "COVER TO", "EXPIRY", "TO"],
+    "period_to": [
+        "RISK COV TO", "COV TO", "COVER TO", "PERIOD TO", "EXPIRY",
+        "EXPIRY DATE", "COVER END", "END DATE", "TO",
+    ],
     "period": [
         "PERIOD OF INSURANCE", "INSURANCE PERIOD", "PERIOD OF COVER", "COVER PERIOD", "PERIOD",
     ],
@@ -64,8 +67,14 @@ CLAIMS_ALIASES: Dict[str, List[str]] = {
         "DATE OF", "DOL",
     ],
     "uw_yr": ["UNDERWRITING YEAR", "UW YEAR", "U YEAR", "U/YEAR", "UW YR", "UY"],
-    "period_from": ["PERIOD OF COVER FROM", "PERIOD FROM", "COVER FROM", "START DATE", "FROM"],
-    "period_to": ["PERIOD OF COVER TO", "PERIOD TO", "COVER TO", "END DATE", "TO"],
+    "period_from": [
+        "RISK COV FROM", "COV FROM", "COVER FROM", "PERIOD FROM", "INCEPTION",
+        "PERIOD OF COVER FROM", "START DATE", "FROM",
+    ],
+    "period_to": [
+        "RISK COV TO", "COV TO", "COVER TO", "PERIOD TO", "EXPIRY",
+        "PERIOD OF COVER TO", "END DATE", "TO",
+    ],
     "period": ["PERIOD OF INSURANCE", "PERIOD OF COVER", "PERIOD"],
     "total_claims": [
         "TOTAL RESERVE AMOUNT", "TOTAL CLAIMS CLAIMS", "GROSS LOSS RESERVE",
@@ -259,6 +268,27 @@ def map_simple_columns(
                 )
     cm.unmapped_headers = [norms[i] for i in range(len(norms)) if i not in used and norms[i]]
     return cm
+
+
+REQUIRED_PREMIUM_FIELDS = ("policy_no", "insured", "period_from", "period_to", "gross_premium")
+REQUIRED_CLAIMS_FIELDS = ("policy_no", "insured", "period_from", "period_to", "total_claims")
+
+
+def missing_required_fields(cmap: ColumnMap, kind: str) -> List[str]:
+    """Template fields the manual requires that this header did not map.
+
+    A single PERIOD column supplies both Insurance Period From and To, so
+    those two columns are not required on their own when ``period`` mapped.
+    """
+    fields = REQUIRED_CLAIMS_FIELDS if kind == "claims" else REQUIRED_PREMIUM_FIELDS
+    period_covers = cmap.get("period") is not None
+    missing: List[str] = []
+    for field in fields:
+        if field in ("period_from", "period_to") and period_covers:
+            continue
+        if cmap.get(field) is None:
+            missing.append(field)
+    return missing
 
 
 def extra_alias_columns(
@@ -662,7 +692,32 @@ def detect_premium_allocation_blocks(
             if sur_set:
                 rules.extra_named_layers(norms, cm)
 
+    refresh_unmapped(cm, header_row)
     return cm
+
+
+def refresh_unmapped(cmap: ColumnMap, headers: Sequence[Any], *extra: Optional[int]) -> None:
+    """Drop columns the simple map or a band already claimed.
+
+    ``map_simple_columns`` records every non-alias header as unmapped, including
+    RET/TREATY/FAC columns that the allocation pass then assigns.
+    """
+    consumed = {i for i in cmap.mapping.values() if i is not None}
+    for idx in extra:
+        if idx is not None:
+            consumed.add(idx)
+    for cols in (
+        (cmap.ret_ppn, cmap.ret_si, cmap.ret_prem),
+        (cmap.sur_ppn, cmap.sur_si, cmap.sur_prem),
+        (cmap.fac_ppn, cmap.fac_si, cmap.fac_prem),
+    ):
+        consumed.update(i for i in cols if i is not None)
+    for block in cmap.extra_treaty_blocks:
+        consumed.update(i for i in block[1:] if isinstance(i, int))
+    norms = [normalize_header(h) if h is not None else "" for h in headers]
+    cmap.unmapped_headers = [
+        norms[i] for i in range(len(norms)) if i not in consumed and norms[i]
+    ]
 
 
 def cell(row: Sequence[Any], idx: Optional[int]) -> Any:
