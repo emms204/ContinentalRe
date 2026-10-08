@@ -623,15 +623,8 @@ def _audit_hidden_tabs(path: Path, exceptions: List[ExceptionRecord], adapter: A
     them so the audit shows what each hidden tab holds."""
     if not getattr(adapter, "content_sheet_typing", False):
         return []
-    try:
-        from src.domain.cre_cleaner.io.excel import _sheet_visibility
-        vis = _sheet_visibility(path)
-        names = [
-            sn for sn, v in vis.items()
-            if (v.get("state") or "visible") != "visible"
-        ]
-    except Exception:
-        return []
+    names = [e.source_sheet for e in exceptions
+             if e.reason == "hidden_sheet_skipped" and e.source_filename == path.name]
     if not names:
         return []
     try:

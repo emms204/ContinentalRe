@@ -601,7 +601,6 @@ def write_summary_sheet(wb, summary: dict) -> None:
     splits = summary.get("split_checks") or {}
     dates = summary.get("date_checks") or {}
     metrics = [
-        ("Adapter status", summary.get("adapter_status")),
         ("Premium source files", summary.get("premium_files")),
         ("Claims source files", summary.get("claims_files")),
         ("Premium rows written", summary.get("premium_rows")),
@@ -625,7 +624,6 @@ def write_summary_sheet(wb, summary: dict) -> None:
             "Date check flags",
             "; ".join(f"{k}: {v}" for k, v in sorted(dates.items())) or "none",
         ))
-    metrics.append(("Notes", summary.get("notes")))
     row_i = 10
     for k, v in metrics:
         ws.cell(row_i, 1).value = k

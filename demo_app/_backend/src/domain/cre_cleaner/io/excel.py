@@ -407,7 +407,11 @@ def read_source_workbook(
     for sn, rows in sheets.items():
         v = vis.get(sn) or {}
         if v.get("state", "visible") != "visible":
-            # Hidden sheets stay unread; no WARN — the skip is normal for drafts.
+            filled = sum(1 for r in rows if any(clean_text(c) for c in r))
+            notes.append((
+                "WARN", "hidden_sheet_skipped", sn, 0,
+                f"Sheet is {v['state']} in the source; {filled} non-empty rows not read",
+            ))
             continue
         hidden = v.get("hidden_rows") or set()
         if hidden:
@@ -770,7 +774,6 @@ def write_summary_sheet(wb, summary: dict) -> None:
     splits = summary.get("split_checks") or {}
     dates = summary.get("date_checks") or {}
     metrics = [
-        ("Adapter status", summary.get("adapter_status")),
         ("Premium source files", summary.get("premium_files")),
         ("Claims source files", summary.get("claims_files")),
         ("Premium rows written", summary.get("premium_rows")),
@@ -794,7 +797,6 @@ def write_summary_sheet(wb, summary: dict) -> None:
             "Date check flags",
             "; ".join(f"{k}: {v}" for k, v in sorted(dates.items())) or "none",
         ))
-    metrics.append(("Notes", summary.get("notes")))
     row_i = 10
     for k, v in metrics:
         ws.cell(row_i, 1).value = k

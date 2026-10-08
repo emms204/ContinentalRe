@@ -1154,7 +1154,7 @@ def _run_pipeline_impl(
 
     # Repeated premium/claims rows are kept as in the source and not flagged
     # (flag_duplicate_* are no-ops). Whole-file near/exact duplicates are still
-    # handled by _drop_duplicate_sources above.
+    # handled by _drop_duplicate_sources when multiple inputs are uploaded.
 
     split_exc, split_counts = check_row_splits(
         result.premium_rows, result.claims_rows, result.outstanding_rows,
