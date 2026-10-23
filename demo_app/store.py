@@ -9,10 +9,12 @@ from __future__ import annotations
 import json
 import os
 import re
+import sys
 import threading
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+from uuid import NAMESPACE_URL, uuid5
 
 _LOCK = threading.Lock()
 
@@ -56,14 +58,39 @@ def _write_json(path: Path, payload: Any) -> None:
 
 
 def partners() -> List[Dict[str, Any]]:
+    """Existing local partners plus missing registered adapters for demo tests.
+
+    Generated identifiers exist only in this process; they are not shared
+    partner IDs and never get written into the snapshot or sent to BigQuery.
+    """
+    backend = str(Path(__file__).resolve().parent / '_backend')
+    if backend not in sys.path:
+        sys.path.insert(0, backend)
+    from src.domain.cre_cleaner.adapters import get_adapter, list_adapters
+    from src.domain.cre_cleaner.adapters.base import UnsupportedCedantError
+
     rows = _read_json(PARTNERS_PATH, [])
-    if not isinstance(rows, list) or not rows:
-        raise FileNotFoundError(
-            f"Partner snapshot is missing or empty ({PARTNERS_PATH}). "
-            "Run demo_app/scripts/refresh_store_snapshot.py on a machine with gcloud, "
-            "then redeploy. This site does not call BigQuery."
-        )
-    return rows
+    if not isinstance(rows, list):
+        raise FileNotFoundError(f"Partner snapshot must contain a list ({PARTNERS_PATH}).")
+    available = []
+    represented = set()
+    for row in rows:
+        if not isinstance(row, dict) or not row.get('partner_id'):
+            continue
+        try:
+            adapter = get_adapter(*partner_name_to_cedant_broker(row.get('name', '')))
+        except (ValueError, UnsupportedCedantError):
+            continue
+        available.append(dict(row))
+        represented.add((adapter.cedant, adapter.broker))
+    for cedant, broker, *_ in list_adapters():
+        if (cedant, broker) in represented:
+            continue
+        available.append(dict(
+            partner_id='demo-' + str(uuid5(NAMESPACE_URL, f'continental-re-demo:{cedant}:{broker}')),
+            name=f'{cedant}({broker})', cedant=cedant, broker=broker, demo_only=True,
+        ))
+    return sorted(available, key=lambda row: row['name'].casefold())
 
 
 def partner_by_id(partner_id: str) -> Optional[Dict[str, Any]]:

@@ -3,7 +3,54 @@
   "source_project": "infrastructure-staging-418710",
   "source_dataset": "staging_mh_reinsurance_ai",
   "partner_count": 21,
-  "class_count": 31,
+  "class_count": 50,
   "subclass_count": 12,
-  "note": "Demo snapshot only. Confirmations update local files and are never synced to production. Duplicate AIICO(ARK)/AIICO(SCIB) staging cedents removed for the demo UI."
+  "note": "Demo snapshot only. Confirmations update local files and are never synced to production. Duplicate AIICO(ARK)/AIICO(SCIB) staging cedents removed for the demo UI.",
+  "local_class_seeds": {
+    "added_on": "2026-10-21",
+    "source": "Royal Exchange demo template vocabulary",
+    "staging_synced": false,
+    "rows": [
+      {
+        "partner": "ROYAL EXCHANGE(AGRIC)",
+        "class_name": "agriculture"
+      },
+      {
+        "partner": "ROYAL EXCHANGE(DIRECT)",
+        "class_name": "agriculture"
+      },
+      {
+        "partner": "ROYAL EXCHANGE(DIRECT)",
+        "class_name": "bond"
+      },
+      {
+        "partner": "ROYAL EXCHANGE(DIRECT)",
+        "class_name": "engineering"
+      },
+      {
+        "partner": "ROYAL EXCHANGE(DIRECT)",
+        "class_name": "fire"
+      },
+      {
+        "partner": "ROYAL EXCHANGE(DIRECT)",
+        "class_name": "general_accident"
+      },
+      {
+        "partner": "ROYAL EXCHANGE(DIRECT)",
+        "class_name": "marine_cargo"
+      },
+      {
+        "partner": "ROYAL EXCHANGE(DIRECT)",
+        "class_name": "marine_hull"
+      },
+      {
+        "partner": "ROYAL EXCHANGE(DIRECT)",
+        "class_name": "oil_and_energy"
+      },
+      {
+        "partner": "ROYAL EXCHANGE(DIRECT)",
+        "class_name": "terrorism"
+      }
+    ]
+  }
 }

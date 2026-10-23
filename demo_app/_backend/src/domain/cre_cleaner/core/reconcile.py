@@ -37,7 +37,7 @@ _METRIC_ORDER = ("gross", "total", "ret", "treaty", "fac")
 
 def metric_label(key: str) -> str:
     if key.startswith("layer:"):
-        return f"Treaty layer {key[6:]} (not in upload columns)"
+        return f"Treaty source layer {key[6:]}"
     return METRIC_LABELS.get(key, key)
 
 
@@ -102,7 +102,7 @@ def check_row_splits(
 
     c = counts.setdefault("premium", {"ok": 0, "mismatch": 0, "not_checkable": 0})
     for r in premium_rows:
-        layers = r.extra_layers or []
+        layers = [l for l in (r.extra_layers or []) if not l.get("included_in_treaty_total")]
         states: List[str] = []
         amounts = [r.ret_prem, r.sur_prem, r.fac_prem] + [l.get("prem") for l in layers]
         if r.gross_premium is not None and any(a is not None for a in amounts):
@@ -121,7 +121,7 @@ def check_row_splits(
         c = counts.setdefault(label, {"ok": 0, "mismatch": 0, "not_checkable": 0})
         for r in rows:
             parts = [r.amount_ret, r.amount_treaty, r.amount_fac] + [
-                l.get("amount") for l in (r.extra_layers or [])
+                l.get("amount") for l in (r.extra_layers or []) if not l.get("included_in_treaty_total")
             ]
             if r.total_claims is None or not any(p is not None for p in parts):
                 c["not_checkable"] += 1
@@ -604,6 +604,39 @@ def transaction_key(row) -> tuple:
     return ("P", str(row.policy_no or "").strip().upper(), str(row.name_of_insured or "").strip().upper(),
             _key_num(row.gross_premium), _key_num(row.ret_prem), _key_num(row.sur_prem),
             str(row.period_from), str(row.period_to))
+
+
+def sheet_copy_key(row) -> tuple:
+    """Identity of one row when two tabs of one workbook are compared:
+    ``transaction_key`` plus FAC, class, currency, insured and policy / claim
+    number, and the non-zero further treaty layers (a zero or blank layer
+    column one tab lacks is no difference). Tabs that differ in any of these
+    are never taken for copies. A class that is only the row's own tab name
+    (no class read from a column or banner) counts as no class: it names the
+    tab, not the risk."""
+    audit = getattr(row, "audit", None)
+    if isinstance(row, ClaimsRow):
+        fac, insured, number = row.amount_fac, row.insured, (row.claim_no, row.policy_no)
+        cls, layer_key = row.class_name, "amount"
+    else:
+        fac, insured, number = row.fac_prem, row.name_of_insured, (row.policy_no,)
+        cls, layer_key = getattr(audit, "class_hint", ""), "prem"
+    cls = " ".join(str(cls or "").upper().split())
+    if cls == " ".join(str(getattr(audit, "source_sheet", "") or "").upper().split()):
+        cls = ""
+    layers = []
+    for layer in getattr(row, "extra_layers", None) or []:
+        amount = _key_num(layer.get(layer_key))
+        if isinstance(amount, float) and amount:
+            layers.append((str(layer.get("layer", "")), amount))
+    return transaction_key(row) + (
+        _key_num(fac),
+        cls,
+        str(getattr(audit, "currency", "") or "").upper(),
+        str(insured or "").strip().upper(),
+        tuple(str(n or "").strip().upper() for n in number),
+        tuple(sorted(layers)),
+    )
 
 
 def overlap_counts(candidate_rows: Sequence, loaded_rows: Sequence) -> Tuple[int, int]:

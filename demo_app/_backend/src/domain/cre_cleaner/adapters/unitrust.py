@@ -34,6 +34,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from src.domain.cre_cleaner.adapters.base import QuarterlyWorkbookAdapter
 from src.domain.cre_cleaner.adapters.mutual_benefits_ark import MutualBenefitsArkAdapter
+from src.domain.cre_cleaner.core.detect import SheetTypeRules
 from src.domain.cre_cleaner.core.map_columns import ColumnMap, PremiumLayoutRules, map_simple_columns
 from src.domain.cre_cleaner.core.normalize import normalize_header
 from src.domain.cre_cleaner.models import ExceptionRecord
@@ -150,7 +151,9 @@ class UnitrustAgricAdapter(QuarterlyWorkbookAdapter):
         # insurance period (Start Date / End Date are the period).
         return field == "period" and norm.startswith("PERIOD BALANCE")
 
-    def map_claims_columns(self, header: Sequence[Any], aliases: Dict[str, List[str]]) -> ColumnMap:
+    def map_claims_columns(
+        self, header: Sequence[Any], aliases: Dict[str, List[str]], sheet_type: str = "",
+    ) -> ColumnMap:
         norms = [normalize_header(h) if h is not None else "" for h in header]
         band_cols = set()
         bands = {}
@@ -261,6 +264,47 @@ class UnitrustAgricAdapter(QuarterlyWorkbookAdapter):
         )
 
 
+# 2019–2020 'REINSURANCE PROPORTIONAL DISTRIBUTION REPORT' claims exports:
+#   Amount of claim Paid | % | Company Retention Payment | % | Quotas Share
+#   Payment | % | First Surplus Payment | % | Second Surplus Payment | % |
+#   Facultative Payment   (outstanding: '… O/S' instead of '… Payment')
+# Each '%' is the share of the band to its right. Older files split the
+# labels over two rows ('Amount of' / 'claim Paid', 'Effective' / 'Date').
+# Quota share is the TREATY band; first / second surplus are extra layers.
+# Total-claims labels are exact: any other 'AMOUNT OF …' header (salvage,
+# premium, recovery) is never the total.
+UNITRUST_ARK_TOTAL_CLAIMS = ("AMOUNT OF CLAIM PAID", "AMOUNT OF CLAIM O S", "AMOUNT OF CLAIM", "AMOUNT OF")
+UNITRUST_ARK_CLAIMS_ALIAS_EXTRA: Dict[str, List[str]] = {
+    "total_claims": ["OUTSTANDING AMOUNT", *UNITRUST_ARK_TOTAL_CLAIMS],
+    "amount_ret": ["COMPANY RETENTION"],
+    "amount_treaty": ["QUOTAS SHARE", "QUOTA SHARE"],
+    "date_of_loss": ["LOSSDATE"],
+    "period_from": ["EFFECTIVE DATE", "EFFECTIVE"],
+    "period_to": ["EXPIRYDATE", "EXPIRY DATE"],
+}
+
+
+_ARK_CLAIM_BANDS = {
+    'ret': ('COMPANY RETENTION', 'NET RETENTION', 'NET RETENTIONS'),
+    'quota': ('QUOTAS SHARE', 'QUOTA SHARE', 'TREATY QUOTA SHARE'),
+    'surplus1': ('FIRST SURPLUS', 'TREATY FIRST SURPLUS'),
+    'surplus2': ('SECOND SURPLUS', 'TREATY SECOND SURPLUS'),
+    'fac': ('FACULTATIVE',),
+}
+_ARK_BAND_NAMES = {key: names[0] for key, names in _ARK_CLAIM_BANDS.items()}
+
+
+def _ark_claim_band(norm):
+    """Exact source band/part; generic AMOUNT and unknown tail pairs stay out."""
+    for key, names in _ARK_CLAIM_BANDS.items():
+        for name in names:
+            for suffix, part in ((' PPN', 'ppn'), (' AMOUNT', 'amount'),
+                                 (' PAYMENT', 'amount'), (' O S', 'amount'), ('', '')):
+                if norm == name + suffix:
+                    return key, part
+    return None, ''
+
+
 class UnitrustArkAdapter(MutualBenefitsArkAdapter):
     """Unitrust & ARK: shares the ARK broker's file *discovery* (month files +
     quarterly fallback) only; Unitrust band layout; no other cedant's
@@ -272,5 +316,151 @@ class UnitrustArkAdapter(MutualBenefitsArkAdapter):
     # premium in the next two blank columns). TSI / GP stay on the 100%
     # columns (setting default): 'Our share SI' is blank in these returns.
     premium_layout_rules = UNITRUST_AGRIC_PREMIUM_RULES
+    claims_alias_extra = UNITRUST_ARK_CLAIMS_ALIAS_EXTRA
+    # Prepare only source-named pairs ourselves. Generic forward filling of
+    # a parent across an unlabelled third pair can invent another treaty band.
+    band_subrow_layout = False
+    # Mutual's claims class / PPN choices are not Unitrust's: defaults.
+    settings: dict = {}
+    claims_sheet_class_first = False
+    # Tabs are split by currency ('G.A NAIRA' / 'G.A DOLLAR', 'USD Marine'):
+    # one class label per class, not one per currency.
+    sheet_type_rules = SheetTypeRules(
+        class_noise_words=frozenset({"NAIRA", "DOLLAR", "DOLLARS", "USD", "NGN"}),
+    )
     verified = False
     status_note = "Unitrust & ARK: month-file discovery; not checked against Bisola gold"
+
+    def claims_exclude(self, field: str, norm: str) -> bool:
+        return (field == "total_claims" and "AMOUNT OF" in norm
+                and norm not in UNITRUST_ARK_TOTAL_CLAIMS
+                or field == 'period' and norm.startswith('PERIOD BALANCE'))
+
+    def prepare_source_sheet(self, sheet, rows, *, path, exceptions):
+        from math import isclose
+        from src.domain.cre_cleaner.core.normalize import parse_number
+
+        self.__dict__.setdefault('_ark_source_tables', {})[(path.name, sheet)] = rows
+        result = list(rows)
+        for hi, row in enumerate(rows):
+            norms = [normalize_header(v) for v in row]
+            if not any(h in {'POLICY', 'POLICY NO', 'POLICY NUMBER'} for h in norms) or not any(
+                    h in {'CLAIM NO', 'CLAIM NUMBER', 'CLAIMS NO'} for h in norms):
+                continue
+            starts = [(i, *_ark_claim_band(h)) for i, h in enumerate(norms) if _ark_claim_band(h)[0]]
+            if not starts:
+                continue
+            header = list(row)
+            below = rows[hi + 1] if hi + 1 < len(rows) else []
+            sub = [normalize_header(v) for v in below]
+            cm = map_simple_columns(row, self.claims_aliases(), exclude=self.claims_exclude)
+            pi, ci, ti = cm.get('policy_no'), cm.get('claim_no'), cm.get('total_claims')
+            end = next((j for j in range(hi + 1, len(rows)) if any(
+                normalize_header(v) in {'POLICY', 'POLICY NO', 'POLICY NUMBER'} for v in rows[j])
+                and any(normalize_header(v) in {'CLAIM NO', 'CLAIM NUMBER', 'CLAIMS NO'} for v in rows[j])), len(rows))
+            data = [r for r in rows[hi + 1:end] if pi is not None and ci is not None
+                    and max(pi, ci) < len(r) and r[pi] and r[ci]]
+            def corroborated(i):
+                for r in data:
+                    if ti is None or max(i + 1, ti) >= len(r):
+                        continue
+                    share, amount, total = [parse_number(r[j]) for j in (i, i + 1, ti)]
+                    if share is None or amount is None or total in (None, 0) or abs(share) > 100:
+                        continue
+                    if amount and any(isclose(amount, total * factor, rel_tol=1e-8,
+                            abs_tol=max(.03, abs(total) * .0001)) for factor in (share, share / 100)):
+                        return True
+                return False
+
+            proofs = {i: corroborated(i) for i, _, part in starts if not part
+                      and i + 1 < len(norms) and not norms[i + 1]}
+            owned = set()
+            for i, key, part in starts:
+                label = next(name for name in _ARK_CLAIM_BANDS[key]
+                             if norms[i] == name or norms[i].startswith(name + ' '))
+                if part:
+                    header[i] = label + (' PPN' if part == 'ppn' else ' AMOUNT')
+                    owned.add(i)
+                    if part == 'amount' and i and norms[i - 1] == '%':
+                        header[i - 1] = label + ' PPN'
+                        owned.add(i - 1)
+                    continue
+                if i and norms[i - 1] == '%':
+                    header[i - 1], header[i] = label + ' PPN', label + ' AMOUNT'
+                    owned.update((i - 1, i))
+                elif i + 1 < len(norms) and not norms[i + 1]:
+                    explicit = (sub[i:i + 2] in (['PPN', 'AMOUNT'], ['%', 'AMOUNT']))
+                    zero_pair = bool(data) and all(all(j >= len(r) or r[j] in (None, '')
+                        or parse_number(r[j]) == 0 for j in (i, i + 1)) for r in data)
+                    # A source-named all-zero band shares the proved pair
+                    # schema; copy its zeroes rather than manufacturing blanks.
+                    if explicit or proofs.get(i) or (any(proofs.values()) and zero_pair):
+                        header[i:i + 2] = [label + ' PPN', label + ' AMOUNT']
+                    else:
+                        header[i:i + 2] = ['UNITRUST UNVERIFIED ALLOCATION'] * 2
+                        exceptions.append(ExceptionRecord('WARN', 'unitrust_claims_band_ambiguous',
+                            path.name, sheet, hi + 1, f'{row[i]!r} columns {i + 1}/{i + 2} have '
+                            'no PPN/AMOUNT captions or corroborating source arithmetic. Both left unmapped.'))
+                    owned.update((i, i + 1))
+                else:
+                    # An explicitly named standalone amount has no adjacent
+                    # blank amount child or leading share column.
+                    header[i] = label + ' AMOUNT'
+                    owned.add(i)
+            unknown = [i for i in range(min(i for i, _, _ in starts), len(norms))
+                       if i not in owned and not norms[i] and any(i < len(r) and r[i] is not None for r in data)]
+            if unknown:
+                exceptions.append(ExceptionRecord('WARN', 'unitrust_unlabelled_claim_allocation', path.name,
+                    sheet, hi + 1, f'Unlabelled allocation columns {[i + 1 for i in unknown]} retained in '
+                    'the source only; their role is not assumed to be FAC or another treaty layer.'))
+            # A duplicated explicit source band does not identify which pair
+            # belongs in the one upload band. It is not silently combined.
+            counts = {}
+            for h in header:
+                key, part = _ark_claim_band(normalize_header(h))
+                if key and part:
+                    counts[(key, part)] = counts.get((key, part), 0) + 1
+            if any(n > 1 for n in counts.values()):
+                exceptions.append(ExceptionRecord('WARN', 'unitrust_claims_band_ambiguous', path.name,
+                    sheet, hi + 1, 'Repeated source allocation band captions; ambiguous bands left unmapped.'))
+            result[hi] = header
+        return result
+
+    def classify_source_tab(self, file, sheet, rows):
+        from src.domain.cre_cleaner.core.table_type import classify_tab
+        # Header role annotations are for mapping only. Keep family/type and
+        # confidence based on the original source captions and values.
+        source = self.__dict__.get('_ark_source_tables', {}).get((file, sheet), rows)
+        return classify_tab(file, sheet, source, vocab=self.table_vocab)
+
+    def map_claims_columns(self, header, aliases, sheet_type=''):
+        norms = [normalize_header(v) for v in header]
+        bands = {}
+        for i, h in enumerate(norms):
+            key, part = _ark_claim_band(h)
+            if key:
+                bands.setdefault(key, {}).setdefault(part or 'amount', []).append(i)
+        masked = [None if _ark_claim_band(h)[0] else header[i] for i, h in enumerate(norms)]
+        cm = map_simple_columns(masked, aliases, exclude=self.claims_exclude)
+        # Start/End Date are the authoritative cover columns when supplied.
+        # A balance/movement or an invalid combined range must not erase them.
+        if cm.get('period_from') is not None and cm.get('period_to') is not None:
+            cm.mapping.pop('period', None)
+        proven = {k: {part: cols[0] for part, cols in parts.items()}
+                  for k, parts in bands.items() if all(len(cols) == 1 for cols in parts.values())}
+        for band, field in [('ret', 'ret'), ('fac', 'fac')]:
+            for part in ('ppn', 'amount'):
+                if part in proven.get(band, {}):
+                    cm.mapping[part + '_' + field] = proven[band][part]
+        original = map_simple_columns(header, aliases, exclude=self.claims_exclude)
+        selected = original.get('amount_treaty')
+        primary = _ark_claim_band(norms[selected])[0] if selected is not None else None
+        if 'amount' not in proven.get(primary, {}):
+            primary = next((k for k in ('quota', 'surplus1', 'surplus2') if 'amount' in proven.get(k, {})), None)
+        if primary:
+            for part, col in proven[primary].items():
+                cm.mapping[part + '_treaty'] = col
+        cm.extra_amount_columns = [(parts['amount'], _ARK_BAND_NAMES[key])
+            for key, parts in proven.items() if key in {'quota', 'surplus1', 'surplus2'}
+            and key != primary and 'amount' in parts]
+        return cm

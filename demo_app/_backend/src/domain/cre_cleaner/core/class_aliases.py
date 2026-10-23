@@ -41,6 +41,7 @@ from src.domain.cre_cleaner.core.class_labels import (
     ClassMap,
     approved_class_labels,
     normalize_class_label,
+    run_mapped_class,
 )
 from src.domain.cre_cleaner.core.class_suggest import normalize_for_suggestion
 
@@ -107,6 +108,10 @@ class ConfirmedAliases:
     # True when the store was read and the partner has no live class rows.
     empty_store: bool = False
     partner_id: Optional[str] = None
+    # Lower-cased class_id -> (template class, store class) for every approved
+    # row. Facultative and unmapped store classes are left out. A per-run
+    # mapping may name any of these ids, not only the first per template.
+    class_ids: Mapping[str, Tuple[str, str]] = field(default_factory=dict)
 
     @classmethod
     def unavailable(cls, detail: str, partner_id: Optional[str] = None) -> "ConfirmedAliases":
@@ -154,6 +159,7 @@ def build_partner_aliases(rows: Iterable[Any], store_map: Optional[Mapping[str, 
     # tier -> key -> {template: {store classes}}, and key -> one raw entry
     found: Dict[str, Dict[str, Dict[str, Set[str]]]] = {TIER_ALIAS: {}, TIER_VARIATION: {}}
     raw_of: Dict[Tuple[str, str], str] = {}
+    class_ids: Dict[str, Tuple[str, str]] = {}
     for row in rows or ():
         store = store_class_key(_field(row, "class_name"))
         if not store:
@@ -172,6 +178,9 @@ def build_partner_aliases(rows: Iterable[Any], store_map: Optional[Mapping[str, 
                  f"Store class {store!r} maps to {template!r}, which is not an approved "
                  "class for this partner; ignored.", store_class=store, class_name=template)
             continue
+        cid = str(_field(row, "class_id") or "").strip().lower()
+        if cid:
+            class_ids[cid] = (template, store)
         for tier, column in ((TIER_ALIAS, "aliases"), (TIER_VARIATION, "variations")):
             for entry in _entries(row, column):
                 key = alias_key(entry)
@@ -228,7 +237,7 @@ def build_partner_aliases(rows: Iterable[Any], store_map: Optional[Mapping[str, 
             provenance[key] = (tier, sorted(stores)[0])
     return ConfirmedAliases(mapping=mapping, available=True, provenance=provenance,
                             warnings=tuple(warnings), overrides=tuple(overrides),
-                            partner_id=partner_id)
+                            partner_id=partner_id, class_ids=class_ids)
 
 
 class AliasedClassMap(ClassMap):
@@ -298,6 +307,8 @@ def alias_applications(rows_and_getters, class_map: Optional[ClassMap]) -> List[
     counts: Dict[Tuple[str, str], int] = {}
     for rows, getter in rows_and_getters:
         for row in rows or ():
+            if run_mapped_class(row):
+                continue
             raw = (getter(row) or "").strip()
             if not raw or normalize_class_label(raw, base):
                 continue

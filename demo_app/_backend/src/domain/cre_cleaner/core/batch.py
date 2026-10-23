@@ -27,7 +27,9 @@ from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Seque
 
 from src.domain.cre_cleaner.core.period_infer import infer_period
 
-EXCEL_SUFFIXES = {".xlsx", ".xls", ".xlsm"}
+from src.domain.cre_cleaner.config import SOURCE_WORKBOOK_SUFFIXES
+
+EXCEL_SUFFIXES = SOURCE_WORKBOOK_SUFFIXES
 
 # ERROR reasons that make a group's result unreliable (reported per group).
 HARD_ERROR_REASONS = frozenset({
@@ -35,7 +37,7 @@ HARD_ERROR_REASONS = frozenset({
     "no_claims_files", "period_unresolved", "period_ambiguous",
     "period_discovery_empty", "period_invalid", "bordereau_type_invalid",
     "claims_file_out_of_period", "batch_group_exception",
-    "class_unresolved", "class_outside_single_class", "upload_structure_invalid",
+    "class_unresolved", "class_outside_single_class", "upload_structure_invalid", "row_mapping_invalid", "no_data_rows", "source_layout_ambiguous", "source_overlap_ambiguous",
 })
 
 STATUS_GROUPED = "grouped"
@@ -64,6 +66,7 @@ class FilePlan:
     broker_warning: str = ""             # → WARN broker_mismatch_suspected
     period_warning: str = ""             # → WARN period_override_conflict
     period_label_warning: str = ""       # → WARN period_label_conflict (exceptions only)
+    period_year_warning: str = ""        # → WARN period_year_from_span (exceptions only)
     has_claims: bool = False
     claims_weak: bool = False
     named_year: Optional[int] = None
@@ -286,7 +289,11 @@ def detect_cedants(
     p = Path(path)
     sheet = banner_text if banner_text is not None else _banner_text(p)
     folders = " | ".join(p.parent.parts[-folder_parts:]) if folder_parts else ""
-    hay = "  ".join(_words(t) for t in (p.stem, folders, sheet))
+    return _names_in("  ".join(_words(t) for t in (p.stem, folders, sheet)), names)
+
+
+def _names_in(hay: str, names: Dict[str, str]) -> List[str]:
+    """Canonical names whose whole-word spelling is in ``hay``, longest first."""
     found: List[str] = []
     for name in sorted(names, key=len, reverse=True):
         w = _words(name)
@@ -296,6 +303,28 @@ def detect_cedants(
                 found.append(canon)
             hay = hay.replace(w, " ")
     return found
+
+
+def banner_cedant_mismatches(path: Path, cedant: str, broker: str = "", *, sheets=None) -> List[Tuple[str, List[str]]]:
+    """(sheet, cedants named) for each sheet whose banner rows name a
+    registered cedant other than the selected one, and not the selected one
+    (a misfiled workbook: another company's return in this cedant's folder)."""
+    from src.domain.cre_cleaner.adapters import _ALIASES
+    from src.domain.cre_cleaner.io.excel import read_workbook_sheets
+    c = str(cedant or "").strip().upper()
+    names, _disabled = detection_names()
+    canon = names.get(_ALIASES.get((c, str(broker or "").strip().upper()), (c, ""))[0], c)
+    try:
+        if sheets is None:
+            sheets = read_workbook_sheets(Path(path))
+    except Exception:
+        return []
+    out: List[Tuple[str, List[str]]] = []
+    for sn, rows in sheets.items():
+        found = _names_in(_words(" ".join(banner_rows(rows))), names)
+        if found and canon not in found:
+            out.append((sn, found))
+    return out
 
 
 # Broker names that are ordinary words are never evidence on their own.
@@ -443,8 +472,12 @@ def plan_batch(
     detect_cedant: bool = True,
     selected_year: Optional[int] = None,
     selected_quarter: Optional[int] = None,
+    on_file: Optional[Callable[[Path, int, int], None]] = None,
 ) -> BatchPlan:
     """Infer each file's period (and check its cedant) and group the files.
+
+    ``on_file(path, index, total)`` optionally reports each file before its
+    checks, in deterministic name order; index is one-based.
 
     * A selected ``cedant`` / ``broker`` is authoritative: a file whose name /
       folder / banner names a different registered cedant (and not the
@@ -476,12 +509,15 @@ def plan_batch(
     overrides = {str(k): dict(v) for k, v in (overrides or {}).items()}
     plan = BatchPlan()
     brokers, _alias = _registry()
-    for p in sorted((Path(f) for f in files), key=lambda x: x.name.upper()):
+    paths = sorted((Path(f) for f in files), key=lambda x: x.name.upper())
+    for index, p in enumerate(paths, 1):
+        if on_file:
+            on_file(p, index, len(paths))
         fp = FilePlan(path=p, cedant=cedant, broker=broker)
         ov = overrides.get(p.name, {})
         plan.files.append(fp)
         if p.suffix.lower() not in EXCEL_SUFFIXES:
-            fp.status, fp.detail = STATUS_NOT_EXCEL, "not an Excel file (.xlsx/.xls/.xlsm)"
+            fp.status, fp.detail = STATUS_NOT_EXCEL, "not a supported workbook (.xlsx/.xls/.xlsm/.xlsb/.ods)"
             continue
 
         found = detect_cedants(p) if detect_cedant else []
@@ -530,6 +566,7 @@ def plan_batch(
         inf = infer_period(p, period_source=_adapter_period_source(fp.cedant, fp.broker))
         fp.confidence = inf.confidence
         fp.period_label_warning = inf.period_label_warning or ""
+        fp.period_year_warning = getattr(inf, "period_year_warning", "") or ""
         fp.has_claims = any(kind in ("paid", "outstanding") for kind in (inf.sheet_kinds or []))
         fp.claims_weak = bool(inf.claims_weak)
         fp.named_year = inf.named_year
@@ -670,12 +707,14 @@ def run_group(
                 ("broker_mismatch_suspected", getattr(fp, "broker_warning", "")),
                 ("period_override_conflict", getattr(fp, "period_warning", "")),
                 ("period_label_conflict", getattr(fp, "period_label_warning", "")),
+                ("period_year_from_span", getattr(fp, "period_year_warning", "")),
             ):
                 if text:
                     extra.append(ExceptionRecord("WARN", reason, fp.name, detail=text))
                     gr.warnings.append(f"{reason}: {text}")
         if extra:
-            pipeline_kwargs = dict(pipeline_kwargs, extra_exceptions=extra)
+            pipeline_kwargs = dict(pipeline_kwargs,
+                extra_exceptions=list(pipeline_kwargs.get('extra_exceptions') or []) + extra)
         res = runner(
             cedant=group.cedant, broker=group.broker,
             year=group.year, quarter=group.quarter,
@@ -721,14 +760,46 @@ def run_batch(
     """Run every group independently (pending files are not run)."""
     out = BatchResult(plan=plan)
     n = len(plan.groups)
+    evidence_by_partner = {}
     for i, g in enumerate(plan.groups, 1):
         if on_group:
             try:
                 on_group(g, i, n)
             except Exception:
                 pass
+        kwargs = dict(pipeline_kwargs)
+        if runner is None:
+            from src.domain.cre_cleaner.adapters import get_adapter
+            from src.domain.cre_cleaner.adapters.base import UnsupportedCedantError
+            try:
+                adapter = get_adapter(g.cedant, g.broker)
+            except UnsupportedCedantError:
+                adapter = None  # run_group reports the failure without stopping the batch
+            gather = getattr(adapter, 'batch_class_evidence', None)
+            if callable(gather):
+                key = (g.cedant, g.broker, g.year)
+                if key not in evidence_by_partner:
+                    paths = [fp.path for group in plan.groups
+                             if (group.cedant, group.broker, group.year) == key
+                             for fp in group.files if fp.status == STATUS_GROUPED
+                             and not fp.cedant_warning and not fp.broker_warning
+                             and not fp.period_warning]
+                    try:
+                        evidence_by_partner[key] = (gather(paths,
+                            context=[*key, kwargs.get('row_identity_context', ''), 'batch-evidence'],
+                            include_fac=kwargs.get('include_fac', False)), '')
+                    except Exception as exc:
+                        # Failed evidence must never stop an independent quarter.
+                        evidence_by_partner[key] = ([], type(exc).__name__)
+                evidence, failure = evidence_by_partner[key]
+                kwargs['class_evidence_records'] = evidence
+                if failure:
+                    from src.domain.cre_cleaner.models import ExceptionRecord
+                    kwargs['extra_exceptions'] = list(kwargs.get('extra_exceptions') or []) + [
+                        ExceptionRecord('WARN', 'class_evidence_unavailable',
+                            detail=f'Batch class evidence could not be read ({failure}); missing classes require review')]
         out.groups.append(run_group(
             g, template=template, out_dir=out_dir, work_dir=work_dir,
-            base_dir=base_dir, runner=runner, **pipeline_kwargs,
+            base_dir=base_dir, runner=runner, **kwargs,
         ))
     return out

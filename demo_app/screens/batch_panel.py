@@ -15,14 +15,14 @@ from typing import Any, Dict, List, Optional
 
 import streamlit as st
 
-from cre_cleaner.adapters import list_adapters
-from cre_cleaner.core.batch import (
+from src.domain.cre_cleaner.adapters import list_adapters
+from src.domain.cre_cleaner.core.batch import (
     STATUS_CEDANT_MISMATCH, STATUS_CEDANT_UNCONFIRMED, STATUS_CEDANT_UNKNOWN,
     plan_batch, run_batch,
 )
 
 _CEDANT_PENDING = {STATUS_CEDANT_MISMATCH, STATUS_CEDANT_UNCONFIRMED, STATUS_CEDANT_UNKNOWN}
-from cre_cleaner.io.delivery import deliver
+from src.domain.cre_cleaner.io.delivery import deliver
 from demo_app import paths
 
 _DELIVERY_LABELS = {

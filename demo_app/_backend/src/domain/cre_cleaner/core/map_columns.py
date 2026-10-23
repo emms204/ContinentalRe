@@ -61,7 +61,7 @@ CLAIMS_ALIASES: Dict[str, List[str]] = {
     ],
     "class": ["POLICY CLASS", "SUB CLASS", "POL CLASS", "SUBCLASS", "CLASS"],
     "policy_no": ["POLICY NUMBER", "POLICY NO", "POLICY NO.", "POLICY"],
-    "claim_no": ["CLAIM NUMBER", "CLAIMNUMBER", "CLAIM NO", "CLAIM NO."],
+    "claim_no": ["CLAIM NUMBER", "CLAIMNUMBER", "CLAIM NO", "CLAIM NO.", "CLAIMS NUMBER", "CLAIMS NO"],
     "date_of_loss": [
         "DATE OF LOSS DAY MTH YEAR", "DATE OF LOSS INCIDENT", "DATE OF LOSS", "LOSS DATE",
         "DATE OF", "DOL",
@@ -156,6 +156,12 @@ class ColumnMap:
     # Claims: further treaty-layer amount columns an adapter located
     # positionally ((col, label)); copied per row like alias-found layers.
     extra_amount_columns: List[Tuple[int, str]] = field(default_factory=list)
+    # Claims: header taken as TOTAL CLAIMS by the adapter's per-tab-type
+    # fallback (no total-claims alias matched); "" when none was used.
+    total_fallback: str = ""
+    # Opt-in: distinct quota/surplus allocations share one upload TREATY band.
+    combine_treaty_layers: bool = False
+    treaty_ppn_columns: List[int] = field(default_factory=list)
 
     def get(self, field: str) -> Optional[int]:
         return self.mapping.get(field)
@@ -175,6 +181,36 @@ def is_share_header(norm: str) -> bool:
     ):
         return True
     return False
+
+
+_AMOUNT_WORDS = {"AMOUNT", "AMT", "N", "NGN", "USD"}
+_SHARE_WORDS = {"%", "PPN", "PROPORTION", "RATE", "PCT", "PCNT"}
+
+
+def _band_core(norm: str, drop: set) -> str:
+    return " ".join(t for t in norm.replace("%", " % ").split() if t not in drop)
+
+
+def pair_band_ppn_columns(cm: "ColumnMap", header: Sequence[Any]) -> None:
+    """Claims PPN for a band whose share column names the same band as its
+    amount column ('RETENTION %' / 'RETENTION AMOUNT', '1ST SURPLUS TREATY %' /
+    '1ST SURPLUS TREATY AMOUNT', 'FAC %' / 'FAC AMOUNT'). The shared aliases
+    hold no PPN fields; only empty PPN fields are filled, amounts never move."""
+    norms = [normalize_header(h) if h is not None else "" for h in header]
+    used = set(cm.mapping.values())
+    for kind in ("ret", "treaty", "fac"):
+        i = cm.get("amount_" + kind)
+        if i is None or cm.get("ppn_" + kind) is not None or i >= len(norms):
+            continue
+        core = _band_core(norms[i], _AMOUNT_WORDS)
+        if not core:
+            continue
+        match = [j for j, n in enumerate(norms)
+                 if j not in used and is_share_header(n) and _band_core(n, _SHARE_WORDS) == core]
+        if match:
+            j = min(match, key=lambda j: abs(j - i))
+            cm.mapping["ppn_" + kind] = j
+            used.add(j)
 
 
 def _alias_match(norm: str, aliases: List[str]) -> bool:
@@ -270,6 +306,26 @@ def map_simple_columns(
     return cm
 
 
+def fill_unmapped_field(
+    cm: ColumnMap, headers: Sequence[Any], field: str, exact_headers: Sequence[str],
+) -> ColumnMap:
+    """Map ``field`` to the leftmost free column whose header is exactly one of
+    ``exact_headers`` (in list preference order), only when the alias pass
+    left ``field`` unmapped."""
+    if not exact_headers or cm.get(field) is not None:
+        return cm
+    norms = [normalize_header(h) if h is not None else "" for h in headers]
+    used = set(cm.mapping.values())
+    for want in (normalize_header(h) for h in exact_headers):
+        for i, n in enumerate(norms):
+            if n and n == want and i not in used:
+                cm.mapping[field] = i
+                if n in cm.unmapped_headers:
+                    cm.unmapped_headers.remove(n)
+                return cm
+    return cm
+
+
 REQUIRED_PREMIUM_FIELDS = ("policy_no", "insured", "period_from", "period_to", "gross_premium")
 REQUIRED_CLAIMS_FIELDS = ("policy_no", "insured", "period_from", "period_to", "total_claims")
 
@@ -312,6 +368,11 @@ def extra_alias_columns(
     return out
 
 
+_UW_YEAR_BANNER = re.compile(
+    r"^(?:(?:19|20)\d{2} (?:UW|UNDERWRITING) YEAR|(?:UW|UNDERWRITING) YEAR (?:19|20)\d{2})$"
+)
+
+
 def merge_group_subheaders(
     group_row: Sequence[Any],
     sub_row: Sequence[Any],
@@ -347,6 +408,9 @@ def merge_group_subheaders(
             out.append(f"{g} AMOUNT".strip() if g else sub)
         elif sub in {"PREMIUM", "GROSS PREMIUM", "SUM INSURED", "SI"} and g:
             out.append(f"{g} {sub}".strip())
+        elif top and re.search(r"[A-Z]", sub) and _UW_YEAR_BANNER.match(top):
+            # '2022 UW YEAR' spans the row-1 cells; the column is named below it.
+            out.append(sub)
         elif top:
             out.append(top)
         elif sub:

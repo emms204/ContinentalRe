@@ -196,3 +196,6 @@ EXCEL_ERROR_STRINGS = frozenset({
 
 # Class label that Continental told Bisola to ignore (not a treaty class)
 FAC_CLASS_LABEL = "Facultative"
+
+
+SOURCE_WORKBOOK_SUFFIXES = frozenset({".xlsx", ".xls", ".xlsm", ".xlsb", ".ods"})

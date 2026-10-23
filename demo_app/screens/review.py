@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 from pathlib import Path
+import tempfile
+from zipfile import ZipFile, BadZipFile
 
 import pandas as pd
 import streamlit as st
@@ -34,9 +36,8 @@ def _resolve_ours_path() -> Path | None:
 def render() -> None:
     st.subheader("What's in the pack")
     st.caption(
-        "Upload workbook excludes audit logs; those are sidecars from the Run screen. "
-        "When a clean writes more than one workbook (e.g. currency split), pick which "
-        "to inspect below."
+        "Choose a cleaned workbook and sheet to preview. For a ZIP containing "
+        "multiple quarters or currencies, choose a workbook inside the archive."
     )
 
     entries = _resolve_entries()
@@ -69,7 +70,43 @@ def render() -> None:
             "Source upload(s): " + ", ".join(f"`{n}`" for n in upload_names)
         )
 
-    names = sheet_names(ours_path)
+    if ours_path.suffix.lower() == ".zip":
+        try:
+            with ZipFile(ours_path) as archive:
+                members = [item for item in archive.infolist() if not item.is_dir()
+                           and Path(item.filename).suffix.lower() in {".xlsx", ".xlsm", ".xls"}
+                           and not item.filename.startswith("__MACOSX/")]
+                if not members:
+                    st.info("This ZIP contains no Excel workbooks to review.")
+                    return
+                member_index = st.selectbox(
+                    "Workbook inside ZIP", options=list(range(len(members))),
+                    format_func=lambda index: members[index].filename,
+                    key="review_archive_member",
+                )
+                member = members[member_index]
+                st.caption(f"{len(members)} workbook(s) in archive · viewing {member.filename}")
+                # Read just the selected member to a fixed temporary filename.
+                # Never extract member paths into the filesystem.
+                with tempfile.TemporaryDirectory(prefix="cre_review_") as tmp:
+                    workbook = Path(tmp) / ("workbook" + Path(member.filename).suffix.lower())
+                    workbook.write_bytes(archive.read(member))
+                    _preview(workbook)
+        except (BadZipFile, OSError, ValueError, RuntimeError) as exc:
+            st.error(f"Could not read this ZIP: {exc}")
+        return
+    _preview(ours_path)
+
+
+def _preview(workbook: Path) -> None:
+    try:
+        _preview_workbook(workbook)
+    except Exception as exc:
+        st.error(f"Could not preview this workbook: {exc}")
+
+
+def _preview_workbook(workbook: Path) -> None:
+    names = sheet_names(workbook)
     data_sheets = [
         n
         for n in names
@@ -80,7 +117,7 @@ def render() -> None:
         return
 
     choice = st.selectbox("Sheet", options=data_sheets)
-    headers, rows = preview_sheet(ours_path, choice, max_rows=20)
+    headers, rows = preview_sheet(workbook, choice, max_rows=20)
     if not headers:
         st.info("Could not detect a header row on this sheet.")
         return

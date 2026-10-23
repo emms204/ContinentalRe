@@ -523,7 +523,10 @@
       "gen. accident",
       "general accidents",
       "gen accidents",
-      "general-acc"
+      "general-acc",
+      "PACKAGE",
+      "LIABILTY",
+      "LIABILITY"
     ],
     "cedent_id": "ab19215b-732f-47a6-87d8-8660bce37eac",
     "class_id": "42419482-adf3-4cc1-843f-d453cf0bbdd9",
@@ -1157,5 +1160,255 @@
       "terrorisminsurance",
       "terrorism-risk"
     ]
+  },
+  {
+    "cedent_id": "fb8c5de2-db41-40b2-a558-be71f0f55970",
+    "class_name": "agriculture",
+    "class_id": "fb2b550f-6482-5950-935d-fd66452b18e1",
+    "aliases": [
+      "agriculture"
+    ],
+    "variations": [],
+    "keywords": [],
+    "retention_limit": null,
+    "demo_seed": true,
+    "source": "Local demo template vocabulary; not a staging export"
+  },
+  {
+    "cedent_id": "0957404c-99a2-4624-997d-388a8b374549",
+    "class_name": "agriculture",
+    "class_id": "83bf849f-4d71-523c-a8d0-acc390c44e29",
+    "aliases": [
+      "agriculture"
+    ],
+    "variations": [],
+    "keywords": [],
+    "retention_limit": null,
+    "demo_seed": true,
+    "source": "Local demo template vocabulary; not a staging export"
+  },
+  {
+    "cedent_id": "0957404c-99a2-4624-997d-388a8b374549",
+    "class_name": "bond",
+    "class_id": "4deb8402-910f-5ba3-97b4-de0027787c22",
+    "aliases": [
+      "bond"
+    ],
+    "variations": [],
+    "keywords": [],
+    "retention_limit": null,
+    "demo_seed": true,
+    "source": "Local demo template vocabulary; not a staging export"
+  },
+  {
+    "cedent_id": "0957404c-99a2-4624-997d-388a8b374549",
+    "class_name": "engineering",
+    "class_id": "2a7a3a4e-15dd-5b2e-840b-ec66f4e86e25",
+    "aliases": [
+      "engineering"
+    ],
+    "variations": [],
+    "keywords": [],
+    "retention_limit": null,
+    "demo_seed": true,
+    "source": "Local demo template vocabulary; not a staging export"
+  },
+  {
+    "cedent_id": "0957404c-99a2-4624-997d-388a8b374549",
+    "class_name": "fire",
+    "class_id": "54a3b40a-30d0-5240-af56-95e3d0df8161",
+    "aliases": [
+      "fire"
+    ],
+    "variations": [],
+    "keywords": [],
+    "retention_limit": null,
+    "demo_seed": true,
+    "source": "Local demo template vocabulary; not a staging export"
+  },
+  {
+    "cedent_id": "0957404c-99a2-4624-997d-388a8b374549",
+    "class_name": "general_accident",
+    "class_id": "aceda190-ff0e-5c3a-b5c9-45c8396d9d58",
+    "aliases": [
+      "general_accident"
+    ],
+    "variations": [],
+    "keywords": [],
+    "retention_limit": null,
+    "demo_seed": true,
+    "source": "Local demo template vocabulary; not a staging export"
+  },
+  {
+    "cedent_id": "0957404c-99a2-4624-997d-388a8b374549",
+    "class_name": "marine_cargo",
+    "class_id": "a0554707-4ea2-59a8-9ef9-b379674b9c20",
+    "aliases": [
+      "marine_cargo",
+      "MARINE CLAIM",
+      "Marine"
+    ],
+    "variations": [],
+    "keywords": [],
+    "retention_limit": null,
+    "demo_seed": true,
+    "source": "Local demo template vocabulary; not a staging export"
+  },
+  {
+    "cedent_id": "0957404c-99a2-4624-997d-388a8b374549",
+    "class_name": "marine_hull",
+    "class_id": "cd39376d-166c-5bcf-ae9b-d989109fe351",
+    "aliases": [
+      "marine_hull"
+    ],
+    "variations": [],
+    "keywords": [],
+    "retention_limit": null,
+    "demo_seed": true,
+    "source": "Local demo template vocabulary; not a staging export"
+  },
+  {
+    "cedent_id": "0957404c-99a2-4624-997d-388a8b374549",
+    "class_name": "oil_and_energy",
+    "class_id": "db730d5e-9bb3-55fc-8d99-50df411155bd",
+    "aliases": [
+      "oil_and_energy"
+    ],
+    "variations": [],
+    "keywords": [],
+    "retention_limit": null,
+    "demo_seed": true,
+    "source": "Local demo template vocabulary; not a staging export"
+  },
+  {
+    "cedent_id": "0957404c-99a2-4624-997d-388a8b374549",
+    "class_name": "terrorism",
+    "class_id": "0b2a0615-c5b2-576b-a92a-bf67c97d2e47",
+    "aliases": [
+      "terrorism"
+    ],
+    "variations": [],
+    "keywords": [],
+    "retention_limit": null,
+    "demo_seed": true,
+    "source": "Local demo template vocabulary; not a staging export"
+  },
+  {
+    "cedent_id": "59c01ea9-f8bb-468d-9587-4e625d8c7240",
+    "class_name": "agriculture",
+    "class_id": "4d3db628-be20-5d21-881a-b4f028fd9b27",
+    "aliases": [
+      "agriculture"
+    ],
+    "variations": [],
+    "keywords": [],
+    "retention_limit": null,
+    "demo_seed": true,
+    "source": "Local demo template vocabulary; not a staging export"
+  },
+  {
+    "cedent_id": "59c01ea9-f8bb-468d-9587-4e625d8c7240",
+    "class_name": "bond",
+    "class_id": "bb9e8a6e-a3f8-5014-8e73-b245695da146",
+    "aliases": [
+      "bond"
+    ],
+    "variations": [],
+    "keywords": [],
+    "retention_limit": null,
+    "demo_seed": true,
+    "source": "Local demo template vocabulary; not a staging export"
+  },
+  {
+    "cedent_id": "59c01ea9-f8bb-468d-9587-4e625d8c7240",
+    "class_name": "engineering",
+    "class_id": "0dd9a121-833d-5026-802b-4e946a5299d6",
+    "aliases": [
+      "engineering"
+    ],
+    "variations": [],
+    "keywords": [],
+    "retention_limit": null,
+    "demo_seed": true,
+    "source": "Local demo template vocabulary; not a staging export"
+  },
+  {
+    "cedent_id": "59c01ea9-f8bb-468d-9587-4e625d8c7240",
+    "class_name": "fire",
+    "class_id": "d3c8a36e-5a92-513b-8f0d-35e17ff75094",
+    "aliases": [
+      "fire"
+    ],
+    "variations": [],
+    "keywords": [],
+    "retention_limit": null,
+    "demo_seed": true,
+    "source": "Local demo template vocabulary; not a staging export"
+  },
+  {
+    "cedent_id": "59c01ea9-f8bb-468d-9587-4e625d8c7240",
+    "class_name": "general_accident",
+    "class_id": "4b529186-be77-5e06-934e-f4d1ad26927f",
+    "aliases": [
+      "general_accident",
+      "MD/BI"
+    ],
+    "variations": [],
+    "keywords": [],
+    "retention_limit": null,
+    "demo_seed": true,
+    "source": "Local demo template vocabulary; not a staging export"
+  },
+  {
+    "cedent_id": "59c01ea9-f8bb-468d-9587-4e625d8c7240",
+    "class_name": "marine_cargo",
+    "class_id": "932c3206-4352-55d9-acd6-55657e80c1a4",
+    "aliases": [
+      "marine_cargo"
+    ],
+    "variations": [],
+    "keywords": [],
+    "retention_limit": null,
+    "demo_seed": true,
+    "source": "Local demo template vocabulary; not a staging export"
+  },
+  {
+    "cedent_id": "59c01ea9-f8bb-468d-9587-4e625d8c7240",
+    "class_name": "marine_hull",
+    "class_id": "870daa91-88f9-5aed-adcb-b0e37bfbcb75",
+    "aliases": [
+      "marine_hull"
+    ],
+    "variations": [],
+    "keywords": [],
+    "retention_limit": null,
+    "demo_seed": true,
+    "source": "Local demo template vocabulary; not a staging export"
+  },
+  {
+    "cedent_id": "59c01ea9-f8bb-468d-9587-4e625d8c7240",
+    "class_name": "oil_and_energy",
+    "class_id": "f6ca9f4e-1e13-5400-9d79-6978191f456b",
+    "aliases": [
+      "oil_and_energy"
+    ],
+    "variations": [],
+    "keywords": [],
+    "retention_limit": null,
+    "demo_seed": true,
+    "source": "Local demo template vocabulary; not a staging export"
+  },
+  {
+    "cedent_id": "59c01ea9-f8bb-468d-9587-4e625d8c7240",
+    "class_name": "terrorism",
+    "class_id": "67e183fb-a7f2-53eb-9754-42c5b9cb9aaf",
+    "aliases": [
+      "terrorism"
+    ],
+    "variations": [],
+    "keywords": [],
+    "retention_limit": null,
+    "demo_seed": true,
+    "source": "Local demo template vocabulary; not a staging export"
   }
 ]

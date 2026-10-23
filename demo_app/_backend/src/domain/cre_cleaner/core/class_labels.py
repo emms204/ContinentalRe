@@ -32,6 +32,7 @@ BISOLA_CLASS_ORDER: List[str] = [
     "Aviation",
     "Oil & Gas",
     "Travel",
+    "Life",
     FAC_CLASS_LABEL,  # opt-in only; default pipeline drops these sheets
 ]
 
@@ -86,17 +87,40 @@ _CLASS_MAP: Dict[str, str] = {
     "OIL AND GAS": "Oil & Gas",
     "OIL/GAS": "Oil & Gas",
     "TRAVEL": "Travel",
+    "LIFE": "Life",
 }
 
+
+# Bisola-approved General Accident subclasses apply across cedants. Keep
+# these whole-label only, so PL/GIT/ALL RISK cannot match unrelated words.
+APPROVED_GA_LABELS = frozenset(normalize_header(v) for v in (
+    'PL', 'PUBLIC LIABILITY', 'PL PUBLIC LIABILITY', 'WC', 'WORKMEN COMPENSATION',
+    "WORKMEN'S COMPENSATION", 'WORKMENS COMPENSATION', 'WC WORKMEN COMPENSATION',
+    'BURG', 'BURGLARY', 'ALL RISK', 'ALL RISKS', 'FG', 'FIDELITY GUARANTY',
+    'FIDELITY GUARANTEE', 'FIDELITY GUARANTEE INSURANCE', 'FIDELITY GUARANTY INSURANCE',
+    'MONEY', 'MONEY INSURANCE', 'GPA', 'GROUP PERSONAL ACCIDENT',
+    'PROF IND', 'PROFESSIONAL INDEMNITY', 'PROFESSIONAL INDEMITY',
+    'GIT', 'GOODS IN TRANSIT', 'GOOD IN TRANSIT', 'PUBLIC LIABILITY INSURANCE',
+    'FG FIDELITY GUARANTY', 'FG FIDELITY GUARANTEE', 'MONEY MONEY INSURANCE',
+    'GPA GROUP PERSONAL ACCIDENT', 'PROF IND PROFESSIONAL INDEMNITY',
+    'PROF IND PROFESSIONAL INDEMITY', 'GIT GOODS IN TRANSIT',
+    'WORKMEN COMPENSATION INSURANCE',
+    'THEFT AND BURGLARY INSURANCE', 'BURGLARY INSURANCE',
+))
+_CLASS_MAP.update({label: "General Accident" for label in APPROVED_GA_LABELS})
 
 # Keys matched only as the WHOLE normalized value, never as a substring in the
 # fallback of normalize_class_label (short keys that occur inside other words).
 # Adapters add their own via ``ClassMap.exact_only``.
-_EXACT_ONLY_KEYS: FrozenSet[str] = frozenset()
+_EXACT_ONLY_KEYS: FrozenSet[str] = frozenset({"LIFE"}) | APPROVED_GA_LABELS
 
 
 class ClassMap:
     """Generic class map plus one adapter's extra keys (never another's)."""
+
+    # Opt-in for adapters whose explicit parent banners must survive the
+    # single-class fallback. Run-local alias wrappers consult their base map.
+    source_parent_first = False
 
     def __init__(self, extra: Optional[Mapping[str, str]] = None,
                  exact_only: Iterable[str] = ()) -> None:
@@ -142,6 +166,9 @@ def normalize_class_label(raw: Optional[str], class_map: Optional[ClassMap] = No
         return "Other"
     if key in cmap.map:
         return cmap.map[key]
+    approved_key = normalize_header(str(raw))
+    if approved_key in APPROVED_GA_LABELS and approved_key in cmap.map:
+        return cmap.map[approved_key]
     # Word-start fallback (longest keys first): a key matches only where a
     # word of the label starts ("FIRE 1ST", "MCARGO 2ND SURP", "BONDS",
     # "GEN ACCD" for GEN ACC, "MOTORCYCLE"); digits may precede it. Never in
@@ -184,6 +211,52 @@ def approved_class_labels(class_map: Optional[ClassMap] = None) -> set:
     return labels
 
 
+def run_mapped_class(row) -> str:
+    """Template class a per-run mapping already placed on ``row`` (or ``""``)."""
+    audit = getattr(row, "audit", None)
+    return str(getattr(audit, "run_mapped_class", "") or "").strip()
+
+
+def record_class_override_allowed(row, class_map=None) -> bool:
+    """Opted-in partner + validated record-ID decision, never alias/inference."""
+    audit = getattr(row, 'audit', None)
+    return bool(getattr(_map_base(class_map), 'allow_record_class_override', False)
+                and run_mapped_class(row)
+                and getattr(audit, 'class_resolution', {}).get('record_mapping')
+                and run_mapped_class(row) in approved_class_labels(class_map))
+
+
+def row_class_label(row, raw, class_map: Optional[ClassMap] = None,
+                    single: Optional[str] = None) -> str:
+    """Class for one row.
+
+    A per-run mapping wins. On a single-class partner another class blocks,
+    except an adapter explicitly opting into validated record-ID overrides.
+    Alias mappings and inferred classifications never gain that exception.
+    """
+    audit = getattr(row, "audit", None)
+    if getattr(audit, "class_source", "") == "conflict" and not run_mapped_class(row):
+        return ""  # A source contradiction needs a record decision, never a stored alias.
+    mapped = run_mapped_class(row) or getattr(audit, "inferred_class", "")
+    single = single if single is not None else getattr(class_map, "single_class", None)
+    if mapped:
+        if single and mapped != single and not record_class_override_allowed(row, class_map):
+            return ""
+        return mapped
+    if single:
+        audit = getattr(row, "audit", None)
+        if getattr(_map_base(class_map), "source_parent_first", False):
+            source = getattr(audit, "class_source", "")
+            if source == "conflict":
+                return ""  # Only an explicit per-run decision can resolve this row.
+            if source == "banner":
+                parent = normalize_class_label(raw, class_map)
+                return parent if parent == single else ""
+        text = text_for_single_class(row, raw, class_map)
+        return resolve_class_label(text, class_map, single)
+    return normalize_class_label(raw, class_map)
+
+
 def unapproved_class_rows(rows, class_getter, class_map: Optional[ClassMap] = None):
     """Rows whose class does not resolve to an approved label.
 
@@ -192,15 +265,10 @@ def unapproved_class_rows(rows, class_getter, class_map: Optional[ClassMap] = No
     those rows are approved. A different approved class stays unapproved.
     """
     allowed = approved_class_labels(class_map)
-    single = getattr(class_map, "single_class", None)
     buckets: Dict[Tuple[str, str, str], int] = {}
     for row in rows:
         raw = (class_getter(row) or "").strip()
-        text = text_for_single_class(row, raw) if single else raw
-        label = (
-            resolve_class_label(text, class_map, single)
-            if single else normalize_class_label(raw, class_map)
-        )
+        label = row_class_label(row, raw, class_map)
         if label in allowed:
             continue
         audit = getattr(row, "audit", None)
@@ -244,6 +312,8 @@ def resolve_class_label(raw: Optional[str], class_map: Optional[ClassMap] = None
       resolves becomes the single class.
     * A different approved class returns ``\"\"`` so the run can answer
       ``class_outside_single_class`` instead of opening that class's sheet.
+      That includes a partner alias the store has confirmed to another class,
+      not only a hit in the built-in map.
     """
     single = single_class or getattr(class_map, "single_class", None)
     if not single:
@@ -255,6 +325,10 @@ def resolve_class_label(raw: Optional[str], class_map: Optional[ClassMap] = None
     store = early(raw) if early is not None else ""
     if store == single:
         return single
+    # Confirmed to a different approved class. Do not fold it into the
+    # single class: the pipeline blocks with class_outside_single_class.
+    if store and store in approved_class_labels(base):
+        return ""
     text = "" if raw is None else str(raw).strip()
     if not text or is_unresolved_class(text):
         return single
@@ -325,6 +399,8 @@ def banner_class_label(text: Optional[str]) -> str:
         found.add("Oil & Gas")
     if "TRAVEL" in toks:
         found.add("Travel")
+    if "LIFE" in toks and " NON LIFE " not in joined:
+        found.add("Life")
     if any(t.startswith("ENGIN") for t in toks) or "ENG" in toks:
         found.add("Engineering")
     if "FIRE" in toks:
@@ -383,15 +459,21 @@ def ordered_class_labels(labels: Iterable[str]) -> List[str]:
     return seen
 
 
-def text_for_single_class(row, hint: str) -> str:
+def text_for_single_class(row, hint: str, class_map: Optional[ClassMap] = None) -> str:
     """Label the single-class resolver should see.
 
     A section banner collapses ``PLANTATION FIRE`` to ``Fire`` and stores
     that on ``class_hint``. The banner text stays on ``class_label_raw``.
     The store alias is on that raw text, so a raw label that differs from
     the collapsed hint is what gets resolved.
+
+    Adapters opting into source_parent_first retain the authoritative parent
+    instead; a subclass alias cannot silently replace a contrary parent.
     """
     audit = getattr(row, "audit", None)
+    if (getattr(_map_base(class_map), "source_parent_first", False)
+            and getattr(audit, "class_source", "") in {"banner", "conflict"}):
+        return (hint or "").strip()
     raw = (getattr(audit, "class_label_raw", "") or "").strip()
     hint = (hint or "").strip()
     if raw and raw.casefold() != hint.casefold():
@@ -408,11 +490,9 @@ def group_rows_by_class(rows: Sequence, class_getter,
     sheet (the pipeline blocks the run before this write).
     """
     out: Dict[str, list] = {}
-    single = getattr(class_map, "single_class", None)
     for r in rows:
         raw = class_getter(r)
-        text = text_for_single_class(r, raw) if single else raw
-        lab = resolve_class_label(text, class_map, single) if single else normalize_class_label(raw, class_map)
+        lab = row_class_label(r, raw, class_map)
         if not lab:
             continue
         out.setdefault(lab, []).append(r)

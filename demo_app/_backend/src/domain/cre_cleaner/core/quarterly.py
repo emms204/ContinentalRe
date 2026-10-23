@@ -8,8 +8,9 @@ from collections import Counter, defaultdict
 from datetime import date, datetime
 from itertools import combinations
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
+from src.domain.cre_cleaner.core.class_resolution import source_digest
 from src.domain.cre_cleaner.core.class_labels import (
     banner_class_label,
     is_fac_sheet_name,
@@ -17,9 +18,12 @@ from src.domain.cre_cleaner.core.class_labels import (
     normalize_class_label,
 )
 from src.domain.cre_cleaner.core.detect import (
+    SUMMARY_TAB_AUDIT_NOTE,
     detect_sheet_type,
     find_header_row,
     class_from_sheet_name,
+    re_sub_spaces,
+    summary_tab_word,
 )
 from src.domain.cre_cleaner.core.filters import (
     DATE_TXT,
@@ -58,6 +62,7 @@ from src.domain.cre_cleaner.core.normalize import (
     currency_code,
     currency_codes,
     currency_filter_code,
+    format_amount,
     prefer_named_over_fcy,
     parse_number,
     parse_date,
@@ -95,6 +100,36 @@ def _workbook_currency_filter_hint(
 def _sheet_base_name(sn: str) -> str:
     m = _COPY_SHEET_RE.match(str(sn).strip())
     return (m.group("base") if m else str(sn)).strip()
+
+
+def _copy_tab_premium_size(path: Path, sn: str, raw_rows: List[List[Any]], adapter: Any) -> Tuple[int, str]:
+    """Data rows and gross premium on a premium copy tab that is not loaded
+    (header-mapped like a real tab; total and blank rows not counted)."""
+    hdr = find_header_row(raw_rows, "premium")
+    if hdr is None:
+        return 0, format_amount(0)
+    header, group_row, data_start = _premium_header_with_subrow(
+        raw_rows, hdr, merge=bool(getattr(adapter, "band_subrow_layout", True)))
+    if adapter is not None:
+        cmap = adapter.map_premium_columns(header, group_row, path=path, sheet=sn, exceptions=[])
+    else:
+        cmap = detect_premium_allocation_blocks(header, group_row)
+    key_cols = [cmap.get("insured"), cmap.get("policy_no")]
+    n, total = 0, 0.0
+    for row in raw_rows[data_start:]:
+        if is_blank_row(row) or looks_like_total_row(row, key_cols):
+            continue
+        n += 1
+        total += parse_number(cell(row, cmap.get("gross_premium"))) or 0.0
+    return n, format_amount(total)
+
+
+def _copy_tab_warning(path: Path, sn: str, n_rows: int, amount: str) -> ExceptionRecord:
+    return ExceptionRecord(
+        "WARN", "duplicate_sheet_skipped", path.name, sn, 0,
+        f"Tab name marks it as a copy of {_sheet_base_name(sn)!r}, so it is not loaded: "
+        f"{n_rows} rows, {amount} left out. Check it really repeats that tab.",
+    )
 
 
 def _is_duplicate_copy_sheet(sn: str, all_names: Sequence[str]) -> bool:
@@ -188,6 +223,65 @@ def _claims_header_with_subrow(
     return merge_group_subheaders(header, sub), header_at + 2
 
 
+_BAND_ROW_WORD_RE = re.compile(r"RETEN|TREATY|SURPLUS|QUOTA|FACULTATIVE", re.IGNORECASE)
+_BAND_ROW_MIN_CELLS = 3
+
+
+def _looks_like_band_row(row: Sequence[Any]) -> bool:
+    filled = [clean_text(c) for c in row if clean_text(c)]
+    return len(filled) >= _BAND_ROW_MIN_CELLS and any(_BAND_ROW_WORD_RE.search(c) for c in filled)
+
+
+_CLASS_LABEL_RE = re.compile(r"^\s*CLASS(?:ES)?(?:\s+OF\s+BUSINESS)?\s*:?\s*(.*)$", re.IGNORECASE)
+
+
+def _banner_text(cells: Sequence[str]) -> str:
+    """Candidate section-banner text of a row's non-empty cells: a lone cell,
+    or the value of a 'CLASS OF BUSINESS: | FIRE' label row ('' otherwise)."""
+    if len(cells) == 1:
+        m = _CLASS_LABEL_RE.match(cells[0])
+        return m.group(1).strip() if m and m.group(1).strip() else cells[0]
+    if len(cells) == 2:
+        m = _CLASS_LABEL_RE.match(cells[0])
+        if m and not m.group(1).strip():
+            return cells[1]
+    return ""
+
+
+_TRAILER_RE = re.compile(
+    r"^\s*(?:GRAND\s+|SUB[\s-]?)?TOTAL\b\s*(?:FOR\b)?\s*(.*?)\s*$|^\s*(.+?)\s+TOTAL\s*$",
+    re.IGNORECASE,
+)
+_TRAILER_NOISE_RE = re.compile(r"\bFOR\b|\b(?:19|20)\d{2}\b|[()]", re.IGNORECASE)
+
+
+def _section_banner_label(adapter: Any, cells: Sequence[str], text: str) -> str:
+    """Premium section-banner class: the adapter's reading of the row when it
+    has one (``premium_banner_label`` returns None to defer), else keywords."""
+    reader = getattr(adapter, "premium_banner_label", None)
+    if callable(reader):
+        label = reader(cells, text)
+        if label is not None:
+            return label
+    return banner_class_label(text)
+
+
+def _trailer_class_text(row: Sequence[Any]) -> str:
+    """Class named by a block total row ('TOTAL FOR FIRE', 'TOTAL FIRE FOR
+    2020', 'GRAND TOTAL FOR G.ACCIDENT', 'ENG. TOTAL'), or ''."""
+    for c in row:
+        if not isinstance(c, str) or "TOTAL" not in c.upper():
+            continue
+        m = _TRAILER_RE.match(c)
+        if not m:
+            return ""
+        rest = re_sub_spaces(_TRAILER_NOISE_RE.sub(" ", m.group(1) or m.group(2) or "")).strip(" .-:")
+        if rest and (banner_class_label(rest) or normalize_class_label(rest) not in ("", "Other")):
+            return rest
+        return ""
+    return ""
+
+
 def _premium_header_with_subrow(
     raw_rows: List[List[Any]], header_at: int, merge: bool = False,
 ) -> Tuple[List[Any], Optional[List[Any]], int]:
@@ -195,6 +289,9 @@ def _premium_header_with_subrow(
     with ``band_subrow_layout = False``). Returns (header, group_row, data_start)."""
     header = raw_rows[header_at]
     group_row = raw_rows[header_at - 1] if header_at > 0 else None
+    if group_row is not None and is_blank_row(group_row) and header_at > 1 and \
+            _looks_like_band_row(raw_rows[header_at - 2]):
+        group_row = raw_rows[header_at - 2]
     data_start = header_at + 1
     if not merge or header_at + 1 >= len(raw_rows):
         return list(header), group_row, data_start
@@ -205,16 +302,20 @@ def _premium_header_with_subrow(
     return merge_group_subheaders(header, sub), group_row, header_at + 2
 
 
-def _load_source(path: Path) -> Tuple[Dict[str, List[List[Any]]], List[ExceptionRecord], Dict[str, int]]:
+def _load_source(path: Path, adapter: Any = None) -> Tuple[Dict[str, List[List[Any]]], List[ExceptionRecord], Dict[str, int]]:
     """Read a source workbook without hidden sheets/rows; hidden content is
     logged, and hidden data rows are counted per sheet for reconciliation."""
-    sheets, notes = read_source_workbook(path)
+    source_reader = getattr(adapter, "read_source_workbook", read_source_workbook)
+    sheets, notes = source_reader(path)
     exc = [ExceptionRecord(sev, reason, path.name, sn, row, detail)
            for sev, reason, sn, row, detail in notes]
     hidden_count: Dict[str, int] = defaultdict(int)
     for _sev, reason, sn, _row, _detail in notes:
         if reason == "hidden_row_skipped":
             hidden_count[sn] += 1
+    if adapter is not None and hasattr(adapter, "prepare_source_sheet"):
+        sheets = {sn: adapter.prepare_source_sheet(sn, rows, path=path, exceptions=exc)
+                  for sn, rows in sheets.items()}
     return sheets, exc, hidden_count
 
 
@@ -393,30 +494,51 @@ class _SheetTotals:
         return rec
 
 
-def _footer_values(row: Sequence[Any], metric_cols: Dict[str, Optional[int]]) -> Dict[str, float]:
+def _sum_present(values: Iterable[Optional[float]]) -> Optional[float]:
+    values = [v for v in values if v is not None]
+    return sum(values) if values else None
+
+
+def _source_columns(index: Any) -> Tuple[int, ...]:
+    return index if isinstance(index, tuple) else (() if index is None else (index,))
+
+
+def _footer_values(row: Sequence[Any], metric_cols: Dict[str, Any]) -> Dict[str, float]:
     out = {}
     for k, i in metric_cols.items():
         if i is None:
             continue
-        v = parse_number(cell(row, i))
+        v = _sum_present(parse_number(cell(row, col)) for col in _source_columns(i))
         if v is not None:
             out[k] = v
     return out
 
 
-def _footer_cells(values: Dict[str, float], metric_cols: Dict[str, Optional[int]],
+def _footer_cells(values: Dict[str, float], metric_cols: Dict[str, Any],
                   excel_row: int) -> Dict[str, str]:
     """{metric: cell reference} of a printed total row (0-based column indices)."""
     from openpyxl.utils import get_column_letter
-    return {k: f"{get_column_letter(metric_cols[k] + 1)}{excel_row}"
+    return {k: " + ".join(f"{get_column_letter(i + 1)}{excel_row}"
+                           for i in _source_columns(metric_cols[k]))
             for k in values if metric_cols.get(k) is not None}
 
 
 def _is_footer_row(row: Sequence[Any], insured: str, policy: str, values: Dict[str, float]) -> bool:
     """Cedant total row: no insured/policy, an amount in a mapped amount
     column, and either 'TOTAL' text or no words at all."""
-    if insured or policy or not values:
+    if not values:
         return False
+    # Cedants also put a total label in the policy/insured cell. It is still
+    # a footer, and must participate in reconciliation instead of being
+    # skipped before the later grand total can replace segment subtotals.
+    for identity in (insured, policy):
+        if not identity:
+            continue
+        norm = normalize_header(identity)
+        if norm not in {"TOTAL", "GRAND TOTAL", "SUB TOTAL", "SUBTOTAL"} \
+                and not _trailer_class_text([identity]) \
+                and not re.match(r"^(?:GRAND )?SUMMARY TOTALS?\b", norm):
+            return False
     text = " ".join(clean_text(c).upper() for c in row if isinstance(c, str))
     return "TOTAL" in text or not any(ch.isalpha() for ch in text)
 
@@ -429,15 +551,35 @@ def _date_or_flag(raw: Any, field: str, flag) -> Any:
     return d
 
 
+_TO_WORD_RE = re.compile(r"^\s*T?O\s+(?=\S)", re.IGNORECASE)
+
+
+def _strip_to_word(raw: Any) -> Any:
+    """'o 2023-08-04' / 'To 2023-08-04' → '2023-08-04': a 'FROM To TO' cell
+    split into two columns at a fixed width leaves the word on the TO side."""
+    if isinstance(raw, str) and parse_date(raw) is None:
+        rest = _TO_WORD_RE.sub("", raw, count=1)
+        if rest != raw and parse_date(rest) is not None:
+            return rest
+    return raw
+
+
 def _period_cells(row, cmap: ColumnMap, header: Sequence[Any], flag) -> Tuple[Any, Any]:
     """FROM/TO from a single PERIOD cell ('dd/mm/yyyy - dd/mm/yyyy') or FROM/TO
     columns. A PERIOD header spanning two cells (merged, blank header on the
     right) holds TO in the next column."""
     pi = cmap.get("period")
     if pi is None:
+        raw_from = cell(row, cmap.get("period_from"))
+        raw_to = _strip_to_word(cell(row, cmap.get("period_to")))
+        if parse_date(raw_from) is None and parse_date(raw_to) is None:
+            # A FROM column holding the whole cover ('2023-07-11 To 2024-07-09').
+            a, b = parse_period(raw_from)
+            if a is not None and b is not None:
+                return a, b
         return (
-            _date_or_flag(cell(row, cmap.get("period_from")), "FROM", flag),
-            _date_or_flag(cell(row, cmap.get("period_to")), "TO", flag),
+            _date_or_flag(raw_from, "FROM", flag),
+            _date_or_flag(raw_to, "TO", flag),
         )
     raw = cell(row, pi)
     period_from, period_to = parse_period(raw)
@@ -447,6 +589,9 @@ def _period_cells(row, cmap: ColumnMap, header: Sequence[Any], flag) -> Tuple[An
         nxt = cell(row, pi + 1)
         if parse_date(nxt) is not None:
             period_to = parse_date(nxt)
+    to_i = cmap.get("period_to")
+    if period_to is None and to_i is not None and to_i != pi:
+        period_to = _date_or_flag(_strip_to_word(cell(row, to_i)), "TO", flag)
     return period_from, period_to
 
 
@@ -552,7 +697,13 @@ def _repeated_headers(raw_rows: List[List[Any]], hdr_i: int) -> List[int]:
     return out
 
 
-def _treaty_layer_note(path: Path, sn: str, primary: str, extras: Sequence[str]) -> ExceptionRecord:
+def _treaty_layer_note(path: Path, sn: str, primary: str, extras: Sequence[str], combined=False) -> ExceptionRecord:
+    if combined:
+        return ExceptionRecord(
+            "INFO", "treaty_layers_combined", path.name, sn, 0,
+            f"TREATY is the sum of distinct source allocations: {primary}, {', '.join(extras)}; "
+            "source layer values retained per row and in reconciliation",
+        )
     return ExceptionRecord(
         "WARN", "multiple_treaty_layers", path.name, sn, 0,
         f"{len(extras) + 1} treaty layers: {primary or 'TREATY'} → TREATY band; "
@@ -561,11 +712,32 @@ def _treaty_layer_note(path: Path, sn: str, primary: str, extras: Sequence[str])
     )
 
 
-def _premium_metric_cols(cmap: ColumnMap) -> Dict[str, Optional[int]]:
+def _warn_layers_left_out(exceptions: List[ExceptionRecord], path: Path, sn: str, excel_row: int,
+                          layers: Sequence[Dict[str, Any]], key: str, currency: str) -> None:
+    """WARN per row whose further treaty layers (quota share, 2nd surplus …)
+    carry money outside the TREATY band: the upload has three bands, and how
+    to place the other layers is open with Bisola."""
+    left = [(str(lay.get("layer", "")), lay[key]) for lay in layers if lay.get(key) and not lay.get("included_in_treaty_total")]
+    if not left:
+        return
+    parts = ", ".join(f"{label} {format_amount(v, currency)}" for label, v in left)
+    exceptions.append(ExceptionRecord(
+        "WARN", "treaty_layer_left_out", path.name, sn, excel_row,
+        f"{parts} left out of the TREATY band "
+        f"({format_amount(sum(v for _l, v in left), currency)} in total); kept per row "
+        "outside the upload columns — layers beyond RET / TREATY / FAC are open with Bisola",
+        amount=sum(v for _l, v in left), currency=currency,
+    ))
+
+
+def _premium_metric_cols(cmap: ColumnMap) -> Dict[str, Any]:
     cols = {"gross": cmap.get("gross_premium"), "ret": cmap.ret_prem,
             "treaty": cmap.sur_prem, "fac": cmap.fac_prem}
     for label, _p, _s, pr in cmap.extra_treaty_blocks:
         cols[f"layer:{label}"] = pr
+    if cmap.combine_treaty_layers:
+        cols["treaty"] = tuple(dict.fromkeys(i for i in
+            [cmap.sur_prem] + [b[3] for b in cmap.extra_treaty_blocks] if i is not None))
     return cols
 
 
@@ -586,11 +758,19 @@ def _typed_sheet(path: Path, sn: str, raw_rows: List[List[Any]], legacy_st: str,
     logged. Other adapters keep the name rules; the content type is advisory
     and a disagreement is logged.
     """
-    tt = classify_tab(path.name, sn, raw_rows, vocab=_adapter_rules(adapter)[1])
+    classify_source_tab = getattr(adapter, "classify_source_tab", None)
+    tt = (classify_source_tab(path.name, sn, raw_rows) if classify_source_tab else
+          classify_tab(path.name, sn, raw_rows, vocab=_adapter_rules(adapter)[1]))
     content = tt.sheet_type
     loadable = {"premium", "paid", "outstanding"}
     first = next((t.header_row for t in tt.tables if t.header_row >= 0), -1) + 1
     if not getattr(adapter, "content_sheet_typing", False):
+        if content == "premium" and legacy_st == "skip" and getattr(adapter, "recover_premium_from_content", False):
+            exceptions.append(ExceptionRecord(
+                "INFO", "table_type_from_content", path.name, sn, first,
+                f"Premium table recovered from content: {tt.audit_text()[:600]}",
+            ))
+            return content, tt
         if content in loadable and content != legacy_st:
             exceptions.append(ExceptionRecord(
                 "INFO", "table_type_disagrees", path.name, sn, first,
@@ -627,6 +807,11 @@ def _audit_hidden_tabs(path: Path, exceptions: List[ExceptionRecord], adapter: A
              if e.reason == "hidden_sheet_skipped" and e.source_filename == path.name]
     if not names:
         return []
+    if not getattr(adapter, "audit_hidden_contents", True):
+        return [SourceAuditRecord(
+            path.name, sn, "hidden_skip", 0, 0, 0, 0, source_month,
+            "hidden sheet — contents not inspected or loaded",
+        ) for sn in names]
     try:
         allsh = read_workbook_sheets(path)
     except Exception:  # pragma: no cover - reader already succeeded once
@@ -663,6 +848,53 @@ _PREMIUM_MONEY_ATTRS = (
 def _col_letter(idx: int) -> str:
     from openpyxl.utils import get_column_letter
     return get_column_letter(idx + 1)
+
+
+_DETAILS_MIN_CHARS = 15
+_DETAILS_MIN_SHARE = 0.5
+_DETAILS_MIN_ROWS = 2
+# A remarks column on a few rows repeats itself ('PORT HARCOURT BRANCH' x4,
+# 'Ceded 3rd qtr' x3); loss narratives fill most claim rows or, when sparse,
+# still differ from claim to claim.
+_DETAILS_MIN_FILL = 0.25
+_DETAILS_MIN_DISTINCT = 5
+
+
+def _unlabelled_details_column(
+    header: Sequence[Any], rows: Sequence[Sequence[Any]], cmap: ColumnMap,
+) -> Optional[int]:
+    """First blank-header column right of the mapped claims columns that holds
+    loss descriptions, judged on rows with a total-claims amount: no number or
+    date; at least half of its filled cells are text over ``_DETAILS_MIN_CHARS``
+    characters (``_DETAILS_MIN_ROWS`` such cells, or every data row if fewer);
+    and either filled on ``_DETAILS_MIN_FILL`` of the rows or holding at least
+    ``_DETAILS_MIN_DISTINCT`` different texts, half of its long texts distinct."""
+    used = [i for i in cmap.mapping.values() if i is not None]
+    used += [i for i, _lab in getattr(cmap, "extra_amount_columns", [])]
+    if not used or cmap.get("details") is not None:
+        return None
+    total_i = cmap.get("total_claims")
+    data = [r for r in rows if not is_blank_row(r)
+            and (total_i is None or parse_number(cell(r, total_i)) is not None)]
+    if not data:
+        return None
+    width = max(len(r) for r in data)
+    for idx in range(max(used) + 1, width):
+        if idx < len(header) and clean_text(header[idx]):
+            continue
+        filled = [r[idx] for r in data if idx < len(r) and clean_text(r[idx])]
+        if not filled:
+            continue
+        if any(isinstance(v, (int, float, date, datetime)) and not isinstance(v, bool) for v in filled):
+            continue
+        long_text = [clean_text(v) for v in filled if len(clean_text(v)) > _DETAILS_MIN_CHARS]
+        if len(long_text) < min(_DETAILS_MIN_ROWS, len(data)) or len(long_text) < _DETAILS_MIN_SHARE * len(filled):
+            continue
+        distinct = len(set(long_text))
+        if len(filled) >= _DETAILS_MIN_FILL * len(data) or (
+                distinct >= _DETAILS_MIN_DISTINCT and distinct >= _DETAILS_MIN_SHARE * len(long_text)):
+            return idx
+    return None
 
 
 def _as_date(value: Any):
@@ -726,8 +958,8 @@ def _majority_kind(values: Sequence[Any]) -> Optional[str]:
     return None
 
 
-def _money_column_indexes(cmap: ColumnMap, kind: str, metric_cols: Dict[str, Optional[int]]) -> Set[int]:
-    found = {idx for idx in metric_cols.values() if isinstance(idx, int)}
+def _money_column_indexes(cmap: ColumnMap, kind: str, metric_cols: Dict[str, Any]) -> Set[int]:
+    found = {i for idx in metric_cols.values() for i in _source_columns(idx)}
     if kind == "premium":
         for name in ("sum_insured", "gross_premium"):
             idx = cmap.get(name)
@@ -772,7 +1004,7 @@ def _role_text(roles: Dict[str, int]) -> str:
 
 
 def _separator_row(row: Sequence[Any], cmap: ColumnMap, kind: str,
-                   metric_cols: Dict[str, Optional[int]]) -> bool:
+                   metric_cols: Dict[str, Any]) -> bool:
     if is_blank_row(row):
         return True
     insured_i = cmap.get("insured")
@@ -801,6 +1033,8 @@ def _period_pair(row: Sequence[Any], cmap: ColumnMap, header: Sequence[Any]) -> 
     to_cell = None
     if header is not None and not clean_text(cell(header, period_i + 1)):
         to_cell = cell(row, period_i + 1)
+    elif cmap.get("period_to") is not None and cmap.get("period_to") != period_i:
+        to_cell = cell(row, cmap.get("period_to"))
     return cell(row, period_i), to_cell
 
 
@@ -858,13 +1092,15 @@ def _row_consistent(row: Sequence[Any], cmap: ColumnMap, kind: str) -> Optional[
         checks = []
         gross = _amount(row, cmap.get("gross_premium"))
         ret_prem = _amount(row, cmap.ret_prem)
-        treaty_prem = _amount(row, cmap.sur_prem)
+        treaty_prem = _sum_present([_amount(row, cmap.sur_prem)] +
+            [_amount(row, b[3]) for b in cmap.extra_treaty_blocks]) if cmap.combine_treaty_layers else _amount(row, cmap.sur_prem)
         fac_prem = _amount(row, cmap.fac_prem)
         if gross not in (None, 0) and ret_prem is not None and treaty_prem is not None:
             total = ret_prem + treaty_prem + (fac_prem if fac_prem is not None else 0)
             checks.append(abs(total - gross) <= abs(gross) * 0.01 + 1e-6)
         ret_ppn = _amount(row, cmap.ret_ppn)
-        treaty_ppn = _amount(row, cmap.sur_ppn)
+        treaty_ppn = _sum_present([_amount(row, cmap.sur_ppn)] +
+            [_amount(row, b[1]) for b in cmap.extra_treaty_blocks]) if cmap.combine_treaty_layers else _amount(row, cmap.sur_ppn)
         fac_ppn = _amount(row, cmap.fac_ppn)
         if ret_ppn is not None and treaty_ppn is not None:
             total = ret_ppn + treaty_ppn + (fac_ppn if fac_ppn is not None else 0)
@@ -875,6 +1111,8 @@ def _row_consistent(row: Sequence[Any], cmap: ColumnMap, kind: str) -> Optional[
     total = _amount(row, cmap.get("total_claims"))
     ret = _amount(row, cmap.get("amount_ret"))
     treaty = _amount(row, cmap.get("amount_treaty"))
+    if cmap.combine_treaty_layers:
+        treaty = _sum_present([treaty] + [_amount(row, i) for i, _ in cmap.extra_amount_columns])
     fac = _amount(row, cmap.get("amount_fac"))
     if total in (None, 0) or ret is None or treaty is None:
         return None
@@ -1064,7 +1302,8 @@ def _plan_headerless_block(
     header_at: int,
     exceptions: List[ExceptionRecord],
     kind: str,
-    metric_cols: Dict[str, Optional[int]],
+    metric_cols: Dict[str, Any],
+    adapter: Any = None,
 ) -> Tuple[Dict[int, ColumnMap], Set[int], List[List[int]]]:
     """Re-map a headerless shifted run inside one header block.
 
@@ -1098,6 +1337,12 @@ def _plan_headerless_block(
         rows = [raw_rows[ridx] for ridx in piece]
         first = piece[0] + 1
         last = piece[-1] + 1
+        verify_layout = getattr(adapter, "retains_explicit_header_layout", None)
+        if verify_layout and verify_layout(header, cmap, rows, kind):
+            exceptions.append(ExceptionRecord("INFO", "source_header_layout_verified",
+                path.name, sheet, first,
+                f"Rows {first}–{last}: declared identity columns retained after adapter checks of class, dates and source allocations"))
+            continue
         width = max((len(row) for row in rows), default=0)
         candidates = [idx for idx in range(width) if idx not in money_idxs]
         types = {
@@ -1285,7 +1530,7 @@ def parse_premium_file(
     adapter: Any = None,
 ) -> Tuple[List[PremiumRow], List[ExceptionRecord], List[SourceAuditRecord]]:
     path = Path(path)
-    sheets, exceptions, hidden_count = _load_source(path)
+    sheets, exceptions, hidden_count = _load_source(path, adapter=adapter)
     rows_out: List[PremiumRow] = []
     audit: List[SourceAuditRecord] = []
     file_ccy_hint = _workbook_currency_filter_hint(sheets)
@@ -1307,10 +1552,7 @@ def parse_premium_file(
             ))
             continue
         if _is_duplicate_copy_sheet(sn, sheet_names):
-            exceptions.append(ExceptionRecord(
-                "INFO", "duplicate_sheet_skipped", path.name, sn, 0,
-                f"Copy sheet skipped; using base tab {_sheet_base_name(sn)!r}",
-            ))
+            exceptions.append(_copy_tab_warning(path, sn, *_copy_tab_premium_size(path, sn, raw_rows, adapter)))
             audit.append(SourceAuditRecord(
                 source_filename=path.name,
                 source_sheet=sn,
@@ -1327,6 +1569,8 @@ def parse_premium_file(
                               adapter, exceptions)
         if st != "premium":
             note = "skipped non-premium sheet in premium file"
+            if st == "skip" and summary_tab_word(sn):
+                note = SUMMARY_TAB_AUDIT_NOTE.format(word=summary_tab_word(sn))
             if st in ("paid", "outstanding") and getattr(adapter, "content_sheet_typing", False):
                 note = (f"{st} table in premium file — not loaded here (claims come from the "
                         "claims files; see secondary-source check)")
@@ -1345,6 +1589,10 @@ def parse_premium_file(
             continue
 
         hdr_i = find_header_row(raw_rows, "premium")
+        if hdr_i is None and getattr(adapter, "premium_header_scan_all", False):
+            hdr_i = find_header_row(raw_rows, "premium", max_scan=len(raw_rows))
+        if hdr_i is not None and hasattr(adapter, "premium_header_row"):
+            hdr_i = adapter.premium_header_row(raw_rows, hdr_i)
         header_override: Dict[int, Tuple[List[Any], Optional[List[Any]]]] = {}
         if hdr_i is None:
             positional = _positional_header(adapter, "premium", raw_rows, path, sn, exceptions)
@@ -1361,7 +1609,11 @@ def parse_premium_file(
             ))
             continue
 
-        class_hint = class_from_sheet_name(sn)
+        class_hint = class_from_sheet_name(sn, sheet_rules)
+        if hasattr(adapter, "sheet_class_hint"):
+            class_hint = adapter.sheet_class_hint(sn, class_hint)
+        if getattr(adapter, "strict_sheet_class_hints", False) and not is_unresolved_class(class_hint) and not normalize_class_label(class_hint, class_map):
+            class_hint = ""
         ccy_top = max(hdr_i + 1, 1)
         ccy = _SheetCurrency(
             path, sn, raw_rows[: ccy_top], exceptions,
@@ -1370,6 +1622,8 @@ def parse_premium_file(
         totals = _SheetTotals("gross")
         # Positional layouts have no real header rows to re-detect.
         header_indices = [hdr_i] if header_override else _repeated_headers(raw_rows, hdr_i)
+        if adapter is not None and hasattr(adapter, "premium_header_indices"):
+            header_indices = adapter.premium_header_indices(raw_rows, header_indices)
         banner_class = ""
         banner_raw = ""
         banners_seen: List[str] = []
@@ -1389,6 +1643,9 @@ def parse_premium_file(
             else:
                 header, group_row, data_start = _premium_header_with_subrow(
                     raw_rows, header_at, merge=bool(getattr(adapter, "band_subrow_layout", True)))
+                if hasattr(adapter, "premium_header_cells"):
+                    header, group_row = adapter.premium_header_cells(
+                        raw_rows, header_at, header, group_row)
             if adapter is not None:
                 cmap = adapter.map_premium_columns(header, group_row, path=path, sheet=sn,
                                                    exceptions=exceptions)
@@ -1429,19 +1686,20 @@ def parse_premium_file(
             # row above the rows, else the first cell of the band row (manual:
             # source grouping > row class > section/sheet heading > mapping >
             # exception).
-            if not class_hint:
+            if not class_hint or getattr(adapter, "premium_section_class_first", False):
                 found = False
                 stop = header_indices[hi - 1] if hi else -1
                 scan_from = header_at if header_at in header_override else header_at - 1
                 for bi in range(scan_from, max(stop, header_at - 11), -1):
                     if bi < 0 or bi >= len(raw_rows):
                         continue
-                    ne = [clean_text(c) for c in raw_rows[bi] if clean_text(c)]
-                    if len(ne) == 1:
-                        lab = banner_class_label(ne[0])
+                    cells = [clean_text(c) for c in raw_rows[bi] if clean_text(c)]
+                    bt = _banner_text(cells)
+                    if bt:
+                        lab = _section_banner_label(adapter, cells, bt)
                         if lab:
-                            banner_class, banner_raw = lab, ne[0]
-                            banners_seen.append(f"{ne[0]!r}@r{bi + 1}->{lab}")
+                            banner_class, banner_raw = lab, bt
+                            banners_seen.append(f"{bt!r}@r{bi + 1}->{lab}")
                             found = True
                             break
                 if not found and group_row and header_at not in header_override:
@@ -1457,8 +1715,19 @@ def parse_premium_file(
             block_maps, block_skip, block_groups = _plan_headerless_block(
                 raw_rows, data_start, end, header_cmap, header, path, sn,
                 header_at, exceptions, "premium", metric_cols,
+                adapter=adapter,
             )
             remapped_groups.extend(block_groups)
+
+            source_layouts = getattr(adapter, "premium_source_layouts", None)
+            if source_layouts:
+                source_maps, source_skip = source_layouts(
+                    raw_rows, data_start, end, header_cmap,
+                    path=path, sheet=sn, exceptions=exceptions,
+                )
+                block_maps.update(source_maps)
+                block_skip.difference_update(source_maps)
+                block_skip.update(source_skip)
 
             for ridx in range(data_start, end):
                 row = raw_rows[ridx]
@@ -1476,14 +1745,15 @@ def parse_premium_file(
                     # Band-label row of the next header block, not data.
                     continue
                 read_n += 1
-                if not class_hint:
-                    ne = [clean_text(c) for c in row if clean_text(c)]
-                    if len(ne) == 1:
-                        lab = banner_class_label(ne[0])
+                if not class_hint or getattr(adapter, "premium_section_class_first", False):
+                    cells = [clean_text(c) for c in row if clean_text(c)]
+                    bt = _banner_text(cells)
+                    if bt:
+                        lab = _section_banner_label(adapter, cells, bt)
                         if lab:
                             # Section banner row: sets class, never output itself.
-                            banner_class, banner_raw = lab, ne[0]
-                            banners_seen.append(f"{ne[0]!r}@r{excel_row}->{lab}")
+                            banner_class, banner_raw = lab, bt
+                            banners_seen.append(f"{bt!r}@r{excel_row}->{lab}")
                             skipped += 1
                             continue
                 if is_nil_row(row):
@@ -1570,6 +1840,13 @@ def parse_premium_file(
                     )
                     class_raw = sn if class_hint else (row_class_raw or banner_raw)
 
+                resolver = getattr(adapter, "resolve_premium_class", None)
+                if callable(resolver):
+                    effective_class, class_source, class_raw = resolver(
+                        sheet_hint=class_hint, section=banner_class, raw=row_class_raw,
+                        exceptions=exceptions, path=path, sheet=sn, excel_row=excel_row,
+                    )
+
                 extra_layers = []
                 for label, ppn_i, si_i, prem_i in cmap.extra_treaty_blocks:
                     layer = {
@@ -1579,7 +1856,11 @@ def parse_premium_file(
                         "prem": parse_number(cell(row, prem_i)),
                     }
                     if any(layer[k] is not None for k in ("ppn", "si", "prem")):
+                        if cmap.combine_treaty_layers:
+                            layer["included_in_treaty_total"] = True
                         extra_layers.append(layer)
+                _warn_layers_left_out(exceptions, path, sn, excel_row, extra_layers, "prem",
+                                      ccy.for_row(cell(row, cmap.get("currency"))))
 
                 prow = PremiumRow(
                     policy_no=policy,
@@ -1595,14 +1876,21 @@ def parse_premium_file(
                     ret_ppn=parse_number(cell(row, cmap.ret_ppn)),
                     ret_si=parse_number(cell(row, cmap.ret_si)),
                     ret_prem=parse_number(cell(row, cmap.ret_prem)),
-                    sur_ppn=parse_number(cell(row, cmap.sur_ppn)),
-                    sur_si=parse_number(cell(row, cmap.sur_si)),
-                    sur_prem=parse_number(cell(row, cmap.sur_prem)),
+                    sur_ppn=(_sum_present([parse_number(cell(row, cmap.sur_ppn))] +
+                        [l.get("ppn") for l in extra_layers]) if cmap.combine_treaty_layers
+                        else parse_number(cell(row, cmap.sur_ppn))),
+                    sur_si=(_sum_present([parse_number(cell(row, cmap.sur_si))] +
+                        [l.get("si") for l in extra_layers]) if cmap.combine_treaty_layers
+                        else parse_number(cell(row, cmap.sur_si))),
+                    sur_prem=(_sum_present([parse_number(cell(row, cmap.sur_prem))] +
+                        [l.get("prem") for l in extra_layers]) if cmap.combine_treaty_layers
+                        else parse_number(cell(row, cmap.sur_prem))),
                     fac_ppn=parse_number(cell(row, cmap.fac_ppn)),
                     fac_si=parse_number(cell(row, cmap.fac_si)),
                     fac_prem=parse_number(cell(row, cmap.fac_prem)),
                     extra_layers=extra_layers,
                     audit=AuditMeta(
+                        source_digest=source_digest(path),
                         source_month=source_month,
                         source_filename=path.name,
                         source_sheet=sn,
@@ -1610,6 +1898,13 @@ def parse_premium_file(
                         class_hint=effective_class,
                         class_source=class_source,
                         class_label_raw=class_raw,
+                        class_resolution=(dict(
+                            rule="conflicting_source_classes",
+                            section_class=banner_class or class_hint,
+                            section_label=banner_raw or sn,
+                            row_class=row_class_raw,
+                            candidates=sorted({banner_class or class_hint, row_class}),
+                        ) if class_source == "conflict" else {}),
                         currency=ccy.for_row(cell(row, cmap.get("currency"))),
                         period_from_mapped=from_mapped,
                         period_to_mapped=to_mapped,
@@ -1630,7 +1925,8 @@ def parse_premium_file(
 
         _note_headerless_repeats(rows_out[sheet_out_at:], remapped_groups, path, sn, exceptions)
         if layer_labels:
-            exceptions.append(_treaty_layer_note(path, sn, primary_label, layer_labels))
+            exceptions.append(_treaty_layer_note(path, sn, primary_label, layer_labels,
+                combined=cmap.combine_treaty_layers))
         notes = f"class_hint={class_hint}; currency={ccy.audit_code()} ({ccy.source})"
         if adapter is not None and hasattr(adapter, "settings_note"):
             notes += "; " + adapter.settings_note()
@@ -1713,6 +2009,32 @@ _CLAIM_NO_LABELS = {"CLAIM NO", "CLAIM NUMBER", "CLAIMNUMBER"}
 _POLICY_LABELS = {"POLICY NO", "POLICY NUMBER", "POLICY"}
 
 
+_NIL_CELLS = frozenset({"NIL", "N/A", "NA", "NONE", "-"})
+# Labels of a totals / summary block under a claims table ('TOTAL',
+# 'COMPANY RETENTION', 'FIRST SURPLUS', 'FACULTATIVE').
+_SUMMARY_LABEL_WORDS = frozenset({
+    "TOTAL", "TOTALS", "SUBTOTAL", "GRAND", "SUMMARY", "RETENTION", "TREATY",
+    "SURPLUS", "QUOTA", "FAC", "FACULTATIVE", "NET", "GROSS", "BALANCE",
+})
+
+
+def _is_summary_label_row(insured: str, policy: str, claim_no: str) -> bool:
+    """A totals row of a summary block: a total / band label (no digits) where
+    the policy number belongs, an amount (or NIL) where the insured name
+    belongs, and no claim number other than an amount (or NIL). A claim with
+    a NIL insured and a 'TBA' policy is not one."""
+    def amount_like(v: str) -> bool:
+        return parse_number(v) is not None or v.strip().upper() in _NIL_CELLS
+
+    if claim_no and not amount_like(claim_no):
+        return False
+    if not insured or not amount_like(insured):
+        return False
+    if not policy or any(ch.isdigit() for ch in policy):
+        return False
+    return bool(set(re.findall(r"[A-Z]+", policy.upper())) & _SUMMARY_LABEL_WORDS)
+
+
 def _has_claims_header_labels(row: Sequence[Any]) -> bool:
     """True when the row has a whole-cell CLAIM NO label and a POLICY label."""
     cells = {normalize_header(c) for c in row if c is not None and clean_text(c)}
@@ -1744,7 +2066,13 @@ def _parse_claims_sheet(
     aliases = aliases or CLAIMS_ALIASES
     exceptions: List[ExceptionRecord] = []
     hdr_i = find_header_row(raw_rows, "outstanding" if sheet_type == "outstanding" else "paid")
-    class_hint = class_from_sheet_name(sn)
+    if hdr_i is None and getattr(adapter, "claims_header_scan_all", False):
+        hdr_i = find_header_row(raw_rows, sheet_type, max_scan=len(raw_rows))
+    class_hint = class_from_sheet_name(sn, _adapter_rules(adapter)[0])
+    if hasattr(adapter, "sheet_class_hint"):
+        class_hint = adapter.sheet_class_hint(sn, class_hint)
+    if getattr(adapter, "strict_sheet_class_hints", False) and not is_unresolved_class(class_hint) and not normalize_class_label(class_hint, _adapter_rules(adapter)[2]):
+        class_hint = ""
     header_override: Dict[int, List[Any]] = {}
 
     if hdr_i is None:
@@ -1806,6 +2134,31 @@ def _parse_claims_sheet(
     gap_unmapped: List[str] = []
     gap_missing: List[str] = []
     ppn_calc_rows: List[int] = []
+    # (banner, class used, source) -> [rows, total claims] where a class
+    # banner and the tab name disagree.
+    class_conflicts: Dict[Tuple[str, str, str], List[Any]] = {}
+    hint_class = banner_class_label(class_hint) if class_hint else ""
+    # Rows with no class since the last block boundary; a block total row
+    # naming a class ('TOTAL FOR FIRE') classes them.
+    pending_unclassed: List[ClaimsRow] = []
+    trailers_seen: List[str] = []
+    # Header row -> [fallback header, rows, amount] when TOTAL CLAIMS came from
+    # the adapter's per-tab-type fallback.
+    fallback_blocks: Dict[int, List[Any]] = {}
+
+    def _class_from_trailer(total_row: Sequence[Any], excel_row: int) -> None:
+        # Subtotals that name no class ('TOTAL FOR 2020', a bare year row)
+        # leave the pending rows for the class total further down.
+        text = _trailer_class_text(total_row) if pending_unclassed else ""
+        if not text:
+            return
+        raw = next(clean_text(c) for c in total_row if isinstance(c, str) and "TOTAL" in c.upper())
+        for r in pending_unclassed:
+            r.class_name = text
+            r.audit.class_source = "trailer"
+            r.audit.class_label_raw = raw
+        trailers_seen.append(f"{raw!r}@r{excel_row}->{text} ({len(pending_unclassed)} rows)")
+        pending_unclassed.clear()
 
     def _banner_class(cell_text: str) -> str:
         if not class_hint:
@@ -1823,6 +2176,7 @@ def _parse_claims_sheet(
         return ""
 
     for hi, header_at in enumerate(header_indices):
+        pending_unclassed.clear()
         if header_at in header_override:
             header = header_override[header_at]
             data_start = header_at + 1
@@ -1830,21 +2184,45 @@ def _parse_claims_sheet(
             header, data_start = _claims_header_with_subrow(
                 raw_rows, header_at,
                 merge=bool(getattr(adapter, "band_subrow_layout", True)))
+            if adapter is not None and hasattr(adapter, "claims_header_cells"):
+                band_row = raw_rows[header_at - 1] if header_at > 0 else None
+                if hasattr(adapter, "claims_band_row"):
+                    band_row = adapter.claims_band_row(raw_rows, header_at, band_row)
+                block_end = header_indices[hi + 1] if hi + 1 < len(header_indices) else len(raw_rows)
+                header_notes: List[Tuple[str, str, str]] = []
+                header = adapter.claims_header_cells(
+                    header, band_row, data_rows=raw_rows[data_start:block_end], notes=header_notes)
+                for sev, reason, detail in header_notes:
+                    exceptions.append(ExceptionRecord(sev, reason, path.name, sn, header_at + 1, detail))
         if adapter is not None and hasattr(adapter, "map_claims_columns"):
-            cmap = adapter.map_claims_columns(header, aliases)
+            cmap = adapter.map_claims_columns(header, aliases, sheet_type)
         else:
             cmap = map_simple_columns(header, aliases)
+        if getattr(cmap, "total_fallback", ""):
+            fallback_blocks.setdefault(header_at + 1, [cmap.total_fallback, 0, 0.0])
         for t in getattr(cmap, "tie_log", []):
             note = f"r{header_at + 1} {t}"
             if note not in tie_notes:
                 tie_notes.append(note)
         end = header_indices[hi + 1] if hi + 1 < len(header_indices) else len(raw_rows)
+        if cmap.get("details") is None:
+            details_i = _unlabelled_details_column(header, raw_rows[data_start:end], cmap)
+            if details_i is not None:
+                cmap.mapping["details"] = details_i
+                exceptions.append(ExceptionRecord(
+                    "INFO", "details_from_unlabelled_column", path.name, sn, header_at + 1,
+                    f"Column {_col_letter(details_i)} has no header but holds loss descriptions; "
+                    "read as DETAILS OF LOSS",
+                ))
         insured_i = cmap.get("insured")
         policy_i = cmap.get("policy_no")
         extra_cols = extra_alias_columns(
             header, aliases["amount_treaty"], list(cmap.mapping.values()),
         ) + list(getattr(cmap, "extra_amount_columns", []))
-        refresh_unmapped(cmap, header, *(i for i, _lab in extra_cols))
+        if cmap.combine_treaty_layers:
+            extra_cols = list(cmap.extra_amount_columns)
+        extra_cols = list(dict(extra_cols).items())
+        refresh_unmapped(cmap, header, *cmap.treaty_ppn_columns, *(i for i, _lab in extra_cols))
         for h in cmap.unmapped_headers:
             if h not in gap_unmapped:
                 gap_unmapped.append(h)
@@ -1855,25 +2233,28 @@ def _parse_claims_sheet(
             if label not in layer_labels:
                 layer_labels.append(label)
         primary_label = primary_label or normalize_header(cell(header, cmap.get("amount_treaty")) or "")
-        metric_cols: Dict[str, Optional[int]] = {
+        metric_cols: Dict[str, Any] = {
             "total": cmap.get("total_claims"), "ret": cmap.get("amount_ret"),
             "treaty": cmap.get("amount_treaty"), "fac": cmap.get("amount_fac"),
         }
         for i, label in extra_cols:
             metric_cols[f"layer:{label}"] = i
+        if cmap.combine_treaty_layers:
+            metric_cols["treaty"] = tuple(dict.fromkeys(i for i in
+                [cmap.get("amount_treaty")] + [i for i, _ in extra_cols] if i is not None))
         # Look further back for a lone class banner above this header
         scan_from = header_at if header_at in header_override else header_at - 1
         for bi in range(scan_from, max(-1, header_at - 20), -1):
             if bi < 0:
                 break
-            ne = [clean_text(c) for c in raw_rows[bi] if clean_text(c)]
-            if len(ne) == 1:
-                mapped = _banner_class(ne[0])
+            bt = _banner_text([clean_text(c) for c in raw_rows[bi] if clean_text(c)])
+            if bt:
+                mapped = _banner_class(bt)
                 if mapped:
-                    if section_class != mapped or section_raw != ne[0]:
-                        banners_seen.append(f"{ne[0]!r}@r{bi + 1}->{mapped}")
+                    if section_class != mapped or section_raw != bt:
+                        banners_seen.append(f"{bt!r}@r{bi + 1}->{mapped}")
                     section_class = mapped
-                    section_raw = ne[0]
+                    section_raw = bt
                     break
             # Stop if we hit a previous header row
             if bi in header_indices and bi != header_at:
@@ -1884,6 +2265,14 @@ def _parse_claims_sheet(
             raw_rows, data_start, end, header_cmap, header, path, sn,
             header_at, exceptions, "claims", metric_cols,
         )
+
+        for consumed in range(header_at + 1, data_start):
+            for value in raw_rows[consumed]:
+                mapped = _banner_class(clean_text(value)) if clean_text(value) else None
+                if mapped and not is_unresolved_class(mapped):
+                    section_class, section_raw = mapped, clean_text(value)
+                    banners_seen.append(f"{section_raw!r}@r{consumed + 1}->{mapped}")
+                    break
 
         for ridx in range(data_start, end):
             row = raw_rows[ridx]
@@ -1897,13 +2286,14 @@ def _parse_claims_sheet(
             cmap = block_maps.get(ridx, header_cmap)
             insured_i = cmap.get("insured")
             policy_i = cmap.get("policy_no")
-            ne = [clean_text(c) for c in row if clean_text(c)]
-            if len(ne) == 1:
-                mapped = _banner_class(ne[0])
+            bt = _banner_text([clean_text(c) for c in row if clean_text(c)])
+            if bt:
+                mapped = _banner_class(bt)
                 if mapped:
-                    banners_seen.append(f"{ne[0]!r}@r{excel_row}->{mapped}")
+                    banners_seen.append(f"{bt!r}@r{excel_row}->{mapped}")
                     section_class = mapped
-                    section_raw = ne[0]
+                    section_raw = bt
+                    pending_unclassed.clear()
                     skipped += 1
                     continue
             # skip repeated header: whole-cell CLAIM NO + POLICY labels only
@@ -1920,9 +2310,12 @@ def _parse_claims_sheet(
             fvals = _footer_values(row, metric_cols)
             if _is_footer_row(row, insured, policy, fvals):
                 totals.add_footer(fvals, _footer_cells(fvals, metric_cols, excel_row))
+                _class_from_trailer(row, excel_row)
                 skipped += 1
                 continue
             if looks_like_total_row(row, [insured_i, policy_i, cmap.get("claim_no")]):
+                if not (insured or policy):
+                    _class_from_trailer(row, excel_row)
                 if insured or policy:
                     exceptions.append(ExceptionRecord(
                         "WARN", "total_like_row_skipped", path.name, sn, excel_row,
@@ -1943,6 +2336,19 @@ def _parse_claims_sheet(
             amt_tr = parse_number(cell(row, cmap.get("amount_treaty")))
             amt_fac = parse_number(cell(row, cmap.get("amount_fac")))
 
+            if _is_summary_label_row(insured, policy, claim_no):
+                # 'TOTAL' / 'COMPANY RETENTION' | <amount> blocks under a table.
+                dropped = [v for v in (total, parse_number(insured)) if v is not None]
+                exceptions.append(ExceptionRecord(
+                    "WARN", "summary_row_skipped", path.name, sn, excel_row,
+                    f"policy={policy!r} insured={insured!r} claim={claim_no!r}: a total / summary "
+                    f"label and an amount, not a claim — 1 row, "
+                    f"{format_amount(dropped[0] if dropped else 0, ccy.audit_code())} not loaded",
+                    amount=dropped[0] if dropped else 0.0, currency=ccy.audit_code(),
+                ))
+                skipped += 1
+                continue
+
             if not has_min_transaction_evidence(insured, policy, total, amt_ret if amt_ret is not None else amt_tr):
                 if insured or policy or claim_no:
                     exceptions.append(ExceptionRecord(
@@ -1957,7 +2363,12 @@ def _parse_claims_sheet(
             class_name = ""
             class_source = ""
             class_raw = ""
-            if cmap.get("class") is not None:
+            if class_hint and (getattr(adapter, "claims_sheet_class_first", False)
+                    or getattr(adapter, "claims_resolved_sheet_class_first", False)
+                    and normalize_class_label(class_hint, _adapter_rules(adapter)[2]) not in {"", "Other"}
+                    and not is_unresolved_class(class_hint)):
+                class_name, class_source, class_raw = class_hint, "sheet", sn
+            elif cmap.get("class") is not None:
                 class_name = clean_text(cell(row, cmap.get("class")))
                 if class_name:
                     class_source, class_raw = "column", class_name
@@ -1967,6 +2378,19 @@ def _parse_claims_sheet(
                     class_source, class_raw = "banner", section_raw
                 elif class_name:
                     class_source, class_raw = "sheet", sn
+            resolver = getattr(adapter, "resolve_claims_class", None)
+            if callable(resolver):
+                class_name, class_source, class_raw = resolver(
+                    row=row, cmap=cmap, sheet_hint=class_hint, section=section_class,
+                    exceptions=exceptions, path=path, sheet=sn, excel_row=excel_row,
+                )
+            # Only a tab name that names a known class can conflict with a banner.
+            if section_class and hint_class and class_source in ("sheet", "banner") \
+                    and (banner_class_label(section_class) or section_class).casefold() != hint_class.casefold():
+                hit = class_conflicts.setdefault((section_raw or section_class, class_name, class_source),
+                                                 [[], 0.0])
+                hit[0].append(excel_row)
+                hit[1] += total or 0.0
 
             def flag_date(field: str, text: str, _row=excel_row) -> None:
                 exceptions.append(ExceptionRecord(
@@ -2017,7 +2441,19 @@ def _parse_claims_sheet(
             for i, label in extra_cols:
                 v = parse_number(cell(row, i))
                 if v is not None:
-                    extra_layers.append({"layer": label, "amount": v})
+                    extra_layers.append({"layer": label, "amount": v,
+                        "included_in_treaty_total": cmap.combine_treaty_layers})
+            if cmap.combine_treaty_layers:
+                amt_tr = _sum_present([amt_tr] + [l["amount"] for l in extra_layers])
+                if cmap.treaty_ppn_columns:
+                    ppns["treaty"] = _sum_present(
+                        parse_number(cell(row, i)) for i in cmap.treaty_ppn_columns)
+            _warn_layers_left_out(exceptions, path, sn, excel_row, extra_layers, "amount",
+                                  ccy.for_row(cell(row, cmap.get("currency"))))
+            if getattr(cmap, "total_fallback", "") and header_at + 1 in fallback_blocks \
+                    and total is not None:
+                fallback_blocks[header_at + 1][1] += 1
+                fallback_blocks[header_at + 1][2] += total
 
             crow = ClaimsRow(
                 insured=insured,
@@ -2050,14 +2486,48 @@ def _parse_claims_sheet(
                     period_to_mapped=to_mapped,
                 ),
             )
+            check = getattr(adapter, "check_claims_row", None)
+            if callable(check):
+                check(crow, row=row, cmap=cmap, exceptions=exceptions,
+                      path=path, sheet=sn, excel_row=excel_row)
             rows_out.append(crow)
+            if class_name:
+                pending_unclassed.clear()
+            else:
+                pending_unclassed.append(crow)
             totals.add_row(crow)
             kept += 1
         totals.end_section()
 
     if layer_labels:
-        exceptions.append(_treaty_layer_note(path, sn, primary_label, layer_labels))
+        exceptions.append(_treaty_layer_note(path, sn, primary_label, layer_labels,
+                combined=bool(getattr(adapter, "combine_treaty_layers", False))))
+    for (banner, used, source), (rows_hit, amount) in class_conflicts.items():
+        exceptions.append(ExceptionRecord(
+            "WARN", "banner_class_conflicts_sheet", path.name, sn, rows_hit[0],
+            f"class banner {banner!r} and the tab name ({class_hint}) disagree; "
+            f"{len(rows_hit)} rows classed as {used!r} from the "
+            f"{'tab name' if source == 'sheet' else 'banner'} ({_row_list(rows_hit)}): "
+            f"{format_amount(amount, ccy.audit_code())}",
+            amount=amount, currency=ccy.audit_code(),
+        ))
+    for header_row, (label, n, amount) in fallback_blocks.items():
+        exceptions.append(ExceptionRecord(
+            "WARN", "claims_total_fallback_used", path.name, sn, header_row,
+            f"no total-claims column on this {sheet_type} tab; {label!r} read as TOTAL CLAIMS "
+            f"({sheet_type} fallback): {n} rows, {format_amount(amount, ccy.audit_code())}",
+        ))
     notes = f"class_hint={class_hint}; currency={ccy.audit_code()} ({ccy.source})"
+    # A row of explicit NIL markers is a declared empty return, rather than
+    # evidence of an extraction failure. Preserve this distinction in audit.
+    if not rows_out:
+        nil_markers = {"NIL", "NIL RETURN", "NO CLAIMS", "NO CLAIMS PAID"}
+        for source_row in raw_rows[(hdr_i + 1) if hdr_i is not None else 0:]:
+            values = [v for v in source_row if clean_text(v)]
+            if (any(normalize_header(v) in nil_markers for v in values)
+                    and all(normalize_header(v) in nil_markers or parse_number(v) == 0 for v in values)):
+                notes += "; explicit_nil_return: source declares no transactions"
+                break
     if adapter is not None and hasattr(adapter, "settings_note"):
         notes += "; " + adapter.settings_note()
     if ppn_calc_rows:
@@ -2072,6 +2542,13 @@ def _parse_claims_sheet(
     )
     if banners_seen:
         notes += f"; section banners: {', '.join(banners_seen)}"
+    if trailers_seen:
+        notes += f"; class from block total rows: {', '.join(trailers_seen)}"
+        exceptions.append(ExceptionRecord(
+            "INFO", "class_from_total_row", path.name, sn, 0,
+            "Rows with no class took the class named by the total row under them: "
+            + ", ".join(trailers_seen),
+        ))
     if layer_labels:
         notes += f"; extra treaty layers: {', '.join(layer_labels)}"
     if earlier_blocks:
@@ -2092,6 +2569,50 @@ def _parse_claims_sheet(
     ))
 
 
+_PAID_NAME_WORDS = frozenset({"PAID", "SETTLED", "SETTLEMENT", "SETTLEMENTS"})
+_OUTSTANDING_NAME_WORDS = frozenset({"OUTSTANDING", "OUSTANDING", "OUTSANDING", "OUTSATNDING"})
+
+
+def _outstanding_by_file_name(path: Path, sheet: str, adapter: Any) -> bool:
+    if not getattr(adapter, "outstanding_by_file_name", False):
+        return False
+    sheet_words = set(re.findall(r"[A-Z]+", str(sheet).upper()))
+    if sheet_words & (_PAID_NAME_WORDS | {"CLAIM", "CLAIMS"}):
+        return False
+    file_words = set(re.findall(r"[A-Z]+", path.stem.upper()))
+    return bool(file_words & _OUTSTANDING_NAME_WORDS) and not file_words & _PAID_NAME_WORDS
+
+
+_PAID_HEADER_WORDS = frozenset({"PAID", "SETTLED", "SETTLEMENT", "PAYMENT"})
+# 'DATE PAID/TO BE PAID', 'UNPAID', 'OUTSTANDING PAYMENT': not a paid claim.
+_NOT_PAID_HEADER_RE = re.compile(r"\bTO BE\b|\bUNPAID\b|\bNOT\b|\bOUTSTANDING\b|\bO S\b")
+_HEADER_AND_SUB_ROWS = 2
+
+
+def _paid_header_labels(raw_rows: List[List[Any]]) -> List[str]:
+    """Header cells of the tab that point to paid claims (AMOUNT PAID, DATE
+    PAID, SETTLED, PAYMENT DATE …), header row and the sub-row under it."""
+    hdr = find_header_row(raw_rows, "paid")
+    if hdr is None:
+        return []
+    out: List[str] = []
+    for r in raw_rows[hdr:hdr + _HEADER_AND_SUB_ROWS]:
+        for c in r:
+            n = normalize_header(c) if c is not None else ""
+            if n and set(n.split()) & _PAID_HEADER_WORDS and not _NOT_PAID_HEADER_RE.search(n) \
+                    and n not in out:
+                out.append(n)
+    return out
+
+
+def _rows_amount(rows: Sequence[ClaimsRow]) -> str:
+    by_ccy: Dict[str, float] = defaultdict(float)
+    for r in rows:
+        if r.total_claims is not None:
+            by_ccy[r.audit.currency or "NGN"] += float(r.total_claims)
+    return ", ".join(format_amount(v, c) for c, v in sorted(by_ccy.items())) or format_amount(0)
+
+
 def parse_claims_file(
     path: Path,
     *,
@@ -2100,7 +2621,7 @@ def parse_claims_file(
 ) -> Tuple[List[ClaimsRow], List[ClaimsRow], List[ExceptionRecord], List[SourceAuditRecord]]:
     """Return (paid_rows, outstanding_rows, exceptions, audit). Never merge paid+OST."""
     path = Path(path)
-    sheets, exceptions, hidden_count = _load_source(path)
+    sheets, exceptions, hidden_count = _load_source(path, adapter=adapter)
     aliases = adapter.claims_aliases() if adapter is not None else CLAIMS_ALIASES
     paid: List[ClaimsRow] = []
     ost: List[ClaimsRow] = []
@@ -2117,10 +2638,14 @@ def parse_claims_file(
             ))
             continue
         if _is_duplicate_copy_sheet(sn, sheet_names):
-            exceptions.append(ExceptionRecord(
-                "INFO", "duplicate_sheet_skipped", path.name, sn, 0,
-                f"Copy sheet skipped; using base tab {_sheet_base_name(sn)!r}",
-            ))
+            copy_rows: List[ClaimsRow] = []
+            copy_type = detect_sheet_type(sn, raw_rows[:20], sheet_rules)
+            if copy_type in ("paid", "outstanding"):
+                copy_rows, _exc, _aud = _parse_claims_sheet(
+                    path, sn, raw_rows, copy_type, aliases=aliases, adapter=adapter,
+                    file_currency_hint=file_ccy_hint,
+                )
+            exceptions.append(_copy_tab_warning(path, sn, len(copy_rows), _rows_amount(copy_rows)))
             audit.append(SourceAuditRecord(
                 path.name, sn, "skip", 0, 0, 0, 0, "", "duplicate copy sheet skipped",
             ))
@@ -2131,13 +2656,21 @@ def parse_claims_file(
             name_u = normalize_header(sn)
             if "STATEMENT" in name_u and not getattr(adapter, "content_sheet_typing", False):
                 audit.append(SourceAuditRecord(
-                    path.name, sn, "skip", 0, 0, 0, 0, "", "statement/cover skipped",
+                    path.name, sn, "skip", 0, 0, 0, 0, "",
+                    SUMMARY_TAB_AUDIT_NOTE.format(word="STATEMENT"),
                 ))
                 continue
             # try content
             st2 = detect_sheet_type(sn, raw_rows[:30], sheet_rules)
             st = st2
         st, tt = _typed_sheet(path, sn, raw_rows, st, adapter, exceptions)
+        retyped = paid_kept = ""
+        if st == "paid" and _outstanding_by_file_name(path, sn, adapter):
+            paid_labels = _paid_header_labels(raw_rows)
+            if paid_labels:
+                paid_kept = ", ".join(paid_labels)
+            else:
+                st = retyped = "outstanding"
         if st == "premium":
             # FAC OBLIG UY premium cession inside claims workbook — skip for claims pipeline
             audit.append(SourceAuditRecord(
@@ -2147,11 +2680,12 @@ def parse_claims_file(
             ))
             continue
         if st not in {"paid", "outstanding"}:
+            note = {"unknown": "UNKNOWN table type — not loaded (see exceptions)",
+                    "other": "OTHER (empty / summary / statement) — not loaded"}.get(st, "unclassified skip")
+            if st == "skip" and summary_tab_word(sn):
+                note = SUMMARY_TAB_AUDIT_NOTE.format(word=summary_tab_word(sn))
             audit.append(SourceAuditRecord(
-                path.name, sn, st, 0, 0, 0, 0, "",
-                {"unknown": "UNKNOWN table type — not loaded (see exceptions)",
-                 "other": "OTHER (empty / summary / statement) — not loaded"}.get(st, "unclassified skip"),
-                **_type_fields(tt),
+                path.name, sn, st, 0, 0, 0, 0, "", note, **_type_fields(tt),
             ))
             continue
 
@@ -2159,9 +2693,25 @@ def parse_claims_file(
             path, sn, raw_rows, st, aliases=aliases, hidden_rows=hidden_count.get(sn, 0),
             adapter=adapter, file_currency_hint=file_ccy_hint,
         )
+        for parsed_row in rows:
+            parsed_row.audit.source_digest = source_digest(path)
         for k, v in _type_fields(tt).items():
             setattr(aud, k, v)
         exceptions.extend(exc)
+        if retyped:
+            exceptions.append(ExceptionRecord(
+                "WARN", "outstanding_from_file_name", path.name, sn, aud.header_row,
+                "Tab name and headers do not say paid or outstanding; the file name says "
+                f"OUTSTANDING, so the tab is read as outstanding claims: {len(rows)} rows, "
+                f"{_rows_amount(rows)}",
+            ))
+        elif paid_kept:
+            exceptions.append(ExceptionRecord(
+                "WARN", "outstanding_file_paid_tab_kept", path.name, sn, aud.header_row,
+                f"File name says OUTSTANDING but the tab's headers point to paid claims "
+                f"({paid_kept}); kept as paid, not retyped: {len(rows)} rows, "
+                f"{_rows_amount(rows)} — confirm the tab type",
+            ))
         audit.append(aud)
         if st == "paid":
             paid.extend(rows)

@@ -15,7 +15,6 @@ for _p in (str(_BACKEND), str(_REPO)):
 
 import streamlit as st
 
-from demo_app.screens import compare as compare_screen
 from demo_app.screens import review as review_screen
 from demo_app.screens import run as run_screen
 
@@ -105,7 +104,9 @@ st.markdown(CSS, unsafe_allow_html=True)
 
 def _demo_password() -> str:
     try:
-        secret = st.secrets.get("DEMO_PASSWORD")
+        # Missing secrets.toml is supported for local runs. Accessing .get()
+        # directly renders an error before raising, even when it is caught.
+        secret = st.secrets.get("DEMO_PASSWORD") if st.secrets.load_if_toml_exists() else None
         if secret:
             return str(secret)
     except Exception:
@@ -135,9 +136,12 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
+if st.session_state.get("nav_radio") == "Compare":
+    st.session_state.nav_radio = "Run"
+
 nav = st.radio(
     "Navigation",
-    options=["Run", "Compare", "Review"],
+    options=["Run", "Review"],
     horizontal=True,
     label_visibility="collapsed",
     key="nav_radio",
@@ -153,8 +157,6 @@ st.divider()
 
 if nav == "Run":
     run_screen.render()
-elif nav == "Compare":
-    compare_screen.render()
 else:
     review_screen.render()
 

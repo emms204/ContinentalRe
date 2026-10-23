@@ -40,7 +40,7 @@ from src.domain.cre_cleaner.models import (
     ExceptionRecord,
     SourceAuditRecord,
 )
-from src.domain.cre_cleaner.core.normalize import clean_text
+from src.domain.cre_cleaner.core.normalize import clean_text, format_amount
 
 
 # Request-scoped read cache (IMPL-20261002-01). One clean reads the same
@@ -51,6 +51,35 @@ from src.domain.cre_cleaner.core.normalize import clean_text
 _READ_CACHE: contextvars.ContextVar[Optional[Dict[Any, Any]]] = contextvars.ContextVar(
     "cre_cleaner_workbook_read_cache", default=None,
 )
+
+_CALAMINE_INITIALIZATION_ERROR: Optional[str] = None
+
+
+class NativeExcelReaderUnavailable(RuntimeError):
+    """The optional native reader cannot initialize in this process."""
+
+
+def _load_fastexcel():
+    import importlib
+
+    global _CALAMINE_INITIALIZATION_ERROR
+    if _CALAMINE_INITIALIZATION_ERROR is not None:
+        raise NativeExcelReaderUnavailable(_CALAMINE_INITIALIZATION_ERROR)
+    try:
+        return importlib.import_module("fastexcel")
+    except BaseException as exc:
+        # The native extension uses a process-wide Rust logger. Reinitializing
+        # it (e.g. after module reloads) can panic outside Exception handlers.
+        # Recover only this known initialization fault, never Stop or data panics.
+        if (type(exc).__module__ != "pyo3_runtime"
+                or type(exc).__name__ != "PanicException"
+                or "SetLoggerError" not in str(exc)):
+            raise
+        _CALAMINE_INITIALIZATION_ERROR = (
+            "The native Excel reader could not initialize its logger. "
+            "Use the standard XLS/XLSX reader, or restart the worker for XLSB/ODS support."
+        )
+        raise NativeExcelReaderUnavailable(_CALAMINE_INITIALIZATION_ERROR) from exc
 
 
 @contextlib.contextmanager
@@ -81,8 +110,8 @@ def _copy_sheets(sheets: Dict[str, List[List[Any]]]) -> Dict[str, List[List[Any]
 def read_workbook_sheets(path: Path) -> Dict[str, List[List[Any]]]:
     """Return {sheet_name: rows as list of lists}. Supports xlsx and xls.
 
-    Trailing rows that hold no value at all are not returned (xlsx sheets can
-    declare ~65k styled but empty rows). Inside ``workbook_read_cache()`` a
+    Trailing rows/columns that hold no value are not returned (xlsx sheets can
+    declare huge styled but empty rectangles). Inside ``workbook_read_cache()`` a
     workbook is parsed once and later calls get a copy of the rows.
     """
     path = Path(path)
@@ -99,6 +128,8 @@ def read_workbook_sheets(path: Path) -> Dict[str, List[List[Any]]]:
 
 def _read_workbook_sheets_uncached(path: Path) -> Dict[str, List[List[Any]]]:
     suffix = path.suffix.lower()
+    if suffix in {".ods", ".xlsb"}:
+        return _read_calamine(path)
     if suffix == ".xls":
         return _read_xls(path)
     try:
@@ -179,28 +210,101 @@ def _xlsx_last_value_rows(path: Path) -> Dict[str, Optional[int]]:
     return out
 
 
+# A cell element with no content (style only). Only addressed cells (r="A1")
+# are dropped: an unaddressed cell's position depends on the cells before it.
+_EMPTY_CELL = re.compile(
+    rb'<c\s[^>]*?\br="[A-Z]+[0-9]+"[^>]*?/>|<c\s[^>]*?\br="[A-Z]+[0-9]+"[^>]*?>\s*</c>'
+)
+
+
+def _xlsx_without_empty_cells(path: Path) -> Any:
+    """In-memory copy of the package with style-only cells removed from the
+    worksheets. Formatting can declare millions of empty cells (a styled range
+    to column XEP); every remaining cell keeps its own address, so values and
+    coordinates are unchanged while parsing skips the empty ones."""
+    import zipfile
+    from io import BytesIO
+
+    buf = BytesIO()
+    with zipfile.ZipFile(path) as zin, zipfile.ZipFile(buf, "w", zipfile.ZIP_STORED) as zout:
+        for info in zin.infolist():
+            data = zin.read(info)
+            if info.filename.startswith("xl/worksheets/") and info.filename.endswith(".xml"):
+                data = _EMPTY_CELL.sub(b"", data)
+            zout.writestr(info.filename, data)
+    buf.seek(0)
+    return buf
+
+
+def _xlsx_value_bounds(path: Any) -> Dict[str, Tuple[int, int]]:
+    """Actual cell bounds, independent of styled/incorrect worksheet dimensions.
+
+    Include cached values, inline strings and formulas (even uncached ones).
+    Coordinates stay absolute: only the trailing empty rectangle is omitted.
+    A malformed/unaddressed value aborts the optimization, never the read.
+    Hidden sheets are never loaded, so their parts are not parsed: (0, 0).
+    """
+    import zipfile
+    from io import BytesIO
+    from xml.etree import ElementTree as ET
+    from openpyxl.utils.cell import coordinate_to_tuple
+
+    out = {}
+    with zipfile.ZipFile(path) as zf:
+        for name, part, sheet_el in _xlsx_sheet_parts(zf):
+            if (sheet_el.get("state") or "visible") != "visible":
+                out[name] = 0, 0
+                continue
+            last_row = last_col = 0
+            for _event, el in ET.iterparse(BytesIO(zf.read(part)), events=('end',)):
+                tag = el.tag.rsplit('}', 1)[-1]
+                if tag == 'c':
+                    if any(child.tag.rsplit('}', 1)[-1] in {'v', 'is', 'f'} for child in el):
+                        ref = el.get('r') or ''
+                        if not re.fullmatch(r'[A-Z]+[1-9][0-9]*', ref):
+                            raise ValueError('Value cell has no reliable coordinate')
+                        row, col = coordinate_to_tuple(ref)
+                        last_row, last_col = max(last_row, row), max(last_col, col)
+                    el.clear()
+                elif tag == 'row':
+                    el.clear()
+            out[name] = last_row, last_col
+    return out
+
+
 def _read_xlsx(path: Path) -> Dict[str, List[List[Any]]]:
-    wb = load_workbook(path, data_only=True, read_only=True)
+    # Cached formula values live in worksheet cells. Loading external-link
+    # caches adds no values used by the cleaner and can dominate read time.
     try:
-        last = _xlsx_last_value_rows(path)
+        source = _xlsx_without_empty_cells(path)
     except Exception:
-        last = {}
+        source = path  # openpyxl reports a damaged package below
+    try:
+        bounds = _xlsx_value_bounds(source)
+    except Exception:
+        bounds = {}
+    if source is not path:
+        source.seek(0)
+    wb = load_workbook(source, data_only=True, read_only=True, keep_links=False)
     out: Dict[str, List[List[Any]]] = {}
     try:
         for sn in wb.sheetnames:
             ws = wb[sn]
-            # Stop at the last row that holds a value: rows after it are all
-            # None (styled phantom rows), so the rows returned are exactly the
-            # previous ones without that empty tail. max_row=0 would mean
-            # "no limit" to openpyxl, so an empty sheet is returned directly.
-            lim = last.get(sn)
-            if lim is not None and ws.max_row is not None:
-                lim = min(lim, ws.max_row)
+            # Hidden sheets are never loaded (read_source_workbook reports
+            # them); like the calamine reader, return them empty, unparsed.
+            # A styled hidden tab can declare ~16k columns (A1:XEP1307).
+            if (getattr(ws, "sheet_state", None) or "visible") != "visible":
+                out[sn] = []
+                continue
+            # Source XML wins over worksheet dimensions, which can be inflated
+            # by formatting or underreport real values. Never trim leading or
+            # interior empty cells: their coordinates are source evidence.
+            lim, width = bounds.get(sn, (None, None))
             if lim == 0:
                 out[sn] = []
                 continue
             rows = []
-            for row in ws.iter_rows(values_only=True, max_row=lim):
+            for row in ws.iter_rows(values_only=True, max_row=lim, max_col=width):
                 rows.append(list(row))
             out[sn] = rows
     finally:
@@ -240,11 +344,14 @@ def _read_xls(path: Path) -> Dict[str, List[List[Any]]]:
 
 def sheet_names(path: Path) -> List[str]:
     path = Path(path)
+    if path.suffix.lower() in {".ods", ".xlsb"}:
+        fastexcel = _load_fastexcel()
+        return list(fastexcel.read_excel(path).sheet_names)
     if path.suffix.lower() == ".xls":
         import xlrd
         return xlrd.open_workbook(str(path)).sheet_names()
     try:
-        wb = load_workbook(path, read_only=True)
+        wb = load_workbook(path, read_only=True, keep_links=False)
         try:
             return list(wb.sheetnames)
         finally:
@@ -348,6 +455,8 @@ def _xls_visibility(path: Path) -> Dict[str, Dict[str, Any]]:
 
 
 def _read_visibility_uncached(path: Path) -> Dict[str, Dict[str, Any]]:
+    if path.suffix.lower() in {".ods", ".xlsb"}:
+        return _calamine_visibility(path)
     try:
         return _xlsx_visibility(path)
     except Exception:
@@ -381,7 +490,7 @@ def _sheet_visibility(path: Path) -> Dict[str, Dict[str, Any]]:
 
 
 def read_source_workbook(
-    path: Path,
+    path: Path, *, reader=None,
 ) -> Tuple[Dict[str, List[List[Any]]], List[Tuple[str, str, str, int, str]]]:
     """Source reader for parsing: hidden sheets are dropped and hidden rows
     blanked (row positions kept so Excel row numbers stay right).
@@ -391,7 +500,7 @@ def read_source_workbook(
     reported rather than assumed visible silently.
     """
     path = Path(path)
-    sheets = read_workbook_sheets(path)
+    sheets = (reader or read_workbook_sheets)(path)
     notes: List[Tuple[str, str, str, int, str]] = []
     try:
         vis = _sheet_visibility(path)
@@ -403,6 +512,10 @@ def read_source_workbook(
         ))
         return sheets, notes
 
+    if path.suffix.lower() in {".ods", ".xlsb"}:
+        notes.append(("WARN", "row_visibility_unavailable", "", 0,
+                      "ODS/XLSB sheet visibility is checked, but hidden row flags are unavailable; "
+                      "review the source before publication"))
     out: Dict[str, List[List[Any]]] = {}
     for sn, rows in sheets.items():
         v = vis.get(sn) or {}
@@ -410,7 +523,7 @@ def read_source_workbook(
             filled = sum(1 for r in rows if any(clean_text(c) for c in r))
             notes.append((
                 "WARN", "hidden_sheet_skipped", sn, 0,
-                f"Sheet is {v['state']} in the source; {filled} non-empty rows not read",
+                (f"Sheet is {v['state']} in the source; {filled} non-empty rows not read" if filled else f"Sheet is {v['state']} in the source; its contents are not loaded"),
             ))
             continue
         hidden = v.get("hidden_rows") or set()
@@ -462,11 +575,14 @@ _CLAIMS_AMOUNT_KEYS = {
 _CLAIMS_PCT_KEYS = {"PPN RET %", "PPN TREATY %", "PPN FAC %"}
 
 _AMOUNT_FMT = "#,##0.00"
-# Premium proportions are stored as percent points (8.2 → "8.20"); claims PPN
-# shares are fractions (amount/total → 0.062) and must use Excel % format so
-# they display like Bisola gold (6.21%), not 0.06.
-_PCT_FMT = "0.00"
-_CLAIMS_PCT_FMT = "0.00%"
+# Proportions keep the source's scale (gold differs by cedant): percent points
+# (8.2) are written "0.00", fractions (0.082) "0.00%" so they show as 8.20%.
+# The scale is read per source tab from the values: a fraction column never
+# goes above _FRACTION_MAX (same tolerance as reconcile's share check).
+_POINTS_FMT = "0.00"
+_FRACTION_FMT = "0.00%"
+_FRACTION_MAX = 1.05
+_PREMIUM_SHARE_KEYS = {"RETENTION PROPORTION %", "TREATY PROPORTION %", "FACULTATIVE PROPORTION %"}
 _DATE_FMT = "DD/MM/YYYY"
 
 _PREMIUM_WIDTHS = [7, 22, 45, 12, 12, 12, 20, 9, 18, 12, 20, 18, 12, 20, 18, 12, 18, 16]
@@ -600,6 +716,36 @@ def enforce_upload_hygiene(
         dim.hidden = False
 
 
+def _pct_formats(
+    rows: Sequence[Any], key_groups: Sequence[Sequence[str]],
+) -> Dict[Tuple[str, str, str], str]:
+    """Number format per (source file, source tab, key). Keys in one group
+    (e.g. RET / TREATY / FAC shares) share one scale: fractions only when no
+    value in the group goes above ``_FRACTION_MAX``. Groups with no non-zero
+    value are left out (the caller's default applies)."""
+    maxima: Dict[Tuple[str, str, int], float] = {}
+    for row in rows:
+        src = (getattr(row.audit, "source_filename", ""), getattr(row.audit, "source_sheet", ""))
+        vals = row.to_template_values()
+        for g, keys in enumerate(key_groups):
+            for key in keys:
+                v = vals.get(key)
+                if isinstance(v, (int, float)) and not isinstance(v, bool) and v != 0:
+                    k = (src[0], src[1], g)
+                    maxima[k] = max(maxima.get(k, 0.0), abs(float(v)))
+    out: Dict[Tuple[str, str, str], str] = {}
+    for (fn, sn, g), mx in maxima.items():
+        fmt = _FRACTION_FMT if mx <= _FRACTION_MAX else _POINTS_FMT
+        for key in key_groups[g]:
+            out[(fn, sn, key)] = fmt
+    return out
+
+
+def _pct_format_for(formats: Dict[Tuple[str, str, str], str], audit: Any, key: str, default: str) -> str:
+    src = (getattr(audit, "source_filename", ""), getattr(audit, "source_sheet", ""))
+    return formats.get((src[0], src[1], key), default)
+
+
 def write_premium_rows(
     ws,
     rows: Sequence[PremiumRow],
@@ -628,6 +774,7 @@ def write_premium_rows(
         c.value = h
         _apply_style(c, styles.get("premium_header"))
     _set_widths(ws, _PREMIUM_WIDTHS)
+    pct_formats = _pct_formats(rows, [sorted(_PREMIUM_SHARE_KEYS), ["MPL %"]])
 
     for i, prow in enumerate(rows, start=1):
         r = header_row + i
@@ -652,7 +799,7 @@ def write_premium_rows(
             elif key in _PREMIUM_AMOUNT_KEYS:
                 cell.number_format = _AMOUNT_FMT
             elif key in _PREMIUM_PCT_KEYS:
-                cell.number_format = _PCT_FMT
+                cell.number_format = _pct_format_for(pct_formats, prow.audit, key, _POINTS_FMT)
             elif key == "UNDERWRITING YEAR":
                 cell.number_format = "0"
             else:
@@ -702,6 +849,7 @@ def write_claims_rows(
         c.value = key
         _apply_style(c, styles.get("claims_header"))
     _set_widths(ws, _CLAIMS_WIDTHS, start_col=first_col)
+    pct_formats = _pct_formats(rows, [sorted(_CLAIMS_PCT_KEYS)])
 
     for i, crow in enumerate(rows, start=1):
         r = header_row + i
@@ -725,7 +873,7 @@ def write_claims_rows(
             elif key in _CLAIMS_AMOUNT_KEYS:
                 cell.number_format = _AMOUNT_FMT
             elif key in _CLAIMS_PCT_KEYS:
-                cell.number_format = _CLAIMS_PCT_FMT
+                cell.number_format = _pct_format_for(pct_formats, crow.audit, key, _FRACTION_FMT)
             elif key == "UW YR":
                 cell.number_format = "0"
             else:
@@ -866,6 +1014,54 @@ def _write_tabular_workbook(
     wb.save(path)
     wb.close()
     return path
+
+
+ROLLUP_MIN_ROWS = 5
+_ROLLUP_ROWS_LISTED = 10
+
+
+def rollup_row_warnings(records: Sequence[ExceptionRecord]) -> List[ExceptionRecord]:
+    """One WARN per tab and reason when a tab has ``ROLLUP_MIN_ROWS`` or more
+    row-level WARNs of that reason: rows, row numbers and the amount they
+    carry (``ExceptionRecord.amount``, per currency). The row records stay,
+    as INFO under the summary, so the detail is kept but the WARN count is
+    one line per tab, not hundreds."""
+    groups: Dict[Tuple[str, str, str], List[int]] = {}
+    for i, r in enumerate(records):
+        if r.severity == "WARN" and r.source_row and r.source_sheet:
+            groups.setdefault((r.source_filename, r.source_sheet, r.reason), []).append(i)
+    rolled = {k: v for k, v in groups.items() if len(v) >= ROLLUP_MIN_ROWS}
+    if not rolled:
+        return list(records)
+    first = {idx[0]: key for key, idx in rolled.items()}
+    demote = {i for idx in rolled.values() for i in idx}
+    out: List[ExceptionRecord] = []
+    for i, r in enumerate(records):
+        if i in first:
+            key = first[i]
+            members = [records[j] for j in rolled[key]]
+            rows = [m.source_row for m in members]
+            listed = ", ".join(f"r{n}" for n in rows[:_ROLLUP_ROWS_LISTED])
+            if len(rows) > _ROLLUP_ROWS_LISTED:
+                listed += f" … (+{len(rows) - _ROLLUP_ROWS_LISTED} more)"
+            by_ccy: Dict[str, float] = {}
+            for m in members:
+                if m.amount is not None:
+                    by_ccy[m.currency or "NGN"] = by_ccy.get(m.currency or "NGN", 0.0) + float(m.amount)
+            money = ", ".join(format_amount(v, c) for c, v in sorted(by_ccy.items()))
+            out.append(ExceptionRecord(
+                "WARN", key[2], key[0], key[1], 0,
+                f"{len(rows)} rows on this tab ({listed})"
+                + (f"; {money} in total" if money else "")
+                + "; row-by-row detail below as INFO",
+                amount=sum(by_ccy.values()) if len(by_ccy) == 1 else None,
+                currency=next(iter(by_ccy)) if len(by_ccy) == 1 else "",
+            ))
+        if i in demote:
+            r = ExceptionRecord("INFO", r.reason, r.source_filename, r.source_sheet, r.source_row,
+                                r.detail, amount=r.amount, currency=r.currency)
+        out.append(r)
+    return out
 
 
 def write_exceptions_sidecar(
@@ -1122,7 +1318,7 @@ def write_output_workbook(
         )
         layout = "class-split"
 
-    all_exceptions = list(exceptions) + sink.records
+    all_exceptions = rollup_row_warnings(list(exceptions) + sink.records)
     try:
         summary["output_layout"] = layout
         summary["sheet_inventory"] = inventory
@@ -1143,7 +1339,7 @@ def write_output_workbook(
     stem = output_path.with_suffix("")
     exc_path = Path(str(stem) + "_exceptions.xlsx")
     audit_path = Path(str(stem) + "_source_audit.xlsx")
-    all_exceptions = list(exceptions) + sink.records
+    all_exceptions = rollup_row_warnings(list(exceptions) + sink.records)
     write_exceptions_sidecar(exc_path, all_exceptions)
     write_source_audit_sidecar(audit_path, source_audit)
 
@@ -1171,3 +1367,54 @@ def write_output_workbook(
     # expose writer-side exceptions to callers (pipeline appends them)
     write_output_workbook.last_writer_exceptions = list(sink.records)
     return output_path, exc_path, audit_path
+
+
+def _read_calamine(path: Path) -> Dict[str, List[List[Any]]]:
+    """ODS/XLSB via the project's existing fastexcel dependency.
+
+    String coercion preserves mixed header/data columns, including numeric
+    policy text; numeric/date interpretation remains in the column parsers.
+    Explicit zero skipped rows retains original Excel row identities.
+    """
+    fastexcel = _load_fastexcel()
+    cache = _READ_CACHE.get()
+    key = _cache_key("calamine_sheets", path) if cache is not None else None
+    if cache is not None and key in cache:
+        return _copy_sheets(cache[key])
+    book = fastexcel.read_excel(path)
+    result = {}
+    visibility = {}
+    if path.suffix.lower() in {".xlsx", ".xlsm", ".xls"}:
+        try:
+            visibility = _sheet_visibility(path)
+        except Exception:
+            pass  # The source reader reports unavailable visibility metadata.
+    for name in book.sheet_names:
+        if (visibility.get(name) or {}).get("state") in {"hidden", "veryHidden"}:
+            result[name] = []
+            continue
+        sheet = book.load_sheet(name, header_row=None, skip_rows=0, dtypes="string")
+        state = getattr(sheet, "visible", "visible")
+        if state is False or str(state).lower() in {"hidden", "veryhidden", "very_hidden"}:
+            result[name] = []
+        else:
+            result[name] = [list(row.values()) for row in sheet.to_arrow().to_pylist()]
+    if cache is not None:
+        cache[key] = result
+        return _copy_sheets(result)
+    return result
+
+
+def _calamine_visibility(path: Path) -> Dict[str, Dict[str, Any]]:
+    fastexcel = _load_fastexcel()
+    book = fastexcel.read_excel(path)
+    result = {}
+    for name in book.sheet_names:
+        sheet = book.load_sheet(name, header_row=None, skip_rows=0, n_rows=1, dtypes="string")
+        state = getattr(sheet, "visible", None)
+        if state is None:
+            raise ValueError("Reader cannot determine sheet visibility; upgrade the declared fastexcel dependency")
+        if isinstance(state, bool):
+            state = "visible" if state else "hidden"
+        result[name] = {"state": str(state), "hidden_rows": set(), "hidden_cols": []}
+    return result

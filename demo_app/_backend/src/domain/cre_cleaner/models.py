@@ -24,6 +24,12 @@ class AuditMeta:
     # skips the per-row blank warning; the sheet carries required_field_unmapped.
     period_from_mapped: bool = True
     period_to_mapped: bool = True
+    # Template class a per-run mapping placed on this row. Empty when none did.
+    run_mapped_class: str = ""
+    source_digest: str = ""
+    row_id: str = ""
+    inferred_class: str = ""
+    class_resolution: dict = field(default_factory=dict)
 
 
 @dataclass
@@ -50,6 +56,7 @@ class PremiumRow:
     fac_prem: Any = None
     # Treaty layers beyond the one written to the TREATY band (the 18-column
     # upload schema has a single band): [{"layer", "ppn", "si", "prem"}].
+    # included_in_treaty_total marks source layers already added to that band.
     extra_layers: list = field(default_factory=list)
     audit: AuditMeta = field(default_factory=AuditMeta)
 
@@ -104,7 +111,7 @@ class ClaimsRow:
         """Keys match CLAIMS_COL_MAP (TEMPLATE.xlsx upload schema)."""
         return {
             "INSURED": self.insured,
-            "CLASS": self.class_name,
+            "CLASS": self.audit.run_mapped_class or self.audit.inferred_class or self.class_name,
             "POLICY NO.": self.policy_no,
             "CLAIM NO": self.claim_no,
             "DATE OF LOSS (day-mth-year)": self.date_of_loss,
@@ -130,6 +137,10 @@ class ExceptionRecord:
     source_sheet: str = ""
     source_row: int = 0
     detail: str = ""
+    # Money the record is about (left out, held back, moved); None when the
+    # record carries none. Not a column: the per-tab WARN summary adds it up.
+    amount: Optional[float] = None
+    currency: str = ""
 
     def as_row(self) -> list:
         return [
@@ -220,3 +231,7 @@ class PipelineResult:
     # "exceptions_path", "source_audit_path", "summary"}. output_path above is
     # the primary (NGN when present) workbook.
     outputs: list = field(default_factory=list)
+    # One draft entry per per-run mapping for this quarter group, including
+    # the row count and how many of those rows overrode another class.
+    applied_mappings: list = field(default_factory=list)
+    source_row_ids: list = field(default_factory=list)

@@ -46,6 +46,7 @@ _OUT_RE = re.compile(r"\bOU[T]?S[T]?A?N?D?I?N?G?S?\b|\bOUTST\w*|\bOST\b|\bO ?/ ?
 _PAID_RE = re.compile(r"\bPAID\b|\bPAYMENTS?\b|\bSETTLE(D|MENT)?\b|\bDISCHARGE\b|\bDV\b|\bCHEQUE\b")
 _RESERVE_RE = re.compile(r"\bRESERVES?\b|\bESTIMATE[SD]?\b|\bREVISED ESTIMATE\b")
 _OTHER_TAB_RE = re.compile(r"\bSTATEMENT\b|\bSUMMARY\b|\bRECAP\b")
+_CLAIM_TITLE_RE = re.compile(r"\bLOSS(ES)? BORD\w*|\bCLAIMS?\b")
 
 # Generic share / proportion column words; an adapter may add its own
 # abbreviations to this one alternation (TableVocab.share_terms).
@@ -63,7 +64,7 @@ _H_PREMIUM = [
 ]
 _H_CLAIM = [
     (r"\bCLAIM NO\b|\bCLAIM NUMBER\b|\bCLAIM REF\b|\bCLM NO\b|\bCLAIMS NO\b", 4),
-    (r"\bDATE OF LOSS\b|\bLOSS DATE\b|\bDATE OF ACCIDENT\b|\bDATE OF INCIDENT\b", 4),
+    (r"\bDATE OF LOSS\b|\bLOSS ?DATE\b|\bDATE OF ACCIDENT\b|\bDATE OF INCIDENT\b", 4),
     (r"\bCLAIMANT\b", 2),
     (r"\bCAUSE OF LOSS\b|\bNATURE OF LOSS\b|\bDETAILS OF LOSS\b|\bPERIL\b|\bLOSS DESCRIPTION\b", 2),
     (r"\bDATE (NOTIFIED|REPORTED|OF NOTIFICATION|INTIMATED)\b|\bNOTIFICATION DATE\b", 1),
@@ -280,6 +281,11 @@ def classify_table(file: str, sheet: str, rows: Sequence[Sequence[Any]], hdr: in
     else:
         return TableType(hdr, end, UNKNOWN, 0.0, ev, ["family ambiguous (premium and claims signals)"], n)
     hits = len(ph) + (1 if band_hit else 0) if fam == PREMIUM else len(ch) + (1 if claimno else 0)
+    if fam == "CLAIM" and hits < 2 and p == 0 and _CLAIM_TITLE_RE.search(title):
+        # A lone claim-number header with no premium column under a 'LOSS
+        # BORDEREAUX' / 'OUTSTANDING CLAIMS' title.
+        hits += 1
+        ev.append("title names claims/losses")
     if hits < 2:
         return TableType(hdr, end, UNKNOWN, 0.0, ev, [f"only {hits} {fam.lower()} signal"], n)
     tab_vote = _explicit(sheet)

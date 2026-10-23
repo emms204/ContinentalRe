@@ -20,7 +20,9 @@ from src.domain.cre_cleaner.core.class_labels import (
     normalize_class_label,
     ordered_class_labels,
     premium_class_hint,
-    resolve_class_label,
+    row_class_label,
+    run_mapped_class,
+    record_class_override_allowed,
     text_for_single_class,
     unapproved_class_rows,
 )
@@ -38,7 +40,7 @@ from src.domain.cre_cleaner.core.class_aliases import (
 )
 from src.domain.cre_cleaner.config import QUARTER_MONTHS
 from src.domain.cre_cleaner.io.excel import workbook_read_cache, write_output_workbook
-from src.domain.cre_cleaner.models import PipelineResult, ExceptionRecord
+from src.domain.cre_cleaner.models import PipelineResult, ExceptionRecord, PremiumRow
 from src.domain.cre_cleaner.timing_log import log_timing
 from src.domain.cre_cleaner.io.pdf import convert_pdfs_in_dir, list_pdfs
 from src.domain.cre_cleaner.core.period_infer import folder_year, infer_period, _iter_excel_paths
@@ -51,8 +53,12 @@ from src.domain.cre_cleaner.core.reconcile import (
     check_row_dates,
     check_row_splits,
     overlap_counts,
+    sheet_copy_key,
     transaction_key,
 )
+from src.domain.cre_cleaner.core.normalize import format_amount
+
+_log = logging.getLogger("cre_cleaner.pipeline")
 
 
 def _by_class_counts(premium_rows, claims_rows, outstanding_rows, class_map=None) -> dict:
@@ -128,6 +134,11 @@ def _drop_ignored_rows(rows, class_getter, ignored):
     for r in rows or []:
         hint = (class_getter(r) or "").strip() or "(blank)"
         a = getattr(r, "audit", None)
+        # Review groups contain only unresolved records. A formerly blank
+        # record already resolved by evidence must not be dropped with them.
+        if getattr(a, "inferred_class", ""):
+            kept.append(r)
+            continue
         fname = getattr(a, "source_filename", "") if a else ""
         sheet = getattr(a, "source_sheet", "") if a else ""
         if _label_is_ignored(hint if hint != "(blank)" else "", fname, sheet, ignored) or (
@@ -161,7 +172,17 @@ def _block_outside_single_class(result, outside_rows, single_class, class_map,
     base = getattr(class_map, "base", None) or class_map
     for (label, fname, sheet), n in buckets.items():
         raw = "" if label == "(blank)" else label
-        builtin = normalize_class_label(raw, base)
+        sample = next(
+            (
+                row for row, getter, _kind in outside_rows
+                if ((getter(row) or "").strip() or "(blank)") == label
+                and (getattr(getattr(row, "audit", None), "source_filename", "") or "") == fname
+                and (getattr(getattr(row, "audit", None), "source_sheet", "") or "") == sheet
+            ),
+            None,
+        )
+        mapped = run_mapped_class(sample) if sample is not None else ""
+        builtin = mapped or normalize_class_label(raw, base)
         if builtin in ("", "Other"):
             builtin = ""
         where = f"{fname} / {sheet}" if fname and sheet else (fname or sheet or "workbook")
@@ -197,6 +218,15 @@ def _block_outside_single_class(result, outside_rows, single_class, class_map,
         "detail": detail,
         "unresolved": unresolved,
     }
+    # Outside-default classes are source-record decisions, not reusable aliases.
+    # Attach IDs even when the built-in vocabulary already recognizes the label.
+    from src.domain.cre_cleaner.core.class_resolution import affected_rows
+    snapshot = [(row, kind, getter) for row, getter, kind in outside_rows]
+    result.summary['unresolved'] = affected_rows(unresolved, snapshot, class_map)
+    for entry in result.summary['unresolved']:
+        entry['requires_row_resolution'] = True
+        entry['expected_class'] = single_class
+        entry['allows_record_class_override'] = bool(getattr(base, 'allow_record_class_override', False))
 
 
 def _record_source_subclasses(result) -> None:
@@ -245,9 +275,17 @@ def _divert_unresolved_class(rows, class_getter, bordereau: str, blocked: Option
     buckets: dict = {}
     for r in rows:
         hint = (class_getter(r) or "").strip()
+        mapped = run_mapped_class(r) or getattr(r.audit, "inferred_class", "")
+        if mapped:
+            if single_class and mapped != single_class and not record_class_override_allowed(r, class_map):
+                if outside is not None:
+                    outside.append((r, class_getter, bordereau))
+                continue
+            kept.append(r)
+            continue
         if single_class:
-            text = text_for_single_class(r, hint)
-            placed = resolve_class_label(text, class_map, single_class)
+            text = text_for_single_class(r, hint, class_map)
+            placed = row_class_label(r, hint, class_map, single_class)
             if placed:
                 kept.append(r)
                 store_hit = confirmed_label(text, class_map)
@@ -264,8 +302,20 @@ def _divert_unresolved_class(rows, class_getter, bordereau: str, blocked: Option
                     )
                     applied[bucket] = applied.get(bucket, 0) + 1
                 continue
+            if getattr(r.audit, 'class_source', '') == 'conflict':
+                # Source contradictions use the ordinary record review and
+                # exclusion path, while their single-class limit stays active.
+                kept.append(r)
+                continue
             if outside is not None:
-                outside.append((r, class_getter, bordereau))
+                base = getattr(class_map, 'base', None) or class_map
+                if getattr(base, 'allow_record_class_override', False):
+                    # Keep opted-in source review rows for the normal blocked /
+                    # ignored partition below. Otherwise exclusions would be
+                    # rejected before the caller's review decision is read.
+                    kept.append(r)
+                else:
+                    outside.append((r, class_getter, bordereau))
             continue
         if hint and (not is_unresolved_class(hint) or confirmed_label(hint, class_map)):
             kept.append(r)
@@ -295,12 +345,15 @@ def _divert_unresolved_class(rows, class_getter, bordereau: str, blocked: Option
                 f"claim={getattr(r, 'claim_no', '')!r} policy={getattr(r, 'policy_no', '')!r} "
                 f"insured={getattr(r, 'insured', '')!r} total={getattr(r, 'total_claims', None)}"
             )
+        money = getattr(r, "gross_premium" if bordereau == "PREMIUM" else "total_claims", None)
         excs.append(ExceptionRecord(
             "WARN", "class_unresolved",
             getattr(a, "source_filename", "") if a else "",
             getattr(a, "source_sheet", "") if a else "",
             getattr(a, "source_row", 0) if a else 0,
             detail,
+            amount=money if isinstance(money, (int, float)) else None,
+            currency=_row_currency(r),
         ))
     if blocked is not None:
         blocked.extend((label, fname, sheet, n) for (label, fname, sheet), n in buckets.items())
@@ -660,6 +713,87 @@ def _drop_duplicate_sources(result, inputs: Sequence[Path]) -> None:
             _mark_secondary_audit(rec, why)
 
 
+def _rows_main_amount(rows) -> str:
+    """Main amount of rows (gross premium / total claims) per currency."""
+    by_ccy: dict = {}
+    for r in rows:
+        v = r.gross_premium if isinstance(r, PremiumRow) else r.total_claims
+        if v is None:
+            continue
+        ccy = getattr(getattr(r, "audit", None), "currency", "") or "NGN"
+        by_ccy[ccy] = by_ccy.get(ccy, 0.0) + float(v)
+    return ", ".join(format_amount(v, c) for c, v in sorted(by_ccy.items())) or format_amount(0)
+
+
+def _banner_cedant_warnings(cedant: str, broker: str, paths, adapter=None) -> list:
+    """WARN banner_cedant_mismatch per sheet whose title rows name another
+    registered cedant than the one this run cleans for."""
+    from src.domain.cre_cleaner.core.batch import banner_cedant_mismatches
+    out = []
+    for p in dict.fromkeys(Path(p) for p in paths):
+        sheets = None
+        reader = getattr(adapter, "read_source_workbook", None)
+        if callable(reader):
+            try:
+                sheets, _notes = reader(p)
+            except Exception:
+                continue  # Parsing reports unreadable sources separately.
+        for sheet, found in banner_cedant_mismatches(p, cedant, broker, sheets=sheets):
+            out.append(ExceptionRecord(
+                "WARN", "banner_cedant_mismatch", p.name, sheet,
+                detail=(f"the sheet banner names {', '.join(found)}, not {cedant.upper()} "
+                        "(the folder's cedant); cleaned as selected — check the file is filed "
+                        "under the right cedant"),
+            ))
+    return out
+
+
+def _drop_duplicate_sheets(result) -> None:
+    """Two tabs of one workbook whose rows of one kind are exactly the same
+    multiset of transactions (e.g. an 'OS CLAIMS PER CLASS' re-sort of the
+    'OS CLAIMS' list): the first tab in workbook order is loaded, the later
+    copy is not (WARN ``duplicate_sheet_not_loaded`` with the amount left
+    out); never double-count. Rows are compared on ``sheet_copy_key`` (FAC,
+    class, currency, insured and policy / claim number included), so tabs
+    that differ in any of those both load. Partial overlaps are kept as in
+    the source."""
+    from collections import Counter
+    kinds = (("premium_rows", "premium"), ("claims_rows", "paid"),
+             ("outstanding_rows", "outstanding"))
+    for attr, label in kinds:
+        tabs: dict = {}                           # (file, sheet) -> rows, first-seen order
+        for r in getattr(result, attr):
+            sheet = getattr(getattr(r, "audit", None), "source_sheet", "") or ""
+            tabs.setdefault((_row_source(r), sheet), []).append(r)
+        owners: dict = {}                         # (file, signature) -> first sheet
+        drop: set = set()
+        for (fname, sheet), rows in tabs.items():
+            if not fname or not sheet:
+                continue
+            sig = frozenset(Counter(sheet_copy_key(r) for r in rows).items())
+            owner = owners.setdefault((fname, sig), sheet)
+            if owner == sheet:
+                continue
+            drop.add((fname, sheet))
+            msg = (f"the {len(rows)} {label} rows of tab {sheet!r} are the same transactions "
+                   f"as tab {owner!r} (FAC, class, currency, insured and policy / claim number "
+                   f"included); not loaded again (never double-count): {_rows_main_amount(rows)} "
+                   "left out")
+            result.exceptions.append(ExceptionRecord(
+                "WARN", "duplicate_sheet_not_loaded", fname, sheet, detail=msg))
+            _log.warning("duplicate_sheet_not_loaded: %s [%s] = [%s]", fname, sheet, owner)
+        if not drop:
+            continue
+        setattr(result, attr, [
+            r for r in getattr(result, attr)
+            if (_row_source(r), getattr(getattr(r, "audit", None), "source_sheet", "") or "")
+            not in drop
+        ])
+        for rec in result.source_audit:
+            if (rec.source_filename, rec.source_sheet) in drop and rec.sheet_type == label:
+                _mark_secondary_audit(rec, f"same {label} transactions as another tab, not loaded")
+
+
 def _premium_file_month(path: Path, quarter: int) -> Optional[int]:
     """The one month a premium file name names inside ``quarter``, else None."""
     from src.domain.cre_cleaner.adapters.base import name_tokens, quarters_in_text, token_month
@@ -784,6 +918,10 @@ def _run_pipeline_impl(
     extra_exceptions: Optional[list] = None,
     class_aliases: Optional[ConfirmedAliases] = None,
     ignored_labels: Optional[list] = None,
+    run_mappings: Optional[Sequence] = None,
+    row_identity_context: str = "",
+    defer_row_mapping_validation: bool = False,
+    class_evidence_records: Sequence = (),
 ) -> PipelineResult:
     """Clean one quarter from ``raw_dir``.
 
@@ -1091,6 +1229,21 @@ def _run_pipeline_impl(
         result.claims_rows = paid_all
         result.outstanding_rows = ost_all
 
+    # Stop publication for unreadable or structurally ambiguous inputs.
+    source_errors = [e for e in result.exceptions if e.reason in {
+        "premium_file_unreadable", "claims_parse_failed", "source_layout_ambiguous",
+    }]
+    if source_errors:
+        result.summary = {
+            "cedant": cedant.upper(), "broker": broker.upper(), "year": year,
+            "quarter": quarter, "error": source_errors[0].reason,
+            "detail": "; ".join(f"{e.source_filename}: {e.detail}" for e in source_errors),
+        }
+        return result
+
+    _drop_duplicate_sheets(result)
+    result.exceptions.extend(_banner_cedant_warnings(
+        cedant, broker, [p for _m, p, _l in month_files] + list(claims_files), adapter=adapter))
     if single_file and len(single_inputs) > 1:
         _drop_duplicate_sources(result, single_inputs)
     if single_file and want_premium:
@@ -1126,11 +1279,82 @@ def _run_pipeline_impl(
             want_claims=want_claims, want_outstanding=want_outstanding,
         )
 
+    overlap_hook = getattr(adapter, "reconcile_source_overlaps", None)
+    if callable(overlap_hook):
+        overlap_hook(result, [p for _m, p, _l in month_files] + list(claims_files))
+        overlap_errors = [e for e in result.exceptions if e.reason == "source_overlap_ambiguous"]
+        if overlap_errors:
+            result.summary = {
+                "cedant": cedant, "broker": broker, "year": year, "quarter": quarter,
+                "error": "source_overlap_ambiguous",
+                "detail": "; ".join(e.detail for e in overlap_errors),
+            }
+            return result
+
     if not include_fac:
         result.premium_rows, result.claims_rows, result.outstanding_rows = _drop_fac_rows(
             result.premium_rows, result.claims_rows, result.outstanding_rows, class_map,
         )
 
+    from src.domain.cre_cleaner.core.class_resolution import (
+        identify_rows, resolve_from_policy_evidence, affected_rows, records,
+    )
+    identity_context = [cedant.upper(), broker.upper(), year, quarter, row_identity_context]
+    identify_rows(result, identity_context)
+    # Output selection must not hide supporting tables in the supplied files.
+    # Only paths already accepted for this quarter are eligible as evidence.
+    evidence = PipelineResult()
+    if not (want_premium and want_claims and want_outstanding):
+        evidence_paths = {p for _m, p, _l in month_files} | set(claims_files) | set(single_inputs)
+        for path in sorted(evidence_paths):
+            try:
+                if not want_premium:
+                    prem, _exc, _audit = parse_premium_file(path, "", include_fac=include_fac, adapter=adapter)
+                    evidence.premium_rows.extend(prem)
+                if not want_claims or not want_outstanding:
+                    paid, ost, _exc, _audit = parse_claims_file(path, include_fac=include_fac, adapter=adapter)
+                    if not want_claims:
+                        evidence.claims_rows.extend(paid)
+                    if not want_outstanding:
+                        evidence.outstanding_rows.extend(ost)
+            except Exception as exc:
+                result.exceptions.append(ExceptionRecord(
+                    "WARN", "class_evidence_unavailable", path.name,
+                    detail=f"Optional supporting tables could not be read: {type(exc).__name__}",
+                ))
+        _drop_duplicate_sheets(evidence)
+        if single_file and len(single_inputs) > 1:
+            _drop_duplicate_sources(evidence, single_inputs)
+        if not include_fac:
+            evidence.premium_rows, evidence.claims_rows, evidence.outstanding_rows = _drop_fac_rows(
+                evidence.premium_rows, evidence.claims_rows, evidence.outstanding_rows, class_map,
+            )
+        identify_rows(evidence, identity_context)
+    # Use only explicit source classifications, before any per-run overrides.
+    resolve_from_policy_evidence(result, class_map, list(records(evidence)) + list(class_evidence_records))
+
+    if run_mappings:
+        # After facultative rows are dropped, so a mapping cannot revive them.
+        from src.domain.cre_cleaner.core.run_mappings import tag_result_rows
+        from src.domain.cre_cleaner.core.run_mappings import RunMappingError, validate_row_targets
+        try:
+            tag_result_rows(result, run_mappings, class_map, ignored_labels)
+            if not defer_row_mapping_validation:
+                validate_row_targets(run_mappings, [result])
+        except RunMappingError as exc:
+            result.summary = {"error": "row_mapping_invalid", "mapping_errors": exc.errors}
+            result.exceptions.append(ExceptionRecord("ERROR", "row_mapping_invalid", detail=str(exc)))
+            return result
+        for item in result.applied_mappings:
+            if not item.get("rows"):
+                continue
+            result.exceptions.append(ExceptionRecord(
+                "INFO", "class_mapping_applied",
+                detail=(f"{item['alias']!r} -> {item['class_name']} "
+                        f"({item['rows']} row(s))"),
+            ))
+
+    review_snapshot = list(records(result))
     diverted_blocked: list = []
     applied_single: dict = {}
     outside_rows: list = []
@@ -1236,9 +1460,9 @@ def _run_pipeline_impl(
             "error": "class_unresolved",
             "detail": detail,
             # Advisory suggestions only: nothing is applied, the run still fails.
-            "unresolved": unresolved_class_entries(
+            "unresolved": affected_rows(unresolved_class_entries(
                 blocked, class_map, cedant=cedant.upper(), broker=broker.upper(),
-            ),
+            ), review_snapshot, class_map),
         }
         return result
 
@@ -1258,6 +1482,23 @@ def _run_pipeline_impl(
                 detail=f"{label!r} -> {single_class} ({n} record(s))",
             ))
         _record_source_subclasses(result)
+
+    if not (result.premium_rows or result.claims_rows or result.outstanding_rows):
+        detail = (
+            "No transaction rows were found for the requested bordereau type. "
+            "Upload a premium, paid-claims or outstanding-claims bordereau; "
+            "summary and profit-commission statements cannot be cleaned as transactions. "
+            "Nothing was published."
+        )
+        result.exceptions.append(ExceptionRecord("ERROR", "no_data_rows", detail=detail))
+        result.summary = {
+            "cedant": cedant.upper(), "broker": broker.upper(), "year": year,
+            "quarter": quarter, "bordereau_type": mode, "error": "no_data_rows",
+            "detail": detail,
+        }
+        if ignored_entries:
+            result.summary["ignored"] = ignored_entries
+        return result
 
     currency_groups = _split_by_currency(
         result.premium_rows, result.claims_rows, result.outstanding_rows,
@@ -1357,48 +1598,6 @@ def _run_pipeline_impl(
                 result.outstanding_rows = ost_c
                 primary = result
 
-    if not result.outputs:
-        # No rows at all — still write an empty NGN workbook so callers get paths.
-        summary = build_summary(
-            cedant=cedant.upper(), broker=broker.upper(), year=year, quarter=quarter,
-            generated_at=generated_at,
-            premium_files=[p.name for _, p, _ in month_files],
-            claims_files=[p.name for p in claims_files],
-            premium_rows=[], claims_rows=[], outstanding_rows=[],
-            exceptions=result.exceptions, notes=notes,
-        )
-        summary["currency"] = "NGN"
-        summary["adapter_status"] = adapter.status_text()
-        summary["split_checks"] = split_counts
-        summary["date_checks"] = date_counts
-        summary["reconciliation"] = []
-        summary["premium_input_mode"] = prem_mode
-        summary["bordereau_type"] = mode
-        summary["field_completeness"] = field_completeness([], [], [])
-        summary["by_class"] = {}
-        if ignored_entries:
-            summary["ignored"] = ignored_entries
-        name = out_name or f"{cedant.upper()}_{broker.upper()}_{year}_Q{quarter}_cleaned.xlsx"
-        if not name.lower().endswith(".xlsx"):
-            name += ".xlsx"
-        cleaned, ec, au = write_output_workbook(
-            template_path=template, output_path=out_dir / name,
-            premium_rows=[], claims_rows=[], outstanding_rows=[],
-            exceptions=result.exceptions, source_audit=result.source_audit,
-            summary=summary, collapsed=collapsed,
-            include_audit_sheets=include_audit_sheets, include_fac=include_fac,
-            proportion_mode=proportion_headers, claims_leading_blank=claims_leading_blank,
-            class_map=class_map,
-        )
-        result.output_path = str(cleaned)
-        result.exceptions_path = str(ec)
-        result.source_audit_path = str(au)
-        result.summary = summary
-        result.outputs.append({
-            "currency": "NGN", "output_path": str(cleaned),
-            "exceptions_path": str(ec), "source_audit_path": str(au),
-            "summary": summary, "premium_rows": 0, "claims_rows": 0, "outstanding_rows": 0,
-        })
 
     return result
 
@@ -1410,6 +1609,15 @@ def run_pipeline(**kwargs) -> PipelineResult:
     t0 = time.perf_counter()
     with workbook_read_cache():
         result = _run_pipeline_impl(**kwargs)
+    from src.domain.cre_cleaner.core.coverage import cleaning_coverage
+    coverage_errors = []
+    try:
+        coverage_mode = normalize_bordereau_type(kwargs.get("bordereau_type"))
+    except ValueError as exc:
+        coverage_mode, coverage_errors = "all", [str(exc)]
+    result.summary["cleaning_coverage"] = cleaning_coverage(
+        result, mode=coverage_mode, errors=coverage_errors,
+    )
     secs = time.perf_counter() - t0
     _timing_log.info(
         "cre_pipeline_timing cedant=%s broker=%s type=%s secs=%.2f",

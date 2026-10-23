@@ -12,6 +12,66 @@
         "store_class": "marine_hull",
         "template_class": "Marine Hull",
         "at": "2026-10-06T21:24:23.424730+00:00"
+      },
+      {
+        "raw_label": "PACKAGE",
+        "store_class": "general_accident",
+        "template_class": "General Accident",
+        "at": "2026-10-23T03:30:39.528024+00:00"
+      },
+      {
+        "raw_label": "LIABILTY",
+        "store_class": "general_accident",
+        "template_class": "General Accident",
+        "at": "2026-10-23T03:30:39.534893+00:00"
+      },
+      {
+        "raw_label": "PACKAGE",
+        "store_class": "general_accident",
+        "template_class": "General Accident",
+        "at": "2026-10-23T03:30:39.537645+00:00"
+      },
+      {
+        "raw_label": "LIABILITY",
+        "store_class": "general_accident",
+        "template_class": "General Accident",
+        "at": "2026-10-23T03:30:39.541628+00:00"
+      },
+      {
+        "raw_label": "PACKAGE",
+        "store_class": "general_accident",
+        "template_class": "General Accident",
+        "at": "2026-10-23T03:30:39.544557+00:00"
+      },
+      {
+        "raw_label": "LIABILITY",
+        "store_class": "general_accident",
+        "template_class": "General Accident",
+        "at": "2026-10-23T03:30:39.548756+00:00"
+      },
+      {
+        "raw_label": "PACKAGE",
+        "store_class": "general_accident",
+        "template_class": "General Accident",
+        "at": "2026-10-23T03:30:39.551513+00:00"
+      },
+      {
+        "raw_label": "PACKAGE",
+        "store_class": "general_accident",
+        "template_class": "General Accident",
+        "at": "2026-10-23T03:30:39.554319+00:00"
+      },
+      {
+        "raw_label": "LIABILITY",
+        "store_class": "general_accident",
+        "template_class": "General Accident",
+        "at": "2026-10-23T03:30:39.556975+00:00"
+      },
+      {
+        "raw_label": "PACKAGE",
+        "store_class": "general_accident",
+        "template_class": "General Accident",
+        "at": "2026-10-23T03:30:39.559760+00:00"
       }
     ],
     "9cbf42b7-c66e-4022-955e-2b8dde4f5c9b": [
@@ -27,7 +87,35 @@
         "template_class": "Marine Hull",
         "at": "2026-10-07T17:39:58.000255+00:00"
       }
+    ],
+    "0957404c-99a2-4624-997d-388a8b374549": [
+      {
+        "raw_label": "MARINE CLAIM",
+        "store_class": "marine_cargo",
+        "template_class": "Marine Cargo",
+        "at": "2026-10-21T16:21:30.329215+00:00"
+      },
+      {
+        "raw_label": "Marine",
+        "store_class": "marine_cargo",
+        "template_class": "Marine Cargo",
+        "at": "2026-10-21T16:21:30.335496+00:00"
+      },
+      {
+        "raw_label": "Marine",
+        "store_class": "marine_cargo",
+        "template_class": "Marine Cargo",
+        "at": "2026-10-21T16:21:30.340105+00:00"
+      }
+    ],
+    "59c01ea9-f8bb-468d-9587-4e625d8c7240": [
+      {
+        "raw_label": "MD/BI",
+        "store_class": "general_accident",
+        "template_class": "General Accident",
+        "at": "2026-10-22T02:21:10.552593+00:00"
+      }
     ]
   },
-  "updated_at": "2026-10-07T17:39:58.000267+00:00"
+  "updated_at": "2026-10-23T03:30:39.559768+00:00"
 }

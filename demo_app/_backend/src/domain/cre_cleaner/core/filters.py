@@ -45,7 +45,7 @@ def _key_text(row: Sequence[Any], idx: Optional[int]) -> str:
 def has_transaction_identifiers(row: Sequence[Any], key_cols: Sequence[Optional[int]]) -> bool:
     """Real insured AND a real policy no (or claim no, key_cols[2]) on the row.
 
-    The identifier must be text, not a bare number (a misplaced amount/count),
+    The identifier must be text, not a bare numeric cell (a misplaced amount/count),
     and the insured cell must not itself be a total label.
     """
     if len(key_cols) < 2:
@@ -55,7 +55,11 @@ def has_transaction_identifiers(row: Sequence[Any], key_cols: Sequence[Optional[
         return False
     for idx in key_cols[1:3]:
         ident = _key_text(row, idx)
-        if ident and parse_number(ident) is None:
+        raw = row[idx] if idx is not None and idx < len(row) else None
+        # PDF converters preserve long digit-only policy IDs as text. They
+        # are identifiers, unlike formatted monetary text or numeric cells.
+        numeric_id = isinstance(raw, str) and re.fullmatch(r"[0-9]{8,40}", ident)
+        if ident and (parse_number(ident) is None or numeric_id):
             return True
     return False
 

@@ -58,7 +58,12 @@ from src.domain.cre_cleaner.adapters.base import (
     years_in_text,
 )
 from src.domain.cre_cleaner.config import QUARTER_MONTHS
-from src.domain.cre_cleaner.core.normalize import clean_text, normalize_header, parse_date
+from src.domain.cre_cleaner.core.normalize import (
+    clean_text,
+    is_excel_serial_date,
+    normalize_header,
+    parse_date,
+)
 
 _MONTH_TO_Q = {m: q for q, months in QUARTER_MONTHS.items() for m in months}
 
@@ -152,6 +157,9 @@ class PeriodInference:
     # WARN text for period_label_conflict. Empty when the label rule did not
     # run or the label and the dates do not conflict. Exceptions file only.
     period_label_warning: str = ""
+    # WARN text for period_year_from_span: the label names a two-year span
+    # (e.g. "2024-2025 Q1") and the later year was taken. Exceptions file only.
+    period_year_warning: str = ""
 
     @property
     def ok(self) -> bool:
@@ -337,10 +345,58 @@ def _iter_excel_paths(raw_dir: Path) -> List[Path]:
     )
 
 
+_BANNER_SCAN_ROWS = 12
+# A row with this many filled cells is a table row, not a title; with fewer
+# (but at least _TABLE_ROW_MIN_CELLS) it is one when it holds amounts.
+_TABLE_ROW_CELLS = 8
+_TABLE_ROW_MIN_CELLS = 4
+_TABLE_ROW_MIN_AMOUNTS = 2
+_YEAR_MIN, _YEAR_MAX = 1990, 2100
+_QUARTER_NUMBERS = (1, 2, 3, 4)
+# A row with fewer filled cells that names a year header is a label row
+# ('UNDERWRITING YEAR: | 2021'), not a column header.
+_YEAR_LABEL_ROW_CELLS = 3
+_PERIOD_WORD_RE = re.compile(r"\b(?:PERIOD|FROM|TO|AS\s*AT)\b", re.IGNORECASE)
+
+
+def _is_amount_cell(c: Any) -> bool:
+    if isinstance(c, bool) or not isinstance(c, (int, float)):
+        return False
+    if float(c).is_integer() and (c in _QUARTER_NUMBERS or _YEAR_MIN <= c <= _YEAR_MAX):
+        return False
+    return True
+
+
+def _with_serial_dates(r: Sequence[Any]) -> List[Any]:
+    """A banner row naming a period word ('PERIOD FROM' | 45292 | 'TO' |
+    45382) holds its dates as Excel serials: read those cells as dates."""
+    if not any(isinstance(c, str) and _PERIOD_WORD_RE.search(c) for c in r):
+        return list(r)
+    out = []
+    for c in r:
+        d = parse_date(c) if is_excel_serial_date(c) else None
+        out.append(d.strftime("%Y-%m-%d") if d is not None else c)
+    return out
+
+
+def _is_table_row(r: Sequence[Any]) -> bool:
+    """Column-header or data row, not a title: a policy row's cover dates
+    ("2025-05-17 To 2026-03-25") or a remark ("REVERSAL … Q4 2024") must not
+    be read as the reporting-period banner."""
+    filled = [c for c in r if c not in (None, "") and str(c).strip()]
+    if len(filled) >= _TABLE_ROW_CELLS:
+        return True
+    return (len(filled) >= _TABLE_ROW_MIN_CELLS
+            and sum(_is_amount_cell(c) for c in filled) >= _TABLE_ROW_MIN_AMOUNTS)
+
+
 def _scan_banner(rows, detail, evidence) -> Optional[Tuple[int, int]]:
     """First title row that names a reporting period. Sheet names are not read."""
     banner_period = None
-    for r in rows[:12]:
+    for r in rows[:_BANNER_SCAN_ROWS]:
+        r = _with_serial_dates(r)
+        if _is_table_row(r):
+            continue
         text = " ".join(str(c) for c in r if c not in (None, ""))
         if not text.strip():
             continue
@@ -419,6 +475,10 @@ def _collect_dates_from_sheet(
                 weights[j] = w
             elif _is_year_only_header(str(cell)):
                 ycols.append(j)
+        if ycols and sum(1 for c in row if c not in (None, "") and str(c).strip()) < _YEAR_LABEL_ROW_CELLS:
+            # 'UNDERWRITING YEAR: | 2021' is a label row above the table, not
+            # a year column header (the cells under it are other columns).
+            ycols = []
         if len(weights) >= 1 or ycols:
             if header_idx is None or sum(weights.values()) > sum(col_weights.values()):
                 header_idx = i
@@ -967,6 +1027,12 @@ def _parse_label_source(text: str) -> Tuple[Optional[int], Optional[int], bool]:
     return quarter, year, False
 
 
+def _year_span(text: str) -> Optional[Tuple[int, int]]:
+    """The two consecutive years of a fiscal span in ``text`` (e.g. 2024-2025)."""
+    ys = sorted(set(years_in_text(text)))
+    return (ys[0], ys[1]) if len(ys) == 2 and ys[1] - ys[0] == 1 else None
+
+
 def _statement_label_texts(path: Path) -> List[str]:
     """Banner labels only, de-duplicated by text. Sheet names are not labels."""
     from src.domain.cre_cleaner.io.excel import read_workbook_sheets
@@ -1002,6 +1068,7 @@ def label_period(path: Path, *, folder_year: Optional[int] = None) -> Optional[P
     fn_q, fn_y, fn_bad = _parse_label_source(path.stem)
     banner_q = banner_y = None
     banner_bad = False
+    banner_span: Optional[Tuple[int, int]] = None
     parsed = []
     for text in _statement_label_texts(path):
         q, y, bad = _parse_label_source(text)
@@ -1009,6 +1076,7 @@ def label_period(path: Path, *, folder_year: Optional[int] = None) -> Optional[P
             banner_bad = banner_bad or bad
             continue
         parsed.append((q, y))
+        banner_span = banner_span or _year_span(text)
     quarters = {q for q, _y in parsed}
     if len(quarters) > 1:
         banner_bad = True
@@ -1033,7 +1101,8 @@ def label_period(path: Path, *, folder_year: Optional[int] = None) -> Optional[P
         ))
     if fn_q is not None and not fn_bad:
         quarter, source, year = fn_q, "file name", fn_y
-        if year is None and banner_y is not None:
+        # A banner naming another quarter is stale: its year is not this file's.
+        if year is None and banner_y is not None and banner_q == fn_q:
             year = banner_y
     elif banner_q is not None:
         quarter, source, year = banner_q, "banner", banner_y if banner_y is not None else fn_y
@@ -1048,12 +1117,16 @@ def label_period(path: Path, *, folder_year: Optional[int] = None) -> Optional[P
     )
     if year is None and folder_year is not None:
         year = int(folder_year)
-    if year is None and date_inf.year is not None:
-        year = int(date_inf.year)
+    if year is None:
+        # Dates give the year only when the whole content (banners included)
+        # settles it; a stale banner against the dates leaves it unresolved.
+        content = infer_period_from_workbook_content([path], named=(None, None, []))
+        if content.ok:
+            year = int(content.year)
     result = PeriodInference(
         year=year, quarter=int(quarter), confidence="high", source="label",
         evidence=[f"label {year} Q{quarter} from {source}"],
-        notes=notes,
+        notes=notes, sheet_kinds=list(date_inf.sheet_kinds), claims_weak=bool(date_inf.claims_weak),
     )
     parts = []
     if fn_q is not None and banner_q is not None and (
@@ -1076,8 +1149,22 @@ def label_period(path: Path, *, folder_year: Optional[int] = None) -> Optional[P
     if parts and year is not None:
         result.period_label_warning = (
             f"{path.name}: label {year} Q{quarter} from {source}; " + "; ".join(parts)
+            + f"; cleaned as {year} Q{quarter}, the quarter the file states"
         )
         result.notes.append(("WARN", "period_label_conflict", result.period_label_warning))
+    span = None
+    if fn_y is not None and year == fn_y:
+        span = _year_span(path.stem)
+    if span is None and banner_y is not None and year == banner_y:
+        span = banner_span
+    if span is not None:
+        result.period_year_warning = (
+            f"{path.name}: the label names the span {span[0]}-{span[1]}, not one year; "
+            f"cleaned as {year} Q{quarter} (the later year)"
+            + (f"; the dates say {date_txt}" if date_inf.ok and date_txt != f"{year} Q{quarter}" else "")
+            + ". Confirm which year this quarter belongs to."
+        )
+        result.notes.append(("WARN", "period_year_from_span", result.period_year_warning))
     return result
 
 
@@ -1114,9 +1201,11 @@ def infer_period(
     (IMPL-20261006-04), used by ``filename_period`` like a year-named folder
     when a file's own path has none.
 
-    ``period_source="label"`` (AIICO AGRIC-DIRECT): the quarter in the file
-    name, else a statement banner, wins over the date ranges. Every other
-    partner stays on ``content``.
+    ``period_source="label"`` (the adapter default): the quarter in the file
+    name, else a statement banner, wins over the date ranges; treaty-year
+    quarters are not translated and a date disagreement is WARN
+    ``period_label_conflict``. Adapters that set ``content`` keep the
+    date-range logic.
     """
     raw_dir = Path(raw_dir)
     excel_paths = _iter_excel_paths(raw_dir)

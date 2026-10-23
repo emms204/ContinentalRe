@@ -28,16 +28,28 @@ _TEMPLATE_CLASSES_2026_10: Dict[str, str] = {
 }
 
 STORE_CLASS_TO_TEMPLATE: Dict[str, Dict[str, str]] = {
+    'CORNERSTONE': {**_TEMPLATE_CLASSES_2026_10, "life": "Life"},
+    'LEADWAY': dict(_TEMPLATE_CLASSES_2026_10),
+    'LINKAGE': dict(_TEMPLATE_CLASSES_2026_10),
+    'SANLAM GENERAL INSURANCE': dict(_TEMPLATE_CLASSES_2026_10),
+    'SUNU': dict(_TEMPLATE_CLASSES_2026_10),
     "AIICO": dict(_TEMPLATE_CLASSES_2026_10),
-    "AXA": dict(_TEMPLATE_CLASSES_2026_10),
+    # Bisola's AXA gold names this class 'Energy', not 'Oil & Gas'.
+    "AXA": {**_TEMPLATE_CLASSES_2026_10, "oil_and_energy": "Energy"},
     "CHI": dict(_TEMPLATE_CLASSES_2026_10),
     "CUSTODIAN": dict(_TEMPLATE_CLASSES_2026_10),
+    # EMPLE 2025 workbooks add a MOTOR tab (Manual mapping: Motor → MOTOR).
+    "EMPLE": {**_TEMPLATE_CLASSES_2026_10, "motor": "Motor"},
     "HEIRS": dict(_TEMPLATE_CLASSES_2026_10),
     "LASACO": dict(_TEMPLATE_CLASSES_2026_10),
     "MUTUAL BENEFITS": dict(_TEMPLATE_CLASSES_2026_10),
     "NEM": dict(_TEMPLATE_CLASSES_2026_10),
+    "NSIA": dict(_TEMPLATE_CLASSES_2026_10),
+    # Prestige reports Motor and Aviation as their own classes.
+    "PRESTIGE": {**_TEMPLATE_CLASSES_2026_10, "motor": "Motor", "aviation": "Aviation"},
     "ROYAL EXCHANGE": dict(_TEMPLATE_CLASSES_2026_10),
     "UNITRUST": dict(_TEMPLATE_CLASSES_2026_10),
+    "ZENITH": dict(_TEMPLATE_CLASSES_2026_10),
 }
 
 

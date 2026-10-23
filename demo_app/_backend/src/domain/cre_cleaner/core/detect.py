@@ -13,13 +13,14 @@ PREMIUM_MARKERS = {
     "GROSS PREMIUM", "PERIOD OF INSURANCE", "DEBIT NOTE",
 }
 PAID_MARKERS = {
-    "CLAIM NO", "CLAIM NUMBER", "DATE OF LOSS", "LOSS DATE",
-    "TOTAL CLAIMS", "TOTAL CLAIMS PAID", "PAID CLAIMS",
+    "CLAIM NO", "CLAIM NUMBER", "CLAIMS NO", "CLAIMS NUMBER", "DATE OF LOSS", "LOSS DATE",
+    "LOSSDATE", "TOTAL CLAIMS", "TOTAL CLAIMS PAID", "PAID CLAIMS", "AMOUNT PAID",
 }
 OST_MARKERS = {
     "OST RESERVE", "OUTSTANDING", "TOTAL OST", "OWN SHARE",
 }
 NIL_LIKE = {"NIL", "N/A", "NA", "NONE", "-"}
+_CLAIMANT_WORDS = ("INSURED", "ASSURED", "CLAIMANT", "PAYEE")
 
 
 @dataclass(frozen=True)
@@ -33,14 +34,28 @@ class SheetTypeRules:
                            bordereaux) — such tabs are skipped unless PREM.
     paid_without_claim:    a 'PAID' tab name is a paid-claims tab even
                            without the word CLAIM.
+    class_noise_words:     whole words dropped from a tab name before it is
+                           used as a class label ('G.A NAIRA' / 'G.A DOLLAR'
+                           → 'G.A').
     """
     ost_tokens: FrozenSet[str] = field(default_factory=lambda: frozenset({"OST"}))
     ost_slash: bool = False
     dump_tokens: FrozenSet[str] = field(default_factory=frozenset)
     paid_without_claim: bool = False
+    class_noise_words: FrozenSet[str] = field(default_factory=frozenset)
 
 
 GENERIC_SHEET_RULES = SheetTypeRules()
+_SUMMARY_TAB_WORDS = frozenset({"SUMMARY", "STATEMENT", "RECAP"})
+
+
+def summary_tab_word(sheet_name: str) -> str:
+    """The SUMMARY / STATEMENT / RECAP word naming a totals tab, or ''."""
+    toks = set(re.findall(r"[A-Z0-9]+", normalize_header(sheet_name)))
+    return next(iter(sorted(toks & _SUMMARY_TAB_WORDS)), "")
+
+
+SUMMARY_TAB_AUDIT_NOTE = "{word} tab skipped: totals, not transactions (by tab name)"
 
 
 def _row_headers(row: Sequence[Any]) -> List[str]:
@@ -81,6 +96,12 @@ def find_header_row(
         joined = " ".join(headers)
         if not any(m in joined for m in must):
             continue
+        if sheet_type != "premium" and "CLAIM" in joined and "POLICY" in joined and any(
+            p in joined for p in _CLAIMANT_WORDS
+        ):
+            # Claim no + policy + insured/payee columns identify a claims header
+            # even when the amount columns use no marker word.
+            sc += 1
         # Prefer rows that look like column labels (shortish cells)
         if sc > best_score:
             best_score = sc
@@ -95,6 +116,10 @@ def detect_sheet_type(
     rules = rules or GENERIC_SHEET_RULES
     name = normalize_header(sheet_name)
     toks = set(re.findall(r"[A-Z0-9]+", name))
+    # Statement / summary / recap tabs hold totals, not transactions (as in
+    # table_type's content typing).
+    if toks & _SUMMARY_TAB_WORDS:
+        return "skip"
     # Whole-word outstanding tokens only (substring "OS" appears inside LOSS,
     # CROSS, …); the token set comes from the rules.
     is_ost_name = (
@@ -134,7 +159,8 @@ def detect_sheet_type(
         headers = _row_headers(sample_rows[hdr])
         joined = " ".join(headers)
         if "CLAIM" in joined:
-            if any(x in joined for x in ("OST", "OUTSTANDING", "OWN SHARE", "RESERVE")):
+            if any(x in joined for x in ("OST", "OUTSTANDING", "OWN SHARE", "RESERVE")) or \
+                    re.search(r"\bO S\b", joined):
                 return "outstanding"
             return "paid"
         if "PREMIUM" in joined or "SUM INSURED" in joined:
@@ -150,7 +176,19 @@ def detect_sheet_type(
     return "skip"
 
 
-def class_from_sheet_name(sheet_name: str) -> str:
+def class_from_sheet_name(sheet_name: str, rules: Optional[SheetTypeRules] = None) -> str:
+    noise = rules.class_noise_words if rules is not None else frozenset()
+    if noise:
+        # 'T-' (ending in a hyphen) is a prefix glued to the next word
+        # ('T-RECOVERY'); other entries are whole words.
+        alts = [
+            re.escape(w) + r"(?=[A-Z0-9])" if w.endswith("-") else re.escape(w) + r"(?![A-Z0-9])"
+            for w in sorted(noise, key=len, reverse=True)
+        ]
+        sheet_name = re_sub_spaces(re.sub(r"\(\s*\)", " ", re.sub(
+            rf"(?<![A-Z0-9])(?:{'|'.join(alts)})", " ", clean_text(sheet_name),
+            flags=re.IGNORECASE,
+        ))).strip(" -")
     raw = clean_text(sheet_name).upper()
     if "FAC" in raw and "OBLIG" in raw:
         return "FACULTATIVE"
@@ -206,7 +244,9 @@ def _sheet_class_key_matches(key: str, name: str, words: List[str]) -> bool:
 _NON_CLASS_TAB_WORDS = {
     "PREMIUM", "PREMIUMS", "PREM", "CLAIM", "CLAIMS", "PAID", "OUTSTANDING", "OUT",
     "OST", "OS", "LOSS", "LOSSES", "BORDEREAU", "BORDEREAUX", "BORDERAUX", "BORD",
-    "BORDREAUX", "BOEREAUX", "BOARDEREUX", "BOADEREUX", "RETURNS", "RETURN",
+    "BORDREAUX", "BOEREAUX", "BOARDEREUX", "BOADEREUX", "BORDEAUX", "BORDEREUX",
+    "BORDREAU", "BORDERAUS", "BORDERAUXX", "BORDER", "RETURNS", "RETURN",
+    "SETTLED", "OUTST", "OUTS", "CLM", "PD", "DOMESTIC", "FOREIGN", "LOCAL",
     "CESSION", "TTY", "QUARTER", "QTR", "AND", "N", "SHEET", "NIL", "SCHEDULE",
     "RESERVE", "RESERVES", "FOR", "THE", "OF", "SUMMARY", "RECOVERY", "PROD",
     "PRODUCTION", "LISTING", "CONFIRMATION",

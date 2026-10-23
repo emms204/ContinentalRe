@@ -12,6 +12,25 @@ from typing import Any, Optional, Tuple
 _WS_RE = re.compile(r"\s+")
 _NON_HEADER_CHARS_RE = re.compile(r"[^A-Z0-9%]+")
 _STR_CACHE_SIZE = 65536
+# Excel date serials read as dates only inside this range (1990-01-01 to
+# 2100-01-01); other numbers are amounts, years or counts.
+EXCEL_SERIAL_MIN = 32874
+EXCEL_SERIAL_MAX = 73050
+
+
+def is_excel_serial_date(val: Any) -> bool:
+    return (isinstance(val, (int, float)) and not isinstance(val, bool)
+            and EXCEL_SERIAL_MIN <= val <= EXCEL_SERIAL_MAX)
+
+
+def format_amount(amount: Any, currency: str = "NGN") -> str:
+    """'₦1,234.50' (or 'USD 1,234.50') for WARN details."""
+    try:
+        value = float(amount or 0.0)
+    except (TypeError, ValueError):
+        return str(amount)
+    code = (currency or "NGN").upper()
+    return f"₦{value:,.2f}" if code == "NGN" else f"{code} {value:,.2f}"
 
 
 def clean_text(val: Any) -> str:
@@ -124,7 +143,17 @@ def _parse_date_any(val: Any) -> Optional[datetime]:
     s = clean_text(val)
     if not s or s.upper() in {"NIL", "N/A", "NA"}:
         return None
-    # Drop trailing time if present
+    s = re.sub(r"(?<=\d)(?:st|nd|rd|th)\b", "", s, flags=re.IGNORECASE)
+    s = re.sub(r",\s*", ", ", s)
+    s = re.sub(r"([A-Za-z])(\d{4})\b", r"\1 \2", s)
+    # Python's %b accepts Sep, whereas source returns also use Sept.
+    # A whole-token replacement leaves full month names/unrelated text intact.
+    s = re.sub(r"\bSEPT\b", "Sep", s, flags=re.IGNORECASE)
+    try:
+        d = datetime.fromisoformat(s)
+        return datetime(d.year, d.month, d.day)
+    except ValueError:
+        pass
     for fmt in (
         "%d/%m/%Y",
         "%d-%m-%Y",
@@ -141,7 +170,7 @@ def _parse_date_any(val: Any) -> Optional[datetime]:
         "%m/%d/%Y",
     ):
         try:
-            return datetime.strptime(s[:20].strip(), fmt)
+            return datetime.strptime(s, fmt)
         except ValueError:
             continue
     return None
@@ -165,8 +194,9 @@ def parse_period(val: Any) -> Tuple[Optional[datetime], Optional[datetime]]:
     if val is None or val == "":
         return None, None
     if isinstance(val, (datetime, date)):
-        d = parse_date(val)
-        return d, None
+        return parse_date(val), None
+    if isinstance(val, (int, float)) and not isinstance(val, bool):
+        return (parse_date(val) if is_excel_serial_date(val) else None), None
     s = clean_text(val)
     # A lone date may itself contain dashes ('01-Jan-2025'); try it whole first.
     d = parse_date(s)
@@ -193,6 +223,7 @@ _CURRENCY_TOKENS = {
 }
 _CURRENCY_SYMBOLS = (("US$", "USD"), ("$", "USD"), ("₦", "NGN"), ("€", "EUR"), ("£", "GBP"))
 _NAMED_CURRENCIES = frozenset({"NGN", "USD", "EUR", "GBP"})
+_FOREIGN_CURRENCY_RE = re.compile(r"\bFOREIGN[\s_-]+CURRENC(?:Y|IES)\b")
 # Insurer system exports: "Currency Filter ( NAIRA at 1 )" is authoritative;
 # the report title "… FOREIGN CURRENCY" is a template label, not the book currency.
 _CURRENCY_FILTER_RE = re.compile(
@@ -204,16 +235,22 @@ _CURRENCY_FILTER_RE = re.compile(
 def currency_codes(text: Any) -> set:
     """Currency codes named in a filename / sheet name / header cell.
 
-    FCY ("foreign currency") is kept as its own code: the source does not say
-    which currency, so it must not be assumed to be USD.
+    Explicit FCY / "foreign currency" is kept as its own code: the source
+    does not say which currency, so it must not be assumed to be USD.
+    "Foreign treaty" describes the treaty, not the currency of its amounts.
     """
     s = clean_text(text).upper()
     if not s:
         return set()
+    # A counterparty name is not currency evidence. Keep standalone Sterling,
+    # Pound Sterling, symbols and explicit codes (including elsewhere in the cell).
+    s = re.sub(r"\bSTERLING(?=\s+(?:ASSURANCE|INSURANCE|BANK|COMPANY)\b)", "", s)
     found = {code for sym, code in _CURRENCY_SYMBOLS if sym in s}
     for tok in re.split(r"[^A-Z]+", s):
-        if tok in _CURRENCY_TOKENS:
+        if tok != "FOREIGN" and tok in _CURRENCY_TOKENS:
             found.add(_CURRENCY_TOKENS[tok])
+    if _FOREIGN_CURRENCY_RE.search(s):
+        found.add("FCY")
     return found
 
 
@@ -250,6 +287,10 @@ def currency_code(text: Any) -> str:
     s = clean_text(text).upper()
     if s in {"N", "NGN", "₦"}:
         return "NGN"
+    if s == "FOREIGN":
+        # Here the value is explicitly in a CURRENCY column, rather than
+        # appearing incidentally in a treaty/report heading.
+        return "FCY"
     codes = prefer_named_over_fcy(currency_codes(s))
     return codes.pop() if len(codes) == 1 else ""
 

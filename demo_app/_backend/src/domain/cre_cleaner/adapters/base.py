@@ -17,12 +17,17 @@ from src.domain.cre_cleaner.core.map_columns import (
     ColumnMap,
     PremiumLayoutRules,
     detect_premium_allocation_blocks,
+    fill_unmapped_field,
     map_simple_columns,
     merged_aliases,
+    pair_band_ppn_columns,
 )
+from src.domain.cre_cleaner.core.normalize import normalize_header
 from src.domain.cre_cleaner.core.table_type import GENERIC_VOCAB, TableVocab
 
-EXCEL_SUFFIXES = {".xlsx", ".xls", ".xlsm"}
+from src.domain.cre_cleaner.config import SOURCE_WORKBOOK_SUFFIXES
+
+EXCEL_SUFFIXES = SOURCE_WORKBOOK_SUFFIXES
 
 _MONTH_ABBR = {
     1: "JAN", 2: "FEB", 3: "MAR", 4: "APR", 5: "MAY", 6: "JUN",
@@ -176,6 +181,12 @@ class BaseAdapter(ABC):
     # these hooks; the shared core only knows generic, 100%-level names.
     premium_alias_extra: Dict[str, List[str]] = {}
     claims_alias_extra: Dict[str, List[str]] = {}
+    # Exact claims headers used as TOTAL CLAIMS only when no total-claims
+    # alias matched (e.g. 'AMOUNT PAID' beside a 'TOTAL CLAIMS PAID' that
+    # adds the adjuster's fee must lose to that total), keyed by claims tab
+    # type: a paid tab only falls back to paid headers, an outstanding tab
+    # only to outstanding ones. Each use is a WARN.
+    claims_total_fallback: Dict[str, Tuple[str, ...]] = {}
     # Premium RET / TREATY / FAC band vocabulary and layout rules.
     premium_layout_rules: PremiumLayoutRules = GENERIC_PREMIUM_RULES
     # Tab-name typing vocabulary (outstanding tokens, dump tabs, PAID tabs).
@@ -185,6 +196,10 @@ class BaseAdapter(ABC):
     # Extra source class → Bisola class keys (and short exact-only keys).
     class_label_extra: Dict[str, str] = {}
     class_label_exact_only: frozenset = frozenset()
+    # True = on a claims tab whose name gives a class, that class wins over
+    # the row CLASS column (which then holds a policy sub-class or a code, e.g.
+    # 'PLANT ALL RISK' on an engineering claims tab). Premium already does so.
+    claims_sheet_class_first: bool = False
     # RETENTION | TREATY band row + %/AMOUNT/SI sub-row header layout is
     # merged into one header when such a sub-row is present (generic, as
     # before IMPL-04; many cedants rely on it). False = adapter opts out.
@@ -211,11 +226,13 @@ class BaseAdapter(ABC):
     # is not a SETTING_CHOICES tuple because any approved class is legal.
     # period_source: "content" keeps date ranges and banners as the reporting
     # period. "label" uses the quarter named by the file, then a statement
-    # banner, and leaves the sheet dates as a conflict note.
+    # banner, and leaves the sheet dates as a conflict note (WARN
+    # period_label_conflict). Bisola 2026-10-14: the quarter is the one the
+    # file states, treaty-year quarters are not translated -> "label".
     BASE_SETTINGS: Dict[str, Any] = {
         "uw_year_from_start_date": False, "tsi_gp_basis": "100", "claims_ppn_calculated": False,
         "single_class": None,
-        "period_source": "content",
+        "period_source": "label",
     }
     SETTING_CHOICES: Dict[str, Tuple[Any, ...]] = {
         "uw_year_from_start_date": (False, True), "tsi_gp_basis": ("100", "our_share"),
@@ -228,6 +245,10 @@ class BaseAdapter(ABC):
     # (core.table_type) and in-period files outside the controlling set are
     # scanned for duplicates. False = name rules decide; content is advisory.
     content_sheet_typing: bool = False
+    # True = a claims tab typed 'paid' from its headers alone (its name says
+    # neither paid nor outstanding) is outstanding when the file name says
+    # OUTSTANDING and not PAID / SETTLED. Flagged per tab.
+    outstanding_by_file_name: bool = False
 
     def __init__(self) -> None:
         # (severity, reason, filename, detail) raised during discovery
@@ -296,6 +317,17 @@ class BaseAdapter(ABC):
             exclude=self.premium_exclude,
         )
 
+    def premium_header_row(self, raw_rows: List[List[Any]], found: int) -> int:
+        """Premium header row to use (default: the detected one)."""
+        return found
+
+    def premium_header_cells(
+        self, raw_rows: List[List[Any]], header_at: int, header: Sequence[Any],
+        group_row: Optional[Sequence[Any]],
+    ) -> Tuple[List[Any], Optional[Sequence[Any]]]:
+        """Premium header cells and band row to map (default: unchanged)."""
+        return list(header), group_row
+
     def map_premium_columns(
         self,
         header: Sequence[Any],
@@ -307,8 +339,35 @@ class BaseAdapter(ABC):
     ) -> ColumnMap:
         return self.detect_premium_allocation_blocks(header, group_row)
 
-    def map_claims_columns(self, header: Sequence[Any], aliases: Dict[str, List[str]]) -> ColumnMap:
-        return map_simple_columns(header, aliases, exclude=self.claims_exclude)
+    def claims_header_cells(
+        self, header: Sequence[Any], band_row: Optional[Sequence[Any]],
+        data_rows: Sequence[Sequence[Any]] = (), notes: Optional[list] = None,
+    ) -> List[Any]:
+        """Claims header cells to map (default: unchanged). ``band_row`` is the
+        row above the header, for layouts that name RET / TREATY / FAC there;
+        ``data_rows`` the block's rows, for checks on the values. A rewrite
+        that moves money columns appends (severity, reason, detail) to
+        ``notes`` (raised as exceptions on the header row)."""
+        return list(header)
+
+    def claims_band_row(
+        self, raw_rows: List[List[Any]], header_at: int, band_row: Optional[Sequence[Any]],
+    ) -> Optional[Sequence[Any]]:
+        """Band row passed to ``claims_header_cells`` (default: the row above)."""
+        return band_row
+
+    def map_claims_columns(
+        self, header: Sequence[Any], aliases: Dict[str, List[str]], sheet_type: str = "",
+    ) -> ColumnMap:
+        cm = map_simple_columns(header, aliases, exclude=self.claims_exclude)
+        pair_band_ppn_columns(cm, header)
+        if cm.get("total_claims") is not None:
+            return cm
+        fill_unmapped_field(cm, header, "total_claims", self.claims_total_fallback.get(sheet_type, ()))
+        i = cm.get("total_claims")
+        if i is not None:
+            cm.total_fallback = normalize_header(header[i])
+        return cm
 
     def class_map(self) -> Optional[ClassMap]:
         """Generic class map + this adapter's extras (None = generic only)."""
@@ -432,7 +491,7 @@ class QuarterlyWorkbookAdapter(BaseAdapter):
             if p.suffix.lower() not in EXCEL_SUFFIXES:
                 note = (
                     "INFO", "unsupported_file_type", p.name,
-                    f"{label}: {p.suffix or 'no extension'} not read (Excel .xlsx/.xls only"
+                    f"{label}: {p.suffix or 'no extension'} not read (Excel .xlsx/.xls/.xlsm/.xlsb/.ods only"
                     + ("; unzip it first" if p.suffix.lower() == ".zip" else "") + ")",
                 )
                 if note not in self.discovery_notes:

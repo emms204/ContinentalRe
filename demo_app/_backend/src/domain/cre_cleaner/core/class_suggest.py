@@ -192,7 +192,15 @@ def _abstain(reason: str, classes: Sequence[str] = ()) -> Dict[str, Any]:
 def suggest_class(raw: Any, class_map: Optional[ClassMap] = None) -> Dict[str, Any]:
     """``{"suggestion": {class, rule, matched_against} | None, "suggestion_reason": str | None,
     "suggestion_candidates": [classes tied, when ambiguous]}``. Pure and deterministic."""
-    label = normalize_for_suggestion(raw)
+    # Sheet titles carry transaction and period suffixes, not class evidence.
+    # Keep this cleanup local to advisory suggestions: the normalizer is also
+    # used by confirmed aliases and run-scoped ignores, whose scope must stay.
+    words = _words(raw)
+    context = {"PREM", "PREMIUM", "CLMPD", "CLM", "PD", "CLAIM", "PAID",
+               "OS", "OST", "OUTSTANDING", "QTR", "QUARTER", "1ST", "2ND", "3RD", "4TH"}
+    while words and (words[-1] in context or re.fullmatch(r"(?:19|20)\d{2}|Q[1-4]|[1-4]", words[-1])):
+        words.pop()
+    label = normalize_for_suggestion(" ".join(words))
     if not label:
         return _abstain(REASON_NO_CLASS_TEXT)
     compact = label.replace(" ", "")
