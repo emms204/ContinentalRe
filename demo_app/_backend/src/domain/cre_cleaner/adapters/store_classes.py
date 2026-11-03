@@ -37,6 +37,7 @@ STORE_CLASS_TO_TEMPLATE: Dict[str, Dict[str, str]] = {
     # Bisola's AXA gold names this class 'Energy', not 'Oil & Gas'.
     "AXA": {**_TEMPLATE_CLASSES_2026_10, "oil_and_energy": "Energy"},
     "CHI": dict(_TEMPLATE_CLASSES_2026_10),
+    "CORONATION": {**_TEMPLATE_CLASSES_2026_10, "motor": "Motor", "aviation": "Aviation"},
     "CUSTODIAN": dict(_TEMPLATE_CLASSES_2026_10),
     # EMPLE 2025 workbooks add a MOTOR tab (Manual mapping: Motor → MOTOR).
     "EMPLE": {**_TEMPLATE_CLASSES_2026_10, "motor": "Motor"},

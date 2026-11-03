@@ -154,22 +154,13 @@ class SourceLayoutAdapter(QuarterlyWorkbookAdapter):
     )
 
     def read_source_workbook(self, path):
-        from src.domain.cre_cleaner.io.excel import (
-            read_source_workbook, _read_calamine, NativeExcelReaderUnavailable,
-        )
+        # Typed standard reader for .xls/.xlsx/.xlsm; calamine only for
+        # .xlsb/.ods. calamine's string reads turned number-formatted date
+        # serials into text, dropped error cells and leading empty columns,
+        # changed float digits, and had none of the wide-sheet speed-ups.
+        from src.domain.cre_cleaner.io.excel import read_source_workbook
 
-        try:
-            return read_source_workbook(path, reader=_read_calamine)
-        except ImportError:
-            return read_source_workbook(path)
-        except NativeExcelReaderUnavailable:
-            if path.suffix.lower() not in {".xlsx", ".xlsm", ".xls"}:
-                raise
-            sheets, notes = read_source_workbook(path)
-            notes.append(("WARN", "native_reader_fallback", "", 0,
-                          "Native reader logger unavailable; used the standard Excel reader. "
-                          "Source visibility checks remain enabled."))
-            return sheets, notes
+        return read_source_workbook(path)
 
     def premium_header_cells(self, raw_rows, header_at, header, group_row):
         return qualify_bands(header, group_row, self.premium_layout_rules), group_row

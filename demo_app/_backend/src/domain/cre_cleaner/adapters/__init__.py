@@ -7,13 +7,17 @@ from __future__ import annotations
 
 from typing import Dict, List, Tuple, Type
 
-from src.domain.cre_cleaner.adapters.aiico_ark import AiicoArkAdapter
+from src.domain.cre_cleaner.adapters.aiico import AiicoAgricDirectAdapter, AiicoArkAdapter, AiicoScibAdapter
+from src.domain.cre_cleaner.adapters.axa import AxaDirectAdapter
 from src.domain.cre_cleaner.adapters.base import BaseAdapter, UnsupportedCedantError
 from src.domain.cre_cleaner.adapters.chi_scib import ChiScibAdapter
-from src.domain.cre_cleaner.adapters.custodian_scib import CustodianScibAdapter
+from src.domain.cre_cleaner.adapters.coronation import CoronationScibAdapter, CoronationUaibAdapter
+from src.domain.cre_cleaner.adapters.custodian import CustodianScibAdapter, CustodianUaibAdapter
 from src.domain.cre_cleaner.adapters.emple import EmpleAonAdapter, EmpleScibAdapter
-from src.domain.cre_cleaner.adapters.mutual_benefits_ark import MutualBenefitsArkAdapter
-from src.domain.cre_cleaner.adapters.nem_scib import NemScibAdapter
+from src.domain.cre_cleaner.adapters.heirs import HeirsDirectAdapter, HeirsHibAdapter, HeirsJomolaAdapter
+from src.domain.cre_cleaner.adapters.lasaco import LasacoFeybilAdapter, LasacoJomolaAdapter, LasacoJordansAdapter
+from src.domain.cre_cleaner.adapters.mutual_benefits import MutualBenefitsArkAdapter, MutualBenefitsJomolaAgricAdapter
+from src.domain.cre_cleaner.adapters.nem import NemAonAdapter, NemScibAdapter
 from src.domain.cre_cleaner.adapters.prestige import (
     PrestigeAfroAsianAdapter,
     PrestigeFairAdapter,
@@ -24,24 +28,8 @@ from src.domain.cre_cleaner.adapters.prestige import (
     PrestigeScibAdapter,
 )
 from src.domain.cre_cleaner.adapters.nsia import NsiaArkAdapter, NsiaJordansAdapter
-from src.domain.cre_cleaner.adapters.new_cedants import (
-    AiicoAgricDirectAdapter,
-    AiicoScibAdapter,
-    AxaDirectAdapter,
-    CustodianUaibAdapter,
-    HeirsDirectAdapter,
-    HeirsHibAdapter,
-    HeirsJomolaAdapter,
-    LasacoFeybilAdapter,
-    LasacoJomolaAdapter,
-    LasacoJordansAdapter,
-    MutualBenefitsJomolaAgricAdapter,
-    NemAonAdapter,
-    RoyalExchangeAgricAdapter,
-    UnitrustAgricAdapter,
-    UnitrustArkAdapter,
-)
-from src.domain.cre_cleaner.adapters.royal_exchange import RoyalExchangeAdapter
+from src.domain.cre_cleaner.adapters.royal_exchange import RoyalExchangeAdapter, RoyalExchangeAgricAdapter
+from src.domain.cre_cleaner.adapters.unitrust import UnitrustAgricAdapter, UnitrustArkAdapter
 from src.domain.cre_cleaner.adapters.zenith import ZenithArkAdapter, ZenithJordansAdapter
 
 from src.domain.cre_cleaner.adapters.cornerstone import CornerstoneScibAdapter, CornerstoneJordansAdapter, CornerstoneHilalAdapter
@@ -71,6 +59,8 @@ ADAPTERS: Dict[Tuple[str, str], Type[BaseAdapter]] = {
     ("AIICO", "AGRIC DIRECT"): AiicoAgricDirectAdapter,
     ("AXA", "DIRECT"): AxaDirectAdapter,
     ("CHI", "SCIB"): ChiScibAdapter,
+    ("CORONATION", "SCIB"): CoronationScibAdapter,
+    ("CORONATION", "UAIB"): CoronationUaibAdapter,
     ("CUSTODIAN", "SCIB"): CustodianScibAdapter,
     ("CUSTODIAN", "UAIB"): CustodianUaibAdapter,
     ("EMPLE", "SCIB"): EmpleScibAdapter,
@@ -130,6 +120,11 @@ _ALIASES: Dict[Tuple[str, str], Tuple[str, str]] = {
     ("CUSTODIAN AND ALLIED INS", "SCIB"): ("CUSTODIAN", "SCIB"),
     ("CUSTODIAN AND ALLIED INS", "UAIB"): ("CUSTODIAN", "UAIB"),
     ("CHI 2", "SCIB"): ("CHI", "SCIB"),
+    # Coronation Insurance was Wapic Insurance until 2021.
+    ("WAPIC", "SCIB"): ("CORONATION", "SCIB"),
+    ("WAPIC", "UAIB"): ("CORONATION", "UAIB"),
+    ("CORONATION INSURANCE", "SCIB"): ("CORONATION", "SCIB"),
+    ("CORONATION INSURANCE", "UAIB"): ("CORONATION", "UAIB"),
     ("AXA MANSARD", "DIRECT"): ("AXA", "DIRECT"),
     ("AXA", "AXA"): ("AXA", "DIRECT"),
     ("UNITRUST", "UNITRUST & ARK"): ("UNITRUST", "ARK"),

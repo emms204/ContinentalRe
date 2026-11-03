@@ -463,3 +463,12 @@ class RoyalExchangeAdapter(RoyalExchangeClaimsMixin, QuarterlyWorkbookAdapter):
         "Royal Exchange: quarterly treaty analysis/bordereaux workbooks; "
         "not checked against Bisola gold"
     )
+
+
+class RoyalExchangeAgricAdapter(RoyalExchangeClaimsMixin, QuarterlyWorkbookAdapter):
+    premium_layout_rules = RoyalExchangePremiumRules()
+    cedant = "ROYAL EXCHANGE"
+    broker = "AGRIC"
+    settings = {"single_class": "Agriculture"}
+    verified = False
+    status_note = "Royal Exchange Agric: quarterly returns; unverified"

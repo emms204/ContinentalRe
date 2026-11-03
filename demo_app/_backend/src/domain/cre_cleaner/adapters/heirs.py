@@ -315,11 +315,18 @@ class HeirsJomolaAdapter(_HeirsEvidenceAdapter):
                      5: "NEW CLAIM NO", 6: "POLICY NO", 7: "PERIOD OF COVER",
                      9: "DESCRIPTION OF LOSS", 11: "AMOUNT PAID", 13: "TOTAL CLAIMS PAID"}
         for header_at, row in enumerate(result):
-            if len(row) >= 16 and all(normalize_header(row[i]) == label for i, label in signature.items()) and not clean_text(row[14]) and not clean_text(row[15]):
+            if (len(row) >= 14 and all(normalize_header(row[i]) == label for i, label in signature.items())
+                    and all(i >= len(row) or not clean_text(row[i]) for i in (14, 15))):
+                # Readers may omit wholly empty trailing columns, including P
+                # in the amount-only layout. Restore only the known logical
+                # width in these parser copies; populated cells never move.
+                row.extend([None] * max(0, 16 - len(row)))
+                following = [list(data) + [None] * max(0, 16 - len(data))
+                             for data in result[header_at + 1:]]
                 # A verified pair establishes this physical recovery column
                 # for amount-only records under the same legacy header.
                 anchored = False
-                for data in result[header_at + 1:]:
+                for data in following:
                     if len(data) < 16 or not clean_text(data[3]) or not clean_text(data[6]):
                         continue
                     total, fraction, amount = (parse_number(data[i]) for i in (13, 14, 15))
@@ -328,11 +335,11 @@ class HeirsJomolaAdapter(_HeirsEvidenceAdapter):
                             and abs(amount - fraction * total) <= .02):
                         anchored = True
                         break
-                transactions = [data for data in result[header_at + 1:] if len(data) >= 16
+                transactions = [data for data in following if len(data) >= 16
                                 and clean_text(data[3]) and clean_text(data[6])
                                 and parse_number(data[13]) is not None]
                 amounts = [parse_number(data[14]) for data in transactions if clean_text(data[14])]
-                controls = [parse_number(data[14]) for data in result[header_at + 1:] if len(data) >= 16
+                controls = [parse_number(data[14]) for data in following if len(data) >= 16
                             and not clean_text(data[3]) and not clean_text(data[6]) and parse_number(data[14]) is not None]
                 amount_only = (not anchored and amounts and any(abs(a or 0) > 1 for a in amounts)
                     and all(not clean_text(data[15]) for data in transactions)

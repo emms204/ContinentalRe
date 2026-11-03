@@ -28,9 +28,6 @@ def is_nil_row(row: Sequence[Any]) -> bool:
     return nils >= max(2, len(vals) - 1) and "NIL" in vals
 
 
-_TOTAL_TOKENS = (
-    "TOTAL", "SUBTOTAL", "GRAND TOTAL", "TOTALS", "BROUGHT FORWARD", "CARRIED FORWARD",
-)
 # Whole-cell labels that mark a total/footer row even when placed in the insured column.
 _TOTAL_LABELS = {
     "TOTAL", "TOTALS", "SUBTOTAL", "SUB TOTAL", "SUB-TOTAL", "GRAND TOTAL",
@@ -64,20 +61,96 @@ def has_transaction_identifiers(row: Sequence[Any], key_cols: Sequence[Optional[
     return False
 
 
+# An insured starting with TOTAL that reads as a summary label: TOTAL alone or
+# followed by punctuation, report vocabulary, or '… AS AT …'. Generic words only.
+_TOTAL_SUMMARY_RE = re.compile(
+    r"^(?:SUB[- ]?)?TOTALS?\b\s*(?:$|[-:(/&]"
+    r"|(?:FOR|DUE|PAID|CLAIMS?|PREMIUMS?|SUM|RESERVES?|AMOUNT|AMT|OST|OUTSTANDING|BALANCE"
+    r"|TREATY|OUTWARD|GROSS|NET)\b|RECOVER|.*\bAS AT\b)"
+)
+
+
+# A cell that starts with a total word (TOTAL FIRE, SUB-TOTAL …) or carries a
+# carry-over phrase. Whole words only: TOTALENERGIES / SUBTOTALLY do not count.
+_TOTAL_START_RE = re.compile(
+    r"^(?:(?:SUB[- ]?|GRAND )?TOTALS?\b|SUBTOTALS?\b)|\b(?:GRAND TOTAL|BROUGHT FORWARD|CARRIED FORWARD)\b"
+)
+
+
+def is_total_label_cell(text: Any) -> bool:
+    """The cell is a total label as a whole: TOTAL / SUB-TOTAL / GRAND TOTAL /
+    BROUGHT FORWARD, or a summary phrase (TOTAL PREMIUM, TOTAL … AS AT …).
+    Narrative text such as TOTAL LOSS OF VESSEL or an insured named TOTAL … is not."""
+    t = clean_text(text).upper().strip().rstrip(" :")
+    if not t:
+        return False
+    if t in _TOTAL_LABELS or _TOTAL_SUMMARY_RE.match(t):
+        return True
+    return bool(re.search(r"\b(?:GRAND TOTAL|BROUGHT FORWARD|CARRIED FORWARD)\b", t))
+
+
+def _has_total_marker(row: Sequence[Any], key_cols: Sequence[Optional[int]]) -> bool:
+    """Total text that can make this row a total/footer row.
+
+    Key cells (insured, policy, claim no) count when they start with a total
+    word. Other cells count only as a whole total label, unless the row has no
+    insured: then any cell starting with a total word counts (TOTAL FIRE under
+    a blank insured). TOTAL LOSS OF VESSEL in the remarks of a named insured's
+    row is narrative, not a marker.
+    """
+    keys = {i for i in key_cols[:3] if i is not None}
+    insured_i = key_cols[0] if key_cols else None
+    has_insured = bool(_key_text(row, insured_i))
+    for j, c in enumerate(row):
+        t = clean_text(c).upper()
+        if not t:
+            continue
+        if j in keys or not has_insured:
+            if _TOTAL_START_RE.search(t) or is_total_label_cell(t):
+                return True
+        elif is_total_label_cell(t):
+            return True
+    return False
+
+
+def named_total_insured_evidence(row: Sequence[Any], key_cols: Sequence[Optional[int]]) -> Optional[str]:
+    """Evidence that a row whose insured is named TOTAL … (TotalEnergies
+    entities) is a transaction, not a total: 'date' or 'claim_no', else None.
+
+    Only when the row lacks text identifiers, no other cell is a total label
+    (narrative such as TOTAL LOSS OF VESSEL is fine), and the insured is not a
+    summary label. Evidence is a date
+    cell, or an integer claim no (key_cols[2]) of 6+ digits; the policy column
+    is not trusted (a money column can sit under a POLICY header).
+    """
+    idx = key_cols[0] if key_cols else None
+    if idx is None or idx >= len(row) or has_transaction_identifiers(row, key_cols):
+        return None
+    insured = clean_text(row[idx]).upper()
+    if not insured.startswith("TOTAL") or _TOTAL_SUMMARY_RE.match(insured):
+        return None
+    if any(is_total_label_cell(c) for j, c in enumerate(row) if j != idx):
+        return None
+    if any(isinstance(c, (datetime, date)) for c in row):
+        return "date"
+    claim_i = key_cols[2] if len(key_cols) > 2 else None
+    claim = row[claim_i] if claim_i is not None and claim_i < len(row) else None
+    if (isinstance(claim, (int, float)) and not isinstance(claim, bool)
+            and claim == int(claim) and abs(claim) >= 100000):
+        return "claim_no"
+    return None
+
+
 def looks_like_total_row(row: Sequence[Any], key_cols: Sequence[Optional[int]]) -> bool:
     """Total rows often have only a numeric in the last amount col and blank insured/policy.
 
     key_cols = [insured_col, policy_col(, claim_no_col)]. A row carrying a real
     insured plus policy/claim no is a transaction, never a total row — even when
-    its narrative says 'TOTAL LOSS' / 'TOTAL SPILLAGE'.
+    its narrative says 'TOTAL LOSS' / 'TOTAL SPILLAGE'. So is a row whose insured
+    is named TOTAL … with per-transaction evidence (named_total_insured_evidence).
     """
-    labels = []
-    for c in row:
-        t = clean_text(c).upper()
-        if t:
-            labels.append(t)
-    if any(tok in " ".join(labels) for tok in _TOTAL_TOKENS):
-        if not has_transaction_identifiers(row, key_cols):
+    if _has_total_marker(row, key_cols):
+        if not has_transaction_identifiers(row, key_cols) and not named_total_insured_evidence(row, key_cols):
             return True
     # insured/policy empty but some number present → likely total/footer
     insured = None

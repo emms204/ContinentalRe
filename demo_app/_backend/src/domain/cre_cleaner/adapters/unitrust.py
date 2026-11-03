@@ -33,7 +33,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from src.domain.cre_cleaner.adapters.base import QuarterlyWorkbookAdapter
-from src.domain.cre_cleaner.adapters.mutual_benefits_ark import MutualBenefitsArkAdapter
+from src.domain.cre_cleaner.adapters.mutual_benefits import MutualBenefitsArkAdapter
 from src.domain.cre_cleaner.core.detect import SheetTypeRules
 from src.domain.cre_cleaner.core.map_columns import ColumnMap, PremiumLayoutRules, map_simple_columns
 from src.domain.cre_cleaner.core.normalize import normalize_header

@@ -531,6 +531,11 @@ class PrestigeKmdAdapter(ControlledQuarterFiles, SourceLayoutAdapter):
 
     def map_premium_columns(self, header, group_row, **kwargs):
         cm = super().map_premium_columns(header, group_row, **kwargs)
+        # KMD schedules carry no policy number; the POLICY alias would land on
+        # MAXIMUM POLICY LIMIT (a money column). Leave POLICY NO blank.
+        policy_i = cm.get("policy_no")
+        if policy_i is not None and "LIMIT" in normalize_header(header[policy_i]):
+            del cm.mapping["policy_no"]
         col = self._bands(header)
         if col("RETENTION PREMIUM") is None:
             return cm

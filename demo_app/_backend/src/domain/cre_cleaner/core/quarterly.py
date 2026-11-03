@@ -33,6 +33,7 @@ from src.domain.cre_cleaner.core.filters import (
     is_policy_value,
     looks_like_section_header,
     looks_like_total_row,
+    named_total_insured_evidence,
     row_identity_failures,
 )
 from src.domain.cre_cleaner.io.excel import read_source_workbook, read_workbook_sheets
@@ -1003,6 +1004,14 @@ def _role_text(roles: Dict[str, int]) -> str:
     return ", ".join(f"{key}={_col_letter(roles[key])}" for key in order if key in roles)
 
 
+def _total_named_kept(path: Path, sheet: str, excel_row: int, insured: str, evidence: str) -> ExceptionRecord:
+    return ExceptionRecord(
+        "INFO", "total_named_insured_kept", path.name, sheet, excel_row,
+        f"Insured {insured!r} starts with TOTAL but the row carries a {evidence.replace('_', ' ')}; "
+        "kept as a transaction, not a total row",
+    )
+
+
 def _separator_row(row: Sequence[Any], cmap: ColumnMap, kind: str,
                    metric_cols: Dict[str, Any]) -> bool:
     if is_blank_row(row):
@@ -1775,6 +1784,9 @@ def parse_premium_file(
                         ))
                     skipped += 1
                     continue
+                kept_on = named_total_insured_evidence(row, [insured_i, policy_i])
+                if kept_on:
+                    exceptions.append(_total_named_kept(path, sn, excel_row, insured, kept_on))
                 if looks_like_section_header(row) and not insured:
                     skipped += 1
                     continue
@@ -2324,6 +2336,9 @@ def _parse_claims_sheet(
                     ))
                 skipped += 1
                 continue
+            kept_on = named_total_insured_evidence(row, [insured_i, policy_i, cmap.get("claim_no")])
+            if kept_on:
+                exceptions.append(_total_named_kept(path, sn, excel_row, insured, kept_on))
             # month banners / lone dates
             non_empty = [c for c in row if clean_text(c)]
             if len(non_empty) <= 1:

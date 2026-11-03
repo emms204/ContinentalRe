@@ -1,4 +1,8 @@
-"""AIICO rules shared by the AIICO adapters (ARK and SCIB) — explicitly.
+"""AIICO adapters (ARK, SCIB, AGRIC DIRECT) and the AIICO-only rules they share.
+
+Shared AIICO rules
+------------------
+AIICO rules shared by the AIICO adapters (ARK and SCIB) — explicitly.
 
 IMPL-20260929-04: every AIICO-specific rule that used to live in the shared
 core (map_columns / quarterly / detect / class_labels / table_type / config)
@@ -28,16 +32,23 @@ Evidence
   Bond - PREMIUM sheets use the distinct RET/TREATY/FAC PROPORTION % naming —
   most recently in Q4 2025; per brief the most recent gold distinct naming
   wins, so the "gold" mode (the default) == that naming.
+
+AIICO ARK
+---------
+AIICO ARK adapter: monthly-file discovery + the AIICO rules above.
 """
 from __future__ import annotations
 
 import re
 from typing import Any, Dict, List, Optional, Tuple
 
+from src.domain.cre_cleaner.adapters.base import QuarterlyWorkbookAdapter
+from src.domain.cre_cleaner.adapters.monthly_files import MonthlyPremiumAdapter
 from src.domain.cre_cleaner.core.detect import SheetTypeRules
 from src.domain.cre_cleaner.core.map_columns import PremiumLayoutRules, is_share_header
 from src.domain.cre_cleaner.core.normalize import clean_text
 from src.domain.cre_cleaner.core.table_type import TableVocab
+
 
 # Band qualifiers seen in front of numbered allocation headers
 # (RTNTN PPN, TREATY PPN1, TREATY SUM INSURED 1, TREATY PREMIUM2, QUOTA SHARE PPN).
@@ -193,3 +204,42 @@ class AiicoRulesMixin:
 
     def fix_claims_uw_details(self, uw: Any, details: Any) -> Optional[Tuple[int, str]]:
         return aiico_fix_uw_details(uw, details)
+
+
+class AiicoArkAdapter(AiicoRulesMixin, MonthlyPremiumAdapter):
+    cedant = "AIICO"
+    broker = "ARK"
+    verified = True
+    # IMPL-20260929-02: tab/table type from content (verified on all AIICO ARK
+    # raw tabs); filename still gives month/period and the controlling files.
+    content_sheet_typing = True
+
+
+class AiicoScibAdapter(AiicoRulesMixin, MonthlyPremiumAdapter):
+    """AIICO via SCIB: AIICO rules through the explicit AIICO helper
+    (AiicoRulesMixin) + the same month-file discovery as ARK."""
+
+    cedant = "AIICO"
+    broker = "SCIB"
+    verified = False
+    status_note = (
+        "AIICO SCIB: same monthly/quarterly discovery as ARK; not checked against Bisola gold"
+    )
+    content_sheet_typing = True
+
+
+class AiicoAgricDirectAdapter(QuarterlyWorkbookAdapter):
+    """Generic mapping; claims PPN calculated from amounts (flagged
+    'Calculated'), as for the other AIICO adapters and as before IMPL-04."""
+    cedant = "AIICO"
+    broker = "AGRIC DIRECT"
+    settings = {
+        "claims_ppn_calculated": True,
+        "single_class": "Agriculture",
+        "period_source": "label",
+    }
+
+    verified = False
+    status_note = (
+        "AIICO Agric Direct: quarterly treaty returns workbooks; not checked against Bisola gold"
+    )

@@ -424,6 +424,14 @@ class _EmpleAdapter(ControlledQuarterFiles, SourceLayoutAdapter):
         # Manual: PVT / Terrorism is its own class, never merged with Fire.
         return "TERRORISM" if terrorism_tab(sheet) else class_hint
 
+    def check_claims_row(self, claim, *, row, cmap, exceptions, path, sheet, excel_row):
+        # Excel exports may encode an explicit year as text. Keep the source
+        # year authoritative while giving it the same type as numeric years
+        # and the explicit U/YR section values. Do not infer missing years or
+        # reinterpret ranges/unknown text.
+        if isinstance(claim.uw_yr, str) and re.fullmatch(r'(?:19|20)\d{2}', claim.uw_yr.strip()):
+            claim.uw_yr = int(claim.uw_yr.strip())
+
     def classify_source_tab(self, file, sheet, rows):
         return retype_tables(file, sheet, rows, self.table_vocab, _emple_table_rule)
 

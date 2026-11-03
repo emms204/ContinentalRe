@@ -1,4 +1,4 @@
-"""Mutual Benefits via ARK — first-pass, unverified.
+"""Mutual Benefits adapters (ARK, JOMOLA AGRIC) — first-pass, unverified.
 
 Layout is closer to AIICO ARK: per-class / per-layer premium .xls files plus
 separate claims workbooks. Prefer monthly discovery when month names appear;
@@ -13,6 +13,7 @@ from typing import List, Tuple
 from src.domain.cre_cleaner.adapters.monthly_files import MonthlyPremiumAdapter
 from src.domain.cre_cleaner.adapters.base import (
     EXCEL_SUFFIXES,
+    QuarterlyWorkbookAdapter,
     list_input_files,
     name_tokens,
     quarters_in_text,
@@ -23,17 +24,49 @@ from src.domain.cre_cleaner.adapters.base import (
 # Loss bordereaux (2020–2025, ARK and Jomola Agric): CLAIM NO | INSURED /
 # PAYEE | POLICY NO | (COVER FROM | COVER TO) | GROSS AMOUNT or AMOUNT PAID |
 # TREATY | MBA NET (Mutual Benefits' own retention). Outstanding 2020:
-# AMOUNT OF LOSS | TREATY SHARE | NET.
+# AMOUNT OF LOSS | TREATY SHARE | NET. Q4 2021 per-class tabs: Assured Name |
+# Total Paid | RETENTION | % | (TREATY/POOL) AMOUNT | %.
 MUTUAL_CLAIMS_ALIAS_EXTRA = {
-    "insured": ["PAYEE"],
-    "total_claims": ["GROSS AMOUNT", "AMOUNT PAID", "AMOUNT OF LOSS"],
-    "amount_ret": ["MBA NET", "NET"],
+    "insured": ["PAYEE", "ASSURED NAME"],
+    "total_claims": ["GROSS AMOUNT", "AMOUNT PAID", "AMOUNT OF LOSS", "TOTAL PAID"],
+    "amount_ret": ["MBA NET", "NET", "RETENTION"],
     "period_from": ["POLICY COVER FROM"],
     "period_to": ["POLICY COVER TO"],
 }
 
 
 _CLASS_ROW = re.compile(r"^\s*CLASS\s*:?\s*$", re.IGNORECASE)
+
+# 'rein_treaty' premium exports split the header over two rows: identity
+# labels and '<--Band-->' labels on the first, Sum Insured / % / Premium under
+# each band on the second. The identity labels name the blank cells below them.
+_REIN_IDENTITY = {"POLICY NO.": "POLICY NO", "INSURED": "INSURED"}
+_REIN_PERIOD = "INS. PERIOD"
+_REIN_BAND_ARROW = re.compile(r"^<-+\s*(.*?)\s*-*>$")
+# Band label word -> upload band (None: the gross block).
+_REIN_BANDS = (("GROSS", None), ("RETEN", "ret"), ("SURPLUS", "sur"), ("QUOTA", "sur"),
+               ("TREATY", "sur"), ("FACULT", "fac"))
+
+
+def _rein_band_spans(group_row) -> List[Tuple[int, int, str]]:
+    """(start, end, band) per '<--…-->' label in a rein_treaty band row; end is
+    the next label's column (or None for the last band)."""
+    starts = []
+    for i, cell in enumerate(group_row or []):
+        m = _REIN_BAND_ARROW.match(str(cell or "").strip())
+        if not m:
+            continue
+        label = m.group(1).upper()
+        band = next((b for key, b in _REIN_BANDS if key in label), "?")
+        starts.append((i, band))
+    return [(start, starts[n + 1][0] if n + 1 < len(starts) else None, band)
+            for n, (start, band) in enumerate(starts)]
+
+
+def _is_rein_band_row(group_row) -> bool:
+    """The Mutual two-row premium header: identity labels and band arrows."""
+    labels = {str(c or "").strip().upper() for c in group_row or []}
+    return set(_REIN_IDENTITY) <= labels and len(_rein_band_spans(group_row)) >= 3
 
 
 def _is_report_tab(sheet: str) -> bool:
@@ -73,6 +106,49 @@ class MutualBenefitsArkAdapter(MonthlyPremiumAdapter):
     def sheet_class_hint(self, sheet, class_hint):
         # 'rein_treaty' is the export's report name, never a class.
         return "" if _is_report_tab(sheet) else class_hint
+
+    def premium_header_cells(self, raw_rows, header_at, header, group_row):
+        """rein_treaty: Policy No. / Insured / Ins. Period sit on the band row,
+        above blank cells of the Sum Insured row. Other layouts unchanged."""
+        if not _is_rein_band_row(group_row):
+            return list(header), group_row
+        cells = list(header) + [None] * max(0, len(group_row) - len(header))
+        for i, label in enumerate(group_row):
+            key = str(label or "").strip().upper()
+            if str(cells[i] or "").strip():
+                continue
+            if key in _REIN_IDENTITY:
+                cells[i] = _REIN_IDENTITY[key]
+            elif key == _REIN_PERIOD and i + 1 < len(cells) and not str(cells[i + 1] or "").strip():
+                cells[i], cells[i + 1] = "FROM", "TO"
+        return cells, group_row
+
+    def map_premium_columns(self, header, group_row, *, path=None, sheet="", exceptions=None):
+        """rein_treaty: each band's Sum Insured / % / Premium are the cells under
+        its own '<--Band-->' label. The generic pairing gives a band's % the
+        next band's Sum Insured. Other layouts unchanged."""
+        cmap = super().map_premium_columns(header, group_row, path=path, sheet=sheet,
+                                           exceptions=exceptions)
+        if not _is_rein_band_row(group_row):
+            return cmap
+        names = [str(h or "").strip().upper() for h in header]
+        assigned = set()
+        for start, end, band in _rein_band_spans(group_row):
+            span = range(start, len(names) if end is None else end)
+            cols = {key: next((j for j in span if names[j] == label), None)
+                    for key, label in (("si", "SUM INSURED"), ("ppn", "%"), ("prem", "PREMIUM"))}
+            if band is None:
+                if cols["si"] is not None:
+                    cmap.mapping["sum_insured"] = cols["si"]
+                if cols["prem"] is not None:
+                    cmap.mapping["gross_premium"] = cols["prem"]
+            elif band != "?" and band not in assigned:
+                assigned.add(band)
+                for key, col in cols.items():
+                    setattr(cmap, f"{band}_{key}", col)
+        if {"ret", "sur", "fac"} <= assigned:
+            cmap.borrowed_blocks = []
+        return cmap
 
     def premium_banner_label(self, cells, text):
         """A 'CLASS: | | CONTRACTOR ALL RISK' row always starts a new group.
@@ -162,3 +238,12 @@ class MutualBenefitsArkAdapter(MonthlyPremiumAdapter):
 
 # Keep a thin alias used by the registry name
 MutualBenefitsAdapter = MutualBenefitsArkAdapter
+
+
+class MutualBenefitsJomolaAgricAdapter(QuarterlyWorkbookAdapter):
+    cedant = "MUTUAL BENEFITS"
+    broker = "JOMOLA AGRIC"
+    settings = {"single_class": "Agriculture"}
+    claims_alias_extra = MUTUAL_CLAIMS_ALIAS_EXTRA
+    verified = False
+    status_note = "Mutual Benefits Jomola Agric: quarterly returns; unverified"

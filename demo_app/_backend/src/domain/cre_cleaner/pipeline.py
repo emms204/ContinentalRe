@@ -42,7 +42,6 @@ from src.domain.cre_cleaner.config import QUARTER_MONTHS
 from src.domain.cre_cleaner.io.excel import workbook_read_cache, write_output_workbook
 from src.domain.cre_cleaner.models import PipelineResult, ExceptionRecord, PremiumRow
 from src.domain.cre_cleaner.timing_log import log_timing
-from src.domain.cre_cleaner.io.pdf import convert_pdfs_in_dir, list_pdfs
 from src.domain.cre_cleaner.core.period_infer import folder_year, infer_period, _iter_excel_paths
 from src.domain.cre_cleaner.adapters.base import claims_file_period_conflict
 from src.domain.cre_cleaner.core.quarterly import merge_monthly_premiums, parse_claims_file, parse_premium_file
@@ -896,6 +895,18 @@ def field_completeness(
 _timing_log = logging.getLogger("cre_cleaner.timing")
 
 
+def _list_pdfs(raw_dir: Path) -> List[Path]:
+    """PDF files in ``raw_dir`` (or ``raw_dir`` itself), skipping lock / hidden files."""
+    raw_dir = Path(raw_dir)
+    if raw_dir.is_file():
+        return [raw_dir] if raw_dir.suffix.lower() == ".pdf" else []
+    return sorted(
+        p for p in raw_dir.rglob("*")
+        if p.is_file() and p.suffix.lower() == ".pdf"
+        and not p.name.startswith(("~$", "."))
+    )
+
+
 def _run_pipeline_impl(
     *,
     cedant: str,
@@ -925,7 +936,7 @@ def _run_pipeline_impl(
 ) -> PipelineResult:
     """Clean one quarter from ``raw_dir``.
 
-    Phase 1 defaults: PDF conversion off; year/quarter inferred from sheet
+    PDFs are never converted (``convert_pdfs`` must stay False); year/quarter inferred from sheet
     date columns when omitted; ``bordereau_type`` selects Premium / Claims /
     Outstanding / all.
 
@@ -1026,24 +1037,14 @@ def _run_pipeline_impl(
                 detail=str(note.get("message") or ""),
             ))
 
-    # --- PDF → Excel (paused for Phase 1 unless explicitly enabled) ---
-    if convert_pdfs and list_pdfs(raw_dir):
-        batch = convert_pdfs_in_dir(raw_dir)
-        for conv in batch.conversions:
-            sev = "INFO" if conv.ok or conv.skipped else "ERROR"
-            result.exceptions.append(ExceptionRecord(
-                sev, "pdf_convert",
-                source_filename=conv.source.name,
-                detail=conv.detail or ("ok" if conv.ok else "failed"),
-            ))
-            if sev == "ERROR":
-                print(f"ERROR pdf_convert {conv.source.name}: {conv.detail}", file=sys.stderr)
-    elif list_pdfs(raw_dir) and not convert_pdfs:
+    # --- PDFs are not converted here: users supply converted workbooks ---
+    pdfs = _list_pdfs(raw_dir)
+    if pdfs:
         result.exceptions.append(ExceptionRecord(
             "INFO", "pdf_skipped_phase1",
             detail=(
-                f"{len(list_pdfs(raw_dir))} PDF file(s) present but ignored "
-                "(Phase 1: Excel only; set convert_pdfs=True to enable LlamaParse)"
+                f"{len(pdfs)} PDF file(s) present but ignored; "
+                "supply a converted workbook (.xlsx) for each"
             ),
         ))
 
@@ -1606,6 +1607,11 @@ def _run_pipeline_impl(
 def run_pipeline(**kwargs) -> PipelineResult:
     """``_run_pipeline_impl`` inside a workbook read cache: each source workbook
     is parsed once per run instead of once per stage (IMPL-20261002-01)."""
+    if kwargs.get("convert_pdfs"):
+        raise ValueError(
+            "convert_pdfs=True is no longer supported: PDFs are not converted here; "
+            "supply a converted workbook (.xlsx)"
+        )
     t0 = time.perf_counter()
     with workbook_read_cache():
         result = _run_pipeline_impl(**kwargs)

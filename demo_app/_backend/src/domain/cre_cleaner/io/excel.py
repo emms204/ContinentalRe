@@ -272,6 +272,18 @@ def _xlsx_value_bounds(path: Any) -> Dict[str, Tuple[int, int]]:
     return out
 
 
+# OOXML ST_Xstring escape: _xHHHH_ is one character (_x000D_ = carriage
+# return); a literal "_x" is written _x005F_x. openpyxl leaves both as text.
+# Only control characters (_x0000_–_x001F_) and _x005F_ are decoded: writers
+# such as openpyxl and pandas store text like REF_x2019_Q1 unescaped, so a
+# printable code point cannot be told apart from real text and is left as is.
+_XSTRING_ESCAPE = re.compile(r"_x(00[01][0-9A-Fa-f]|005[Ff])_")
+
+
+def _decode_xstring(s: str) -> str:
+    return _XSTRING_ESCAPE.sub(lambda m: chr(int(m.group(1), 16)), s)
+
+
 def _read_xlsx(path: Path) -> Dict[str, List[List[Any]]]:
     # Cached formula values live in worksheet cells. Loading external-link
     # caches adds no values used by the cleaner and can dominate read time.
@@ -305,7 +317,8 @@ def _read_xlsx(path: Path) -> Dict[str, List[List[Any]]]:
                 continue
             rows = []
             for row in ws.iter_rows(values_only=True, max_row=lim, max_col=width):
-                rows.append(list(row))
+                rows.append([_decode_xstring(v) if type(v) is str and "_x" in v else v
+                             for v in row])
             out[sn] = rows
     finally:
         wb.close()
