@@ -19,6 +19,7 @@ from src.domain.cre_cleaner.adapters.base import (
     quarters_in_text,
     years_in_text,
 )
+from src.domain.cre_cleaner.core.normalize import normalize_header
 
 
 # Loss bordereaux (2020–2025, ARK and Jomola Agric): CLAIM NO | INSURED /
@@ -40,8 +41,12 @@ _CLASS_ROW = re.compile(r"^\s*CLASS\s*:?\s*$", re.IGNORECASE)
 # 'rein_treaty' premium exports split the header over two rows: identity
 # labels and '<--Band-->' labels on the first, Sum Insured / % / Premium under
 # each band on the second. The identity labels name the blank cells below them.
-_REIN_IDENTITY = {"POLICY NO.": "POLICY NO", "INSURED": "INSURED"}
-_REIN_PERIOD = "INS. PERIOD"
+# Keys are normalize_header forms ('Policy No.' / 'POLICY  NO' -> 'POLICY NO').
+_REIN_IDENTITY = {"POLICY NO": "POLICY NO", "INSURED": "INSURED"}
+_REIN_PERIOD = "INS PERIOD"
+# Besides INSURED, one of these marks the band row (2023 ENGINEERING 2ND
+# QUARTER has no policy label: its policy numbers sit under a blank heading).
+_REIN_ROW_MARKERS = {"CESS", "INS PERIOD", "POLICY NO"}
 _REIN_BAND_ARROW = re.compile(r"^<-+\s*(.*?)\s*-*>$")
 # Band label word -> upload band (None: the gross block).
 _REIN_BANDS = (("GROSS", None), ("RETEN", "ret"), ("SURPLUS", "sur"), ("QUOTA", "sur"),
@@ -64,9 +69,12 @@ def _rein_band_spans(group_row) -> List[Tuple[int, int, str]]:
 
 
 def _is_rein_band_row(group_row) -> bool:
-    """The Mutual two-row premium header: identity labels and band arrows."""
-    labels = {str(c or "").strip().upper() for c in group_row or []}
-    return set(_REIN_IDENTITY) <= labels and len(_rein_band_spans(group_row)) >= 3
+    """The Mutual two-row premium header: INSURED plus Cess. / Ins. Period /
+    Policy No. on the band row, and at least two band arrows (gross plus one
+    allocation band)."""
+    labels = {normalize_header(c) for c in group_row or []}
+    return ("INSURED" in labels and bool(labels & _REIN_ROW_MARKERS)
+            and len(_rein_band_spans(group_row)) >= 2)
 
 
 def _is_report_tab(sheet: str) -> bool:
@@ -114,7 +122,7 @@ class MutualBenefitsArkAdapter(MonthlyPremiumAdapter):
             return list(header), group_row
         cells = list(header) + [None] * max(0, len(group_row) - len(header))
         for i, label in enumerate(group_row):
-            key = str(label or "").strip().upper()
+            key = normalize_header(label)
             if str(cells[i] or "").strip():
                 continue
             if key in _REIN_IDENTITY:
@@ -133,21 +141,40 @@ class MutualBenefitsArkAdapter(MonthlyPremiumAdapter):
             return cmap
         names = [str(h or "").strip().upper() for h in header]
         assigned = set()
+        own_cols = set()
+        extra, ignored = [], []
         for start, end, band in _rein_band_spans(group_row):
             span = range(start, len(names) if end is None else end)
             cols = {key: next((j for j in span if names[j] == label), None)
                     for key, label in (("si", "SUM INSURED"), ("ppn", "%"), ("prem", "PREMIUM"))}
+            label = str(group_row[start]).strip("<-> ").strip()
             if band is None:
                 if cols["si"] is not None:
                     cmap.mapping["sum_insured"] = cols["si"]
                 if cols["prem"] is not None:
                     cmap.mapping["gross_premium"] = cols["prem"]
-            elif band != "?" and band not in assigned:
+            elif band == "?":
+                continue
+            elif band not in assigned:
                 assigned.add(band)
                 for key, col in cols.items():
                     setattr(cmap, f"{band}_{key}", col)
-        if {"ret", "sur", "fac"} <= assigned:
-            cmap.borrowed_blocks = []
+            elif band == "sur":
+                # A further treaty layer under its own label: kept as a layer.
+                extra.append((label.upper(), cols["ppn"], cols["si"], cols["prem"]))
+            else:
+                ignored.append(f"{label.upper()} (cols {start + 1}-{(end or len(names))})")
+            own_cols.update(c for c in cols.values() if c is not None)
+        # The band columns are now each band's own: drop generic extra layers and
+        # borrowed-column notes about them, keep anything else.
+        cmap.extra_treaty_blocks = [b for b in cmap.extra_treaty_blocks
+                                    if not own_cols & {c for c in b[1:] if c is not None}] + extra
+        cmap.ignored_blocks = list(cmap.ignored_blocks) + ignored
+        resolved = tuple([f"{name} " for band, name in (("sur", "TREATY"), ("fac", "FAC"))
+                          if band in assigned] + [f"{layer[0]} " for layer in extra])
+        cmap.borrowed_blocks = [b for b in cmap.borrowed_blocks
+                                if not (resolved and b.startswith(resolved)
+                                        and not b.startswith("TREATY LAYER"))]
         return cmap
 
     def premium_banner_label(self, cells, text):

@@ -9,6 +9,7 @@ from demo_app import store
 from demo_app.notices import render_notices
 from demo_app.coverage_ui import render_coverage
 from demo_app.engine import CleanError, NeedsReview, approved_class_options, clean, is_bare_marine, keep_alias
+from demo_app.engine import SOURCE_WORKBOOK_SUFFIXES
 
 _TYPES = ("autodetect", "premium", "claims", "premium_claims")
 _DELIVERY = ("separate", "merged", "zip")
@@ -53,8 +54,8 @@ def render() -> None:
     bordereau_type = st.selectbox("Bordereau type", _TYPES, index=0)
     delivery = st.selectbox("Delivery", _DELIVERY, index=0)
     files = st.file_uploader(
-        "Bordereaux (.xls / .xlsx)",
-        type=["xls", "xlsx", "xlsm"],
+        "Bordereaux (" + " / ".join(sorted(SOURCE_WORKBOOK_SUFFIXES)) + ")",
+        type=[suffix.lstrip(".") for suffix in sorted(SOURCE_WORKBOOK_SUFFIXES)],
         accept_multiple_files=True,
     )
     # Only reset the review when the upload set changes. The uploader still

@@ -70,6 +70,14 @@ _TOTAL_SUMMARY_RE = re.compile(
 )
 
 
+# A known qualifier before a closing TOTAL: Sunu's 'Risk Class Total:'
+# subtotal rows, CLASS TOTAL, PAGE TOTAL. A fixed list, so an insured name
+# ending in TOTAL is not read as a total.
+_QUALIFIED_TOTAL_RE = re.compile(
+    r"^(?:RISK CLASS|SUB[- ]?CLASS|CLASS|SECTION|PAGE|BRANCH|CURRENCY|BLOCK)\s+TOTALS?$"
+)
+
+
 # A cell that starts with a total word (TOTAL FIRE, SUB-TOTAL …) or carries a
 # carry-over phrase. Whole words only: TOTALENERGIES / SUBTOTALLY do not count.
 _TOTAL_START_RE = re.compile(
@@ -77,14 +85,21 @@ _TOTAL_START_RE = re.compile(
 )
 
 
+def is_qualified_total_label(text: Any) -> bool:
+    """RISK CLASS TOTAL: / CLASS TOTAL / PAGE TOTAL — a subtotal of the rows
+    above it, so a printed footer (not a carried-forward balance)."""
+    return bool(_QUALIFIED_TOTAL_RE.match(clean_text(text).upper().strip().rstrip(" :")))
+
+
 def is_total_label_cell(text: Any) -> bool:
     """The cell is a total label as a whole: TOTAL / SUB-TOTAL / GRAND TOTAL /
-    BROUGHT FORWARD, or a summary phrase (TOTAL PREMIUM, TOTAL … AS AT …).
-    Narrative text such as TOTAL LOSS OF VESSEL or an insured named TOTAL … is not."""
+    BROUGHT FORWARD, a summary phrase (TOTAL PREMIUM, TOTAL … AS AT …) or a
+    qualified subtotal (RISK CLASS TOTAL:, PAGE TOTAL). Narrative text such as
+    TOTAL LOSS OF VESSEL or an insured named TOTAL … is not."""
     t = clean_text(text).upper().strip().rstrip(" :")
     if not t:
         return False
-    if t in _TOTAL_LABELS or _TOTAL_SUMMARY_RE.match(t):
+    if t in _TOTAL_LABELS or _TOTAL_SUMMARY_RE.match(t) or _QUALIFIED_TOTAL_RE.match(t):
         return True
     return bool(re.search(r"\b(?:GRAND TOTAL|BROUGHT FORWARD|CARRIED FORWARD)\b", t))
 

@@ -31,6 +31,7 @@ from src.domain.cre_cleaner.core.filters import (
     is_blank_row,
     is_nil_row,
     is_policy_value,
+    is_qualified_total_label,
     looks_like_section_header,
     looks_like_total_row,
     named_total_insured_evidence,
@@ -284,10 +285,12 @@ def _trailer_class_text(row: Sequence[Any]) -> str:
 
 
 def _premium_header_with_subrow(
-    raw_rows: List[List[Any]], header_at: int, merge: bool = False,
+    raw_rows: List[List[Any]], header_at: int, merge: bool = False, skip_blank: bool = False,
 ) -> Tuple[List[Any], Optional[List[Any]], int]:
     """Merge premium band + SI/Premium/% subrow (unless the adapter opts out
-    with ``band_subrow_layout = False``). Returns (header, group_row, data_start)."""
+    with ``band_subrow_layout = False``). ``skip_blank`` (adapter opt-in
+    ``band_subrow_after_blank``): one blank row may sit between the band row
+    and its subrow. Returns (header, group_row, data_start)."""
     header = raw_rows[header_at]
     group_row = raw_rows[header_at - 1] if header_at > 0 else None
     if group_row is not None and is_blank_row(group_row) and header_at > 1 and \
@@ -296,11 +299,14 @@ def _premium_header_with_subrow(
     data_start = header_at + 1
     if not merge or header_at + 1 >= len(raw_rows):
         return list(header), group_row, data_start
-    sub = raw_rows[header_at + 1]
+    sub_at = header_at + 1
+    if skip_blank and is_blank_row(raw_rows[sub_at]) and sub_at + 1 < len(raw_rows):
+        sub_at += 1
+    sub = raw_rows[sub_at]
     if not _looks_like_allocation_subrow(sub):
         return list(header), group_row, data_start
     # The found "header" is the band row; merge with subrow and keep prior row as group.
-    return merge_group_subheaders(header, sub), group_row, header_at + 2
+    return merge_group_subheaders(header, sub), group_row, sub_at + 1
 
 
 def _load_source(path: Path, adapter: Any = None) -> Tuple[Dict[str, List[List[Any]]], List[ExceptionRecord], Dict[str, int]]:
@@ -432,8 +438,11 @@ class _SheetTotals:
         self.footer: Dict[str, float] = defaultdict(float)
         self._section_cum: Dict[str, float] = defaultdict(float)
         self._section_seg: Dict[str, float] = defaultdict(float)
+        # All kept rows of the sheet, across repeated header blocks.
+        self._sheet_cum: Dict[str, float] = defaultdict(float)
         self.footer_cells: Dict[str, List[str]] = defaultdict(list)
-        self._section_footers: List[Tuple[Dict[str, float], Dict[str, float], Dict[str, float]]] = []
+        self._section_footers: List[Tuple[Dict[str, float], Dict[str, float], Dict[str, float],
+                                          Dict[str, float]]] = []
         self._section_cells: List[Dict[str, str]] = []
 
     def add_row(self, row) -> None:
@@ -443,26 +452,46 @@ class _SheetTotals:
             self.parsed[ccy][k] += v
             self._section_cum[k] += v
             self._section_seg[k] += v
+            self._sheet_cum[k] += v
 
     def add_footer(self, values: Dict[str, float], cells: Optional[Dict[str, str]] = None) -> None:
-        self._section_footers.append((values, dict(self._section_cum), dict(self._section_seg)))
+        self._section_footers.append(
+            (values, dict(self._section_cum), dict(self._section_seg), dict(self._sheet_cum)))
         self._section_cells.append(dict(cells or {}))
         self._section_seg = defaultdict(float)
 
     def end_section(self) -> None:
         """A grand-total row (≈ everything above it) wins; otherwise subtotal
-        rows are added up."""
+        rows are added up.
+
+        A sheet that repeats its header per block (Sunu: one per underwriting
+        year / risk class) commits each block's subtotals when the block ends.
+        A later footer that matches the whole sheet better than its own block
+        is the sheet's grand total: it replaces those committed subtotals."""
         fs = self._section_footers
         cs = self._section_cells
         chosen: Dict[str, float] = {}
         chosen_cells: Dict[str, List[str]] = defaultdict(list)
-        if len(fs) == 1:
+        sheet_grand = []
+        if self.footer:
+            for i, (vals, cum, seg, sheet) in enumerate(fs):
+                key = self.main if self.main in vals else next(iter(vals))
+                off = abs(vals[key] - sheet.get(key, 0.0))
+                if off < abs(vals[key] - cum.get(key, 0.0)) and off < abs(vals[key] - seg.get(key, 0.0)):
+                    sheet_grand.append(i)
+        if sheet_grand:
+            self.footer = defaultdict(float)
+            self.footer_cells = defaultdict(list)
+            chosen = fs[sheet_grand[-1]][0]
+            for k, c in cs[sheet_grand[-1]].items():
+                chosen_cells[k].append(c)
+        elif len(fs) == 1:
             chosen = fs[0][0]
             for k, c in cs[0].items():
                 chosen_cells[k].append(c)
         elif fs:
             grand = []
-            for i, (vals, cum, seg) in enumerate(fs):
+            for i, (vals, cum, seg, _sheet) in enumerate(fs):
                 key = self.main if self.main in vals else next(iter(vals))
                 if abs(vals[key] - cum.get(key, 0.0)) < abs(vals[key] - seg.get(key, 0.0)):
                     grand.append(i)
@@ -472,7 +501,7 @@ class _SheetTotals:
                     chosen_cells[k].append(c)
             else:
                 acc: Dict[str, float] = defaultdict(float)
-                for i, (vals, _c, _s) in enumerate(fs):
+                for i, (vals, _c, _s, _sh) in enumerate(fs):
                     for k, v in vals.items():
                         acc[k] += v
                     for k, c in cs[i].items():
@@ -537,6 +566,7 @@ def _is_footer_row(row: Sequence[Any], insured: str, policy: str, values: Dict[s
             continue
         norm = normalize_header(identity)
         if norm not in {"TOTAL", "GRAND TOTAL", "SUB TOTAL", "SUBTOTAL"} \
+                and not is_qualified_total_label(identity) \
                 and not _trailer_class_text([identity]) \
                 and not re.match(r"^(?:GRAND )?SUMMARY TOTALS?\b", norm):
             return False
@@ -773,9 +803,12 @@ def _typed_sheet(path: Path, sn: str, raw_rows: List[List[Any]], legacy_st: str,
             ))
             return content, tt
         if content in loadable and content != legacy_st:
+            # A data tab the name rules skip is lost: WARN, never silent.
+            skipped = legacy_st == "skip"
             exceptions.append(ExceptionRecord(
-                "INFO", "table_type_disagrees", path.name, sn, first,
-                f"name rules say {legacy_st}; content says {tt.label}: {tt.audit_text()[:600]}",
+                "WARN" if skipped else "INFO", "table_type_disagrees", path.name, sn, first,
+                f"name rules say {legacy_st}; content says {tt.label}"
+                + (" — tab not loaded" if skipped else "") + f": {tt.audit_text()[:600]}",
             ))
         return legacy_st, tt
     if tt.label == UNKNOWN:
@@ -1651,7 +1684,8 @@ def parse_premium_file(
                 data_start = header_at + 1
             else:
                 header, group_row, data_start = _premium_header_with_subrow(
-                    raw_rows, header_at, merge=bool(getattr(adapter, "band_subrow_layout", True)))
+                    raw_rows, header_at, merge=bool(getattr(adapter, "band_subrow_layout", True)),
+                    skip_blank=bool(getattr(adapter, "band_subrow_after_blank", False)))
                 if hasattr(adapter, "premium_header_cells"):
                     header, group_row = adapter.premium_header_cells(
                         raw_rows, header_at, header, group_row)

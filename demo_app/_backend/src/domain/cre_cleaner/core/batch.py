@@ -588,10 +588,13 @@ def plan_batch(
         if fp.status == STATUS_GROUPED and selected_year is not None:
             inferred_y, inferred_q = fp.year, fp.quarter
             # Strong year mismatch: clear inferred year disagrees with pick.
+            # A label that named only the quarter took its year from
+            # outstanding row dates: weak, so the pick wins (period_warning).
             if (
                 inferred_y is not None
                 and int(inferred_y) != int(selected_year)
                 and strong_conf
+                and not getattr(inf, "year_from_dates", False)
                 and not (ov.get("year") and ov.get("quarter"))
             ):
                 fp.status = STATUS_YEAR_MISMATCH

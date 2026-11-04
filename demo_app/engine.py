@@ -16,6 +16,7 @@ if str(_BACKEND) not in sys.path:
 from src.domain.cre_cleaner.adapters import get_adapter  # noqa: E402
 from src.domain.cre_cleaner.adapters.base import UnsupportedCedantError  # noqa: E402
 from src.domain.cre_cleaner.adapters.store_classes import store_class_map  # noqa: E402
+from src.domain.cre_cleaner.config import SOURCE_WORKBOOK_SUFFIXES  # noqa: E402
 from src.domain.cre_cleaner.core.batch import plan_batch, run_batch  # noqa: E402
 from src.domain.cre_cleaner.core.coverage import cleaning_coverage  # noqa: E402
 from src.domain.cre_cleaner.core.class_aliases import build_partner_aliases  # noqa: E402
@@ -165,7 +166,7 @@ def clean(
             on_progress(message, fraction)
 
     if not uploads:
-        raise CleanError("Upload at least one .xls or .xlsx file.")
+        raise CleanError("Upload at least one supported workbook (.xls, .xlsx, .xlsm, .xlsb, .ods).")
     partner = store.partner_by_id(partner_id)
     if partner is None:
         raise CleanError(
@@ -219,8 +220,8 @@ def clean(
         paths = []
         for name, data in uploads:
             safe = Path(name).name
-            if Path(safe).suffix.lower() not in {".xls", ".xlsx", ".xlsm"}:
-                raise CleanError(f"{safe}: only .xls and .xlsx files are accepted")
+            if Path(safe).suffix.lower() not in SOURCE_WORKBOOK_SUFFIXES:
+                raise CleanError(f"{safe}: accepted file types are {', '.join(sorted(SOURCE_WORKBOOK_SUFFIXES))}")
             dest = raw / safe
             dest.write_bytes(data)
             paths.append(dest)

@@ -101,6 +101,45 @@ def is_our_share_header(norm: str) -> bool:
     return bool(norm) and norm.startswith("OUR SHARE")
 
 
+def apply_tsi_gp_basis(adapter: Any, cm: ColumnMap, header: Sequence[Any], *,
+                       path: Optional[Path] = None, sheet: str = "",
+                       exceptions: Optional[list] = None) -> ColumnMap:
+    """TSI / GP columns for the ``tsi_gp_basis`` setting ("our_share": 'Our
+    share SI' / 'Our Share of G. Prem.'; "100": the engine's 100% columns),
+    logged per sheet. A missing column is left blank with a WARN."""
+    norms = [normalize_header(h) if h is not None else "" for h in header]
+    basis, basis_src = adapter.setting_source("tsi_gp_basis")
+    used = {}
+    for field, kind in (("sum_insured", "si"), ("gross_premium", "gp")):
+        if basis == "our_share":
+            pick = next((i for i, n in enumerate(norms) if _our_share_kind(n) == kind), None)
+        else:
+            pick = cm.mapping.get(field)
+        if pick is None:
+            cm.mapping.pop(field, None)
+        else:
+            cm.mapping[field] = pick
+        used[field] = pick
+    if exceptions is not None and path is not None:
+        desc = ", ".join(
+            f"{'TSI' if f == 'sum_insured' else 'GP'} <- "
+            + ("(none)" if i is None else f"col {i + 1} {norms[i]!r}")
+            for f, i in used.items()
+        )
+        rec = ExceptionRecord("INFO", "tsi_gp_basis", path.name, sheet, 0,
+                              f"TSI/GP basis={basis} ({basis_src}): {desc}")
+        if not any(e.reason == rec.reason and e.source_sheet == rec.source_sheet and e.detail == rec.detail
+                   and e.source_filename == rec.source_filename for e in exceptions):
+            exceptions.append(rec)
+        missing = [f for f, i in used.items() if i is None]
+        if missing:
+            exceptions.append(ExceptionRecord(
+                "WARN", "tsi_gp_column_missing", path.name, sheet, 0,
+                f"basis={basis}: no column for {missing}; left blank (other basis not substituted)",
+            ))
+    return cm
+
+
 class UnitrustAgricPremiumRules(PremiumLayoutRules):
     """Generic vocabulary + Unitrust Agric share-label bands."""
 
@@ -126,6 +165,37 @@ class UnitrustAgricPremiumRules(PremiumLayoutRules):
 
 
 UNITRUST_AGRIC_PREMIUM_RULES = UnitrustAgricPremiumRules()
+
+
+# Unitrust & ARK 2023–2025 premium: every band label is a share-% column with
+# its SI and premium in the next two blank columns:
+#   NET RETENTION | TREATY FIRST SURPLUS | TREATY QUOTA SHARE | Facultative
+# First surplus is the TREATY band; quota share is the TREATY band on a sheet
+# without first surplus and a second treaty layer otherwise (the engine's
+# extra_treaty_blocks, WARN multiple_treaty_layers).
+UNITRUST_ARK_SHARE_PPN_HEADERS = UNITRUST_SHARE_PPN_HEADERS | {"TREATY FIRST SURPLUS", "FACULTATIVE"}
+
+
+class UnitrustArkPremiumRules(UnitrustAgricPremiumRules):
+    """Agric's share-label triples plus the ARK first surplus and FAC bands."""
+
+    def is_ppn_header(self, norm: str) -> bool:
+        return norm in UNITRUST_ARK_SHARE_PPN_HEADERS or super().is_ppn_header(norm)
+
+    def block_for_ppn(
+        self, pi: int, norms: List[str], si_idxs: List[int], prem_idxs: List[int],
+    ) -> Optional[Tuple[int, Optional[int], Optional[int]]]:
+        if (
+            norms[pi] in UNITRUST_ARK_SHARE_PPN_HEADERS
+            and pi + 2 < len(norms)
+            and not norms[pi + 1]
+            and not norms[pi + 2]
+        ):
+            return (pi, pi + 1, pi + 2)
+        return super().block_for_ppn(pi, norms, si_idxs, prem_idxs)
+
+
+UNITRUST_ARK_PREMIUM_RULES = UnitrustArkPremiumRules()
 
 
 class UnitrustAgricAdapter(QuarterlyWorkbookAdapter):
@@ -199,37 +269,7 @@ class UnitrustAgricAdapter(QuarterlyWorkbookAdapter):
         # Bands and 100% TSI / GP from the shared engine (our-share / band
         # headers vetoed); the tsi_gp_basis setting then picks the columns.
         cm = self.detect_premium_allocation_blocks(header, group_row)
-        norms = [normalize_header(h) if h is not None else "" for h in header]
-        basis, basis_src = self.setting_source("tsi_gp_basis")
-        used = {}
-        for field, kind in (("sum_insured", "si"), ("gross_premium", "gp")):
-            if basis == "our_share":
-                pick = next((i for i, n in enumerate(norms) if _our_share_kind(n) == kind), None)
-            else:
-                pick = cm.mapping.get(field)
-            if pick is None:
-                cm.mapping.pop(field, None)
-            else:
-                cm.mapping[field] = pick
-            used[field] = pick
-        if exceptions is not None and path is not None:
-            desc = ", ".join(
-                f"{'TSI' if f == 'sum_insured' else 'GP'} <- "
-                + ("(none)" if i is None else f"col {i + 1} {norms[i]!r}")
-                for f, i in used.items()
-            )
-            rec = ExceptionRecord("INFO", "tsi_gp_basis", path.name, sheet, 0,
-                                  f"TSI/GP basis={basis} ({basis_src}): {desc}")
-            if not any(e.reason == rec.reason and e.source_sheet == rec.source_sheet and e.detail == rec.detail
-                       and e.source_filename == rec.source_filename for e in exceptions):
-                exceptions.append(rec)
-            missing = [f for f, i in used.items() if i is None]
-            if missing:
-                exceptions.append(ExceptionRecord(
-                    "WARN", "tsi_gp_column_missing", path.name, sheet, 0,
-                    f"basis={basis}: no column for {missing}; left blank (other basis not substituted)",
-                ))
-        return cm
+        return apply_tsi_gp_basis(self, cm, header, path=path, sheet=sheet, exceptions=exceptions)
 
     def check_premium_row(self, prow: Any, *, exceptions: list, path: Any, sheet: str,
                           excel_row: int) -> None:
@@ -312,16 +352,17 @@ class UnitrustArkAdapter(MutualBenefitsArkAdapter):
 
     cedant = "UNITRUST"
     broker = "ARK"
-    # Same Unitrust band layout as Agric (band label = share %, SI and
-    # premium in the next two blank columns). TSI / GP stay on the 100%
-    # columns (setting default): 'Our share SI' is blank in these returns.
-    premium_layout_rules = UNITRUST_AGRIC_PREMIUM_RULES
+    # Unitrust band layout (band label = share %, SI and premium in the next
+    # two blank columns) with the ARK first surplus and FAC bands.
+    premium_layout_rules = UNITRUST_ARK_PREMIUM_RULES
     claims_alias_extra = UNITRUST_ARK_CLAIMS_ALIAS_EXTRA
     # Prepare only source-named pairs ourselves. Generic forward filling of
     # a parent across an unlabelled third pair can invent another treaty band.
     band_subrow_layout = False
     # Mutual's claims class / PPN choices are not Unitrust's: defaults.
-    settings: dict = {}
+    # TSI / GP on Unitrust's share, the basis the bands are computed on
+    # ('Our share SI' is filled on 99.5% of the 2023–2025 rows): as Agric.
+    settings: dict = {"tsi_gp_basis": "our_share"}
     claims_sheet_class_first = False
     # Tabs are split by currency ('G.A NAIRA' / 'G.A DOLLAR', 'USD Marine'):
     # one class label per class, not one per currency.
@@ -330,6 +371,10 @@ class UnitrustArkAdapter(MutualBenefitsArkAdapter):
     )
     verified = False
     status_note = "Unitrust & ARK: month-file discovery; not checked against Bisola gold"
+
+    def map_premium_columns(self, header, group_row, *, path=None, sheet="", exceptions=None):
+        cm = super().map_premium_columns(header, group_row, path=path, sheet=sheet, exceptions=exceptions)
+        return apply_tsi_gp_basis(self, cm, header, path=path, sheet=sheet, exceptions=exceptions)
 
     def claims_exclude(self, field: str, norm: str) -> bool:
         return (field == "total_claims" and "AMOUNT OF" in norm

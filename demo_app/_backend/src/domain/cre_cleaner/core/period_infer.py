@@ -160,6 +160,11 @@ class PeriodInference:
     # WARN text for period_year_from_span: the label names a two-year span
     # (e.g. "2024-2025 Q1") and the later year was taken. Exceptions file only.
     period_year_warning: str = ""
+    # True when a label named only the quarter and its year was taken from
+    # the row dates of outstanding listings only (they carry old loss and
+    # notification dates): weak evidence against a year the user selected.
+    # Paid / premium dates stay strong.
+    year_from_dates: bool = False
 
     @property
     def ok(self) -> bool:
@@ -1117,16 +1122,21 @@ def label_period(path: Path, *, folder_year: Optional[int] = None) -> Optional[P
     )
     if year is None and folder_year is not None:
         year = int(folder_year)
+    year_from_dates = False
     if year is None:
         # Dates give the year only when the whole content (banners included)
         # settles it; a stale banner against the dates leaves it unresolved.
         content = infer_period_from_workbook_content([path], named=(None, None, []))
         if content.ok:
             year = int(content.year)
+            kinds = set(content.sheet_kinds)
+            year_from_dates = kinds == {"outstanding"}
     result = PeriodInference(
         year=year, quarter=int(quarter), confidence="high", source="label",
-        evidence=[f"label {year} Q{quarter} from {source}"],
+        evidence=[f"label Q{quarter} from {source}, year {year} from outstanding row dates"
+                  if year_from_dates else f"label {year} Q{quarter} from {source}"],
         notes=notes, sheet_kinds=list(date_inf.sheet_kinds), claims_weak=bool(date_inf.claims_weak),
+        year_from_dates=year_from_dates,
     )
     parts = []
     if fn_q is not None and banner_q is not None and (

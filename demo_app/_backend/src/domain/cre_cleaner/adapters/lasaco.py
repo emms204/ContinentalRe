@@ -160,6 +160,12 @@ class _LasacoAdapter(QuarterlyWorkbookAdapter):
 class LasacoJomolaAdapter(_LasacoAdapter):
     cedant = "LASACO"
     broker = "JOMOLA"
+    # Class tabs named 'GEN ACC' / 'ACC 1ST QRT 2019' / 'DIR& OFF LIABILITY'
+    # match no tab-name rule and their headers say 'GROSS PREM.' / 'OUR
+    # SHARE OF G. PREM.': premium is taken from the tab's content.
+    recover_premium_from_content = True
+    # 2019 Q1: a blank row between the band row and its PPN / PREMIUM subrow.
+    band_subrow_after_blank = True
     verified = False
     status_note = "LASACO/JOMOLA: class/quarter returns; unverified"
 

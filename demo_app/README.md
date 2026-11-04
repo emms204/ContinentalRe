@@ -69,7 +69,7 @@ Confirmations written on that URL live on the Streamlit container disk. They sur
 
 1. Enter the password.
 2. Pick a partner (for example `AIICO(ARK)`), a year, and optionally a quarter.
-3. Upload one or more `.xls` / `.xlsx` files and press **Clean**.
+3. Upload one or more `.xls`, `.xlsx`, `.xlsm`, `.xlsb`, or `.ods` workbooks and press **Clean**. Excel binary (`.xlsb`) and OpenDocument (`.ods`) workbooks use the included `fastexcel` reader.
 4. If a label is unknown, the confirm step lists file, sheet, record count, and a suggestion when one exists. **Keep** stores the alias for that partner and re-runs. **Ignore** drops those rows for this run only. Bare `MARINE` has no suggestion; pick Marine Hull or Marine Cargo, or ignore.
 5. Download the workbook or zip. Exclusions are flagged beside the downloads. Expand **Excluded files** for reasons, or **Cleaning notices** for category counts and full source details. Identical notices at the same file/sheet/row are grouped with occurrence counts. **Download full diagnostic report** exports every original notice as CSV. Newly cleaned runs include sheet and row locations when supplied by the cleaner.
 

@@ -10,6 +10,13 @@ _CO_SHARE_AMOUNTS = {"SANLAM PROPORTION", "FBNGI PROPORTION", "SANLAMALLIANZ PRO
 # the share of whichever cession the row has (treaty or FAC FACILITY), so it is
 # not placed in one band (Manual: do not guess allocations).
 _CO_SHARE_TREATY_PPN = {"TREATY %"}
+# Share headers that some outstanding returns write twice (proportion, then
+# amount) -> the PPN alias the first occurrence is read as.
+_REPEATED_SHARE_PPN = {
+    "ALLIANZ SHARE": "ALLIANZ SHARE PPN",
+    "TREATY SHARE": "TREATY SHARE PPN",
+    "FAC SHARE": "FAC SHARE PPN",
+}
 
 
 def _is_co_share_layout(norms) -> bool:
@@ -126,6 +133,7 @@ class SanlamArkAdapter(SourceLayoutAdapter):
         from dataclasses import replace
         from src.domain.cre_cleaner.core.table_type import (
             classify_tab,
+            OTHER,
             OUTSTANDING,
             UNKNOWN,
         )
@@ -212,13 +220,17 @@ class SanlamArkAdapter(SourceLayoutAdapter):
                     ],
                 )
             tables.append(table)
-        labels = {t.label for t in tables}
+        # As classify_tab: a header block with no transactions (OTHER) does not
+        # decide the tab's type; blocks of different types still do (UNKNOWN).
+        txn = [t for t in tables if t.label != OTHER]
+        labels = {t.label for t in txn}
         if tables:
             typed = replace(
                 typed,
                 tables=tables,
-                label=next(iter(labels)) if len(labels) == 1 else UNKNOWN,
-                confidence=min(t.confidence for t in tables),
+                label=(OTHER if not txn
+                       else next(iter(labels)) if len(labels) == 1 else UNKNOWN),
+                confidence=min(t.confidence for t in (txn or tables)),
                 conflicts=[c for t in tables for c in t.conflicts],
             )
         return typed
@@ -277,6 +289,23 @@ class SanlamArkAdapter(SourceLayoutAdapter):
     def claims_header_cells(self, header, band_row, data_rows=(), notes=None):
         cells = super().claims_header_cells(header, band_row, data_rows=data_rows, notes=notes)
         norms = [normalize_header(v) for v in cells]
+        # 2023 OCR: ALLIANZ / TREATY / FAC SHARE are written twice, the share
+        # proportions first and the amounts after. A first column of
+        # proportions is the band PPN; the amount alias then takes the second.
+        for label, ppn in _REPEATED_SHARE_PPN.items():
+            cols = [i for i, h in enumerate(norms) if h == label]
+            if len(cols) != 2:
+                continue
+            values = [parse_number(r[cols[0]]) for r in data_rows if cols[0] < len(r)]
+            values = [v for v in values if v is not None]
+            if values and any(values) and (all(0 <= v <= 1 for v in values)
+                                           or all(0 <= v <= 100 for v in values)):
+                cells[cols[0]] = ppn
+                norms[cols[0]] = ppn
+                if notes is not None:
+                    notes.append(("INFO", "repeated_share_header",
+                                  f"{label!r} appears twice: column {cols[0] + 1} (proportions) read as "
+                                  f"{ppn!r}, column {cols[1] + 1} as the amount"))
         if _is_co_share_layout(norms) and "LOCAL FAC" in norms and notes is not None:
             i = norms.index("LOCAL FAC")
             values = [parse_number(r[i]) for r in data_rows if i < len(r)]
@@ -463,9 +492,14 @@ class SanlamJordansAdapter(SanlamArkAdapter):
     def _index_numbered_claim_sections(self, sheet, rows, *, path, exceptions):
         """Verify source numbering before using a section as a row's class.
 
-        Some claims exports label the numbering column CLASS. Only complete
-        1..N runs beneath an explicit approved section are treated as numbering.
-        Text classes, gaps, duplicates and unknown sections retain normal review.
+        Some claims exports label the numbering column CLASS. A section's numbers
+        are numbering when they run 1..N beneath an explicit approved section.
+        Outstanding-by-year tabs (2022–2024 'OS 2021', '2021') restart the
+        numbers in each section with gaps where rows were removed: those count
+        when the header block has two or more approved sections, every number
+        increases within its section and the column holds nothing but approved
+        headings and whole numbers. Text classes, repeats, a lone section with
+        gaps and unknown sections retain normal review.
         """
         from src.domain.cre_cleaner.core.class_labels import banner_class_label, approved_class_labels
         from src.domain.cre_cleaner.models import ExceptionRecord
@@ -475,19 +509,40 @@ class SanlamJordansAdapter(SanlamArkAdapter):
         columns = None
         section = None
         pending = []
+        block = []          # (section, pending) of the current header block
+        block_ok = True     # no policy row outside an approved section
+
+        def mark(sec, rows_seq):
+            for source_row, sequence in rows_seq:
+                indexed[source_row] = dict(rule='numbered_class_section',
+                    section_class=sec[0], section_label=sec[1],
+                    section_row=sec[2], source_sequence=sequence)
 
         def finish():
             if not section or not pending:
                 return
+            block.append((section, list(pending)))
             if all(sequence == n for n, (_, sequence) in enumerate(pending, 1)):
-                for source_row, sequence in pending:
-                    indexed[source_row] = dict(rule='numbered_class_section',
-                        section_class=section[0], section_label=section[1],
-                        section_row=section[2], source_sequence=sequence)
+                mark(section, pending)
                 exceptions.append(ExceptionRecord('INFO', 'numbered_class_section',
                     path.name, sheet, section[2],
                     f'{len(pending)} source sequence numbers beneath {section[1]!r} '
                     'verified as 1..N; section supplies class, source cells unchanged.'))
+
+        def finish_block():
+            runs = [[s for _, s in p] for _, p in block]
+            if (not block_ok or len(block) < 2
+                    or any(s is None for run in runs for s in run)
+                    or any(b <= a for run in runs for a, b in zip(run, run[1:]))
+                    or all(r in indexed for _, p in block for r, _ in p)):
+                return
+            for sec, rows_seq in block:
+                mark(sec, rows_seq)
+            exceptions.append(ExceptionRecord('INFO', 'numbered_class_section',
+                path.name, sheet, block[0][0][2],
+                f'{sum(map(len, runs))} source sequence numbers increase within each of '
+                f'{len(block)} approved sections (numbering restarts per section, with gaps); '
+                'each section supplies its rows\' class, source cells unchanged.'))
 
         allowed = approved_class_labels(self.class_map()) - {'Other', 'Facultative'}
         for i, row in enumerate(rows, 1):
@@ -496,8 +551,9 @@ class SanlamJordansAdapter(SanlamArkAdapter):
             claim = next((j for j, h in enumerate(norms) if h in {'CLAIM NO', 'CLAIM NUMBER', 'CLAIMS NO'}), None)
             if 'CLASS' in norms and policy is not None and claim is not None:
                 finish()
+                finish_block()
                 columns = (norms.index('CLASS'), policy, claim)
-                section, pending = None, []
+                section, pending, block, block_ok = None, [], [], True
                 continue
             if columns is None:
                 continue
@@ -508,14 +564,20 @@ class SanlamJordansAdapter(SanlamArkAdapter):
                 raw = str(filled[0][1]).strip()
                 label = banner_class_label(raw)
                 section = (label, raw, i) if label in allowed else None
+                if section is None and parse_number(raw) is None:
+                    block_ok = False  # an unknown section heading
                 pending = []
                 continue
-            if section and pi < len(row) and ni < len(row) and row[pi] and row[ni]:
+            if pi < len(row) and ni < len(row) and row[pi] and row[ni]:
+                if not section:
+                    block_ok = False  # a policy row outside an approved section
+                    continue
                 raw = row[ci] if ci < len(row) else None
                 number = parse_number(raw)
                 sequence = int(number) if number is not None and number > 0 and float(number).is_integer() else None
                 pending.append((i, sequence))
         finish()
+        finish_block()
 
     def check_claims_row(self, claim, *, row, cmap, exceptions, path, sheet, excel_row):
         evidence = self.__dict__.get('_numbered_claim_sections', {}).get(
