@@ -603,9 +603,11 @@ def plan_batch(
                     f"selected year {selected_year} — file ignored, not cleaned"
                 )
             elif (
+                # The pick replaces a weak date year, but the label's
+                # explicit quarter is still checked against the pick.
                 selected_quarter is not None
                 and inferred_y is not None
-                and int(inferred_y) == int(selected_year)
+                and (int(inferred_y) == int(selected_year) or getattr(inf, "year_from_dates", False))
                 and inferred_q in (1, 2, 3, 4)
                 and int(inferred_q) != int(selected_quarter)
                 and strong_conf

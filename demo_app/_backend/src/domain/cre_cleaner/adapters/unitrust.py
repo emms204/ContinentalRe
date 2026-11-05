@@ -372,6 +372,19 @@ class UnitrustArkAdapter(MutualBenefitsArkAdapter):
     verified = False
     status_note = "Unitrust & ARK: month-file discovery; not checked against Bisola gold"
 
+    def premium_header_row(self, raw_rows, found):
+        # Q3 2022: a 'PPN | SUM INSURED | PREMIUM' caption row sits under the
+        # band names and outscores the real header ('SUM INSURED' reads as
+        # INSURED). The header is the row above, with Policy No and Insured.
+        if found < 1 or any(normalize_header(c).startswith("POLICY") for c in raw_rows[found] if c is not None):
+            return found
+        caps = {normalize_header(c) for c in raw_rows[found] if c is not None and normalize_header(c)}
+        above = [normalize_header(c) for c in raw_rows[found - 1] if c is not None]
+        if caps <= {"PPN", "%", "SUM INSURED", "SI", "PREMIUM"} and \
+                any(n.startswith("POLICY") for n in above) and "INSURED" in above:
+            return found - 1
+        return found
+
     def map_premium_columns(self, header, group_row, *, path=None, sheet="", exceptions=None):
         cm = super().map_premium_columns(header, group_row, path=path, sheet=sheet, exceptions=exceptions)
         return apply_tsi_gp_basis(self, cm, header, path=path, sheet=sheet, exceptions=exceptions)

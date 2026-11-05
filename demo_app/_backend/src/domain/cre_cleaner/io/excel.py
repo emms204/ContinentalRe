@@ -217,23 +217,49 @@ _EMPTY_CELL = re.compile(
 )
 
 
-def _xlsx_without_empty_cells(path: Path) -> Any:
-    """In-memory copy of the package with style-only cells removed from the
-    worksheets. Formatting can declare millions of empty cells (a styled range
-    to column XEP); every remaining cell keeps its own address, so values and
-    coordinates are unchanged while parsing skips the empty ones."""
-    import zipfile
-    from io import BytesIO
+def _xml_chunks(stream: Any, boundary: bytes = b">"):
+    """Read bounded chunks, keeping XML tags (or worksheet rows) together."""
+    pending = b""
+    while True:
+        chunk = stream.read(1024 * 1024)
+        if not chunk:
+            if pending:
+                yield pending
+            return
+        pending += chunk
+        end = pending.rfind(boundary)
+        if end >= 0:
+            end += len(boundary)
+            yield pending[:end]
+            pending = pending[end:]
 
-    buf = BytesIO()
-    with zipfile.ZipFile(path) as zin, zipfile.ZipFile(buf, "w", zipfile.ZIP_STORED) as zout:
-        for info in zin.infolist():
-            data = zin.read(info)
-            if info.filename.startswith("xl/worksheets/") and info.filename.endswith(".xml"):
-                data = _EMPTY_CELL.sub(b"", data)
-            zout.writestr(info.filename, data)
-    buf.seek(0)
-    return buf
+
+def _xlsx_without_empty_cells(path: Path) -> Any:
+    """Disk-backed copy with addressed, style-only cells removed.
+
+    Process a chunk of complete rows at a time: large compressed worksheets
+    must never be expanded into a single byte string or an in-memory archive.
+    Values, formulas and original cell coordinates remain unchanged.
+    """
+    import shutil
+    import tempfile
+    import zipfile
+
+    buf = tempfile.TemporaryFile()
+    try:
+        with zipfile.ZipFile(path) as zin, zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zout:
+            for info in zin.infolist():
+                with zin.open(info) as source, zout.open(info.filename, "w", force_zip64=True) as target:
+                    if info.filename.startswith("xl/worksheets/") and info.filename.endswith(".xml"):
+                        for data in _xml_chunks(source, b"</row>"):
+                            target.write(_EMPTY_CELL.sub(b"", data))
+                    else:
+                        shutil.copyfileobj(source, target, length=1024 * 1024)
+        buf.seek(0)
+        return buf
+    except BaseException:
+        buf.close()
+        raise
 
 
 def _xlsx_value_bounds(path: Any) -> Dict[str, Tuple[int, int]]:
@@ -245,7 +271,6 @@ def _xlsx_value_bounds(path: Any) -> Dict[str, Tuple[int, int]]:
     Hidden sheets are never loaded, so their parts are not parsed: (0, 0).
     """
     import zipfile
-    from io import BytesIO
     from xml.etree import ElementTree as ET
     from openpyxl.utils.cell import coordinate_to_tuple
 
@@ -256,18 +281,26 @@ def _xlsx_value_bounds(path: Any) -> Dict[str, Tuple[int, int]]:
                 out[name] = 0, 0
                 continue
             last_row = last_col = 0
-            for _event, el in ET.iterparse(BytesIO(zf.read(part)), events=('end',)):
-                tag = el.tag.rsplit('}', 1)[-1]
-                if tag == 'c':
-                    if any(child.tag.rsplit('}', 1)[-1] in {'v', 'is', 'f'} for child in el):
-                        ref = el.get('r') or ''
-                        if not re.fullmatch(r'[A-Z]+[1-9][0-9]*', ref):
-                            raise ValueError('Value cell has no reliable coordinate')
-                        row, col = coordinate_to_tuple(ref)
-                        last_row, last_col = max(last_row, row), max(last_col, col)
-                    el.clear()
-                elif tag == 'row':
-                    el.clear()
+            stack = []
+            with zf.open(part) as stream:
+                for event, el in ET.iterparse(stream, events=('start', 'end')):
+                    if event == 'start':
+                        stack.append(el)
+                        continue
+                    tag = el.tag.rsplit('}', 1)[-1]
+                    if tag == 'c':
+                        if any(child.tag.rsplit('}', 1)[-1] in {'v', 'is', 'f'} for child in el):
+                            ref = el.get('r') or ''
+                            if not re.fullmatch(r'[A-Z]+[1-9][0-9]*', ref):
+                                raise ValueError('Value cell has no reliable coordinate')
+                            row, col = coordinate_to_tuple(ref)
+                            last_row, last_col = max(last_row, row), max(last_col, col)
+                        el.clear()
+                    elif tag == 'row':
+                        el.clear()
+                        if len(stack) > 1:
+                            stack[-2].remove(el)
+                    stack.pop()
             out[name] = last_row, last_col
     return out
 
@@ -297,9 +330,10 @@ def _read_xlsx(path: Path) -> Dict[str, List[List[Any]]]:
         bounds = {}
     if source is not path:
         source.seek(0)
-    wb = load_workbook(source, data_only=True, read_only=True, keep_links=False)
+    wb = None
     out: Dict[str, List[List[Any]]] = {}
     try:
+        wb = load_workbook(source, data_only=True, read_only=True, keep_links=False)
         for sn in wb.sheetnames:
             ws = wb[sn]
             # Hidden sheets are never loaded (read_source_workbook reports
@@ -321,7 +355,10 @@ def _read_xlsx(path: Path) -> Dict[str, List[List[Any]]]:
                              for v in row])
             out[sn] = rows
     finally:
-        wb.close()
+        if wb is not None:
+            wb.close()
+        if source is not path:
+            source.close()
     return out
 
 
@@ -414,33 +451,27 @@ def _xlsx_visibility(path: Path) -> Dict[str, Dict[str, Any]]:
             part = target.lstrip("/") if target.startswith("/") else posixpath.normpath(
                 posixpath.join("xl", target)
             )
-            try:
-                data = zf.read(part)
-            except KeyError:
-                data = b""
             hidden_rows = set()
             hidden_cols: List[int] = []
-            if b'hidden="' not in data:
-                # No row/col can carry hidden="1|true": skip the tag scans
-                # (same result, IMPL-20261002-03).
-                out[el.get("name")] = {
-                    "state": el.get("state") or "visible",
-                    "hidden_rows": hidden_rows,
-                    "hidden_cols": hidden_cols,
-                }
-                continue
-            for m in _ROW_TAG.finditer(data):
-                attrs = m.group(1)
-                if _ATTR_HIDDEN.search(attrs):
-                    r = _ATTR_R.search(attrs)
-                    if r:
-                        hidden_rows.add(int(r.group(1)))
-            for m in _COL_TAG.finditer(data):
-                attrs = m.group(1)
-                if _ATTR_HIDDEN.search(attrs):
-                    lo, hi = _ATTR_MIN.search(attrs), _ATTR_MAX.search(attrs)
-                    if lo and hi:
-                        hidden_cols.extend(range(int(lo.group(1)), min(int(hi.group(1)), 200) + 1))
+            try:
+                stream = zf.open(part)
+            except KeyError:
+                stream = None
+            if stream is not None:
+                with stream:
+                    for data in _xml_chunks(stream):
+                        for m in _ROW_TAG.finditer(data):
+                            attrs = m.group(1)
+                            if _ATTR_HIDDEN.search(attrs):
+                                r = _ATTR_R.search(attrs)
+                                if r:
+                                    hidden_rows.add(int(r.group(1)))
+                        for m in _COL_TAG.finditer(data):
+                            attrs = m.group(1)
+                            if _ATTR_HIDDEN.search(attrs):
+                                lo, hi = _ATTR_MIN.search(attrs), _ATTR_MAX.search(attrs)
+                                if lo and hi:
+                                    hidden_cols.extend(range(int(lo.group(1)), min(int(hi.group(1)), 200) + 1))
             out[el.get("name")] = {
                 "state": el.get("state") or "visible",
                 "hidden_rows": hidden_rows,
